@@ -1,0 +1,4 @@
+[tools]
+biome = "latest"
+hk = "latest"
+rust = "latest"
