@@ -1,0 +1,19 @@
+docs/rust_feature_store_architecture.md
+  s_58e7910a30cd0c::t_ce18e4599db876 1-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "7d15106556dae6bfdda98fb37f0e3a69f7397ecb",
+  "prompts": {},
+  "sessions": {
+    "s_58e7910a30cd0c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09113743-bb1b-4df1-aeb2-7e25bc4fe799",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Chandler King <chandlerok@users.noreply.github.com>"
+    }
+  }
+}
