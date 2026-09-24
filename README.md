@@ -4,9 +4,10 @@ An opinionated feature store with a Rust core and a native Python API. Online se
 uses an in-process `moka` cache over Valkey. Historical point-in-time joins run in an
 embedded DuckDB engine over Arrow.
 
-> **Status: design phase.** This repository currently contains the design documents only.
-> There is no implementation, no published package, and no Helm chart yet. The quickstart
-> below describes the intended interface.
+> **Status: early implementation.** The definition layer, entity key encoding, value codec,
+> and the two-tier online read path are built and measured. The offline engine, Arrow Flight
+> serving, and materialization are design only. There is no published package and no Helm
+> chart yet, so the quickstart below describes the intended interface.
 
 ## Design goals
 

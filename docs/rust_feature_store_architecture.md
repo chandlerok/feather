@@ -4,8 +4,10 @@ This document describes the intended architecture for an opinionated, high-perfo
 open-source alternative to Feast. It strips out multi-provider abstraction and specializes
 on a native Rust core, with DuckDB for historical computation and Valkey for online serving.
 
-Scope note: this is a design document. Nothing described here is implemented. Performance
-figures are targets, not measurements; no benchmarks have been published.
+Scope note: this is a design document with a partial implementation. The definition layer,
+entity key encoding, value codec, and the two-tier online read path are built and measured.
+The offline engine, Arrow Flight serving, and materialization are design only. Figures that
+are measurements say so and carry their hardware and cardinality; the rest are targets.
 
 ---
 
@@ -459,6 +461,33 @@ engine; they differ in where the source data lives and how it is reached.
 #### Tier 1: local files and warehouse sources
 
 - **Engine.** Local DuckDB via the `duckdb` Rust crate.
+- **Entity frame input.** The caller's entity frame is an Arrow record batch. It is appended to
+  a temporary table with DuckDB's Arrow appender (`appender-arrow`) and joined as the left side
+  of the `ASOF` join. Columnar, no per-row work, no serialization, and no file to clean up. The
+  cost is extra C++ template compilation on a clean DuckDB build.
+
+  Measured on an Apple M2 with 8 cores and 8 GiB, 500k entity rows against a 2M-row feature
+  table, minimum of 3 repetitions, three runs:
+
+  | Route          | Load, 500k rows  | Join         |
+  | -------------- | ---------------- | ------------ |
+  | Arrow appender | 3.2ms to 3.3ms   | 33ms to 35ms |
+  | Row appender   | 29.0ms to 29.6ms | 33ms to 35ms |
+  | Temp Parquet   | 21.3ms to 23.3ms | 39ms to 40ms |
+
+  The appender is about 9x the row appender and about 7x the Parquet route on load. Parquet also
+  pays for the decode inside the join, which is why it is the only route above 35ms, and it
+  leaves a file behind. The join is `count(*)` over the `ASOF` join, so these figures exclude
+  materializing the result columns.
+
+  `ANALYZE` on the appended table is not required. The join moved by under 3% in either
+  direction across runs, including one run that was 4.1ms slower after `ANALYZE`, which is
+  inside the roughly 15% run-to-run spread on the join itself. The concern that a table filled
+  through the appender carries no statistics did not produce a measurable planning penalty at
+  this size.
+
+  `crates/feather-core/examples/duckdb_input.rs` runs the comparison:
+  `ENTITIES=500000 cargo run --release -p feather-core --features offline --example duckdb_input`.
 - **Mechanism.** DuckDB's `snowflake` and `bigquery` extensions read from those warehouses.
   Both are **community extensions**: contributed and maintained outside DuckLabs, and
   installed from the community repository (`INSTALL snowflake FROM community`). They are not
