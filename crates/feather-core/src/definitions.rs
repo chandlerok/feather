@@ -261,6 +261,20 @@ impl Definitions {
         }
         Ok(())
     }
+
+    /// Deserialize and validate in one step.
+    ///
+    /// A binding hands over JSON and cannot get a `Definitions` back without it
+    /// having been checked, which is what makes this module the authority rather
+    /// than one opinion among several.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let definitions: Self =
+            serde_json::from_str(json).map_err(|source| Error::MalformedDefinitions {
+                reason: source.to_string(),
+            })?;
+        definitions.validate()?;
+        Ok(definitions)
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +411,34 @@ mod tests {
         });
 
         definitions.validate().expect("valid");
+    }
+
+    #[test]
+    fn from_json_validates_what_it_reads() {
+        let json = serde_json::to_string(&project(|_| {})).expect("serialize");
+        Definitions::from_json(&json).expect("valid");
+
+        // A field declared twice is only caught by `validate`, so reaching it
+        // through `from_json` is what proves the two are wired together.
+        let broken = project(|v| v.features[1].name = "click_count".to_owned());
+        let json = serde_json::to_string(&broken).expect("serialize");
+        let error = Definitions::from_json(&json).expect_err("must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("declares field `click_count` twice"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn from_json_rejects_json_that_is_not_definitions() {
+        let error = Definitions::from_json(r#"{"project": 1}"#).expect_err("must fail");
+
+        assert!(
+            error.to_string().contains("malformed definitions"),
+            "{error}"
+        );
     }
 }

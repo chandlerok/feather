@@ -738,10 +738,12 @@ or removed views would otherwise persist forever. Feast has exactly this leak, g
 online store indefinitely because it only deletes data when the last view for an entity is
 gone ([#3596](https://github.com/feast-dev/feast/issues/3596)).
 
-Feather deletes the affected fields on `apply`: `HDEL` the `v:{view}:*` and `f:{view}`
-fields for a removed view. This has to be idempotent and safe to re-run. Note that it makes
-`apply` no longer a pure function, since it touches the online store. That is acceptable
-because the definitions artifact itself is still never written at runtime.
+Feather reclaims them during a full refresh. The refresh already holds the current view set,
+which is what identifying an orphan field needs, so the same pass `HDEL`s the `v:{view}:*` and
+`f:{view}` fields of any view that is no longer declared. The deletion has to be idempotent and
+safe to re-run, which it is: removing a field that is already gone is a no-op. This is the
+reason a refresh is not a pure function of its inputs, and it is the only part of it that is
+not.
 
 ### Ceiling
 

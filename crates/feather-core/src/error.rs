@@ -63,6 +63,9 @@ pub enum Error {
     #[error("view `{view}` {reason}")]
     MalformedView { view: String, reason: String },
 
+    #[error("malformed definitions: {reason}")]
+    MalformedDefinitions { reason: String },
+
     #[error(
         "one request mixed entities `{first}` and `{second}`; all views in a request must \
          share the same entity"
