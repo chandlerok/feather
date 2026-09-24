@@ -114,6 +114,11 @@ python-platform = "all"
 
 [tool.ty.src]
 include = ["python", "tests"]
+# tests/test_typing_contract.py deliberately contains code that must fail a type
+# check, and pins that with mypy's `# type: ignore[code]`, which mypy verifies is
+# still needed. ty spells the same idea `# ty: ignore`, so it reports those
+# deliberate errors as errors. The file is covered by mypy and pyright instead.
+exclude = ["tests/test_typing_contract.py"]
 
 [tool.ty.rules]
 # Both ship as `ignore`, which makes an unconfigured ty run under-check.
@@ -141,6 +146,10 @@ include = ["python", "tests"]
 python_version = "3.11"
 mypy_path = "python"
 files = ["python", "tests"]
+# An ignore that is no longer needed is a claim about the code that stopped being
+# true, so it is an error rather than dead noise. tests/test_typing_contract.py
+# relies on this to pin checks that must fire.
+warn_unused_ignores = true
 # mypy finds third-party stubs through an interpreter, not through venvPath the
 # way pyright does, so it has to be pointed at the project venv explicitly.
 # Without this it cannot see pydantic or pytest at all.

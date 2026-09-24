@@ -1,8 +1,7 @@
-"""Contract tests for the Python-to-Rust definition wire format.
+"""The declared-view layer: schema in the class body, configuration on the decorator.
 
-Rust deserializes these models with serde and does not re-validate them, so a
-rename here would fail at runtime rather than at import. These tests pin the
-exact keys and values Rust expects.
+Views are declared at module level here, the way a real definitions module does,
+so the checker sees a concrete class and its fields.
 """
 
 import json
@@ -11,196 +10,188 @@ import pydantic
 import pytest
 
 from feather import (
-    DType,
     Entity,
     FeatureService,
     FeatureStoreConfig,
     FeatureView,
     Field,
     FileSource,
+    Float64,
+    Int64,
+    Utf8,
+    config_to_wire,
+    feature_view,
+    view_fields,
+    view_to_wire,
 )
 
+USER = Entity(name="user_id", join_key="user_id")
+SOURCE = FileSource(path="data/user_stats.parquet")
 
-def a_view(**overrides: object) -> FeatureView:
-    """Build a minimal valid view, with overrides applied.
 
-    Returns:
-        The view.
+@feature_view(name="user_clicks", entity=USER, source=SOURCE, ttl_days=30)
+class UserClicks(FeatureView):
+    click_count = Field(Int64)
+    purchase_count = Field(Int64)
+
+
+@feature_view(name="user_stats", entity=USER, source=SOURCE)
+class UserStats(FeatureView):
+    ltv = Field(Float64)
+
+
+@feature_view(name="shadow", entity=USER, source=SOURCE)
+class Shadow(FeatureView):
+    """Every one of these names is a config key or a base-class concern."""
+
+    name = Field(Utf8)
+    source = Field(Utf8)
+    ttl_days = Field(Int64)
+    config = Field(Utf8)
+    fields = Field(Utf8)
+
+
+@feature_view(name="user_clicks", entity=USER, source=SOURCE)
+class OtherUserClicks(FeatureView):
+    """Shares a wire name with UserClicks, for the duplicate check."""
+
+    other = Field(Int64)
+
+
+def test_a_declared_view_compiles_to_the_wire_model() -> None:
+    """The declarative layer produces what Rust deserializes."""
+    wire = view_to_wire(UserClicks)
+    assert wire.name == "user_clicks"
+    assert wire.entities == [USER]
+    assert wire.source == SOURCE
+    assert wire.ttl_days == 30
+    assert [f.name for f in wire.features] == ["click_count", "purchase_count"]
+    assert [f.dtype for f in wire.features] == ["int64", "int64"]
+
+
+def test_the_compiled_json_is_the_rust_contract() -> None:
+    """End to end: a declared view serializes with the keys Rust expects.
+
+    The same shape is asserted in test_wire against the wire models directly, so
+    a change to either layer breaks one of the two tests.
     """
-    base: dict[str, object] = {
+    config = FeatureStoreConfig(project="ads", views=[UserClicks])
+    payload = json.loads(config_to_wire(config).model_dump_json())
+    assert payload["views"][0] == {
         "name": "user_clicks",
-        "entities": [Entity(name="user_id", join_key="user_id")],
-        "source": FileSource(path="data/user_stats.parquet"),
-        "features": [Field(name="click_count", dtype=DType.INT64)],
+        "entities": [{"name": "user_id", "join_key": "user_id"}],
+        "source": {"path": "data/user_stats.parquet"},
+        "features": [
+            {"name": "click_count", "dtype": "int64"},
+            {"name": "purchase_count", "dtype": "int64"},
+        ],
+        "ttl_days": 30,
+        "timestamp_field": None,
+        "created_timestamp_field": None,
     }
-    base.update(overrides)
-    # model_validate rather than the constructor so that deliberately invalid
-    # overrides in tests do not need a type suppression.
-    return FeatureView.model_validate(base)
 
 
-def test_dtype_values_are_the_rust_wire_names() -> None:
-    """The enum values are the serde rename_all = snake_case names."""
-    assert [d.value for d in DType] == [
-        "int64",
-        "float64",
-        "boolean",
-        "utf8",
-        "timestamp_micros",
+def test_a_feature_may_be_called_name_or_source() -> None:
+    """This is why configuration is on the decorator rather than the body.
+
+    With config in the body, the view name and every config key would be taken
+    out of the feature namespace, so none of these could be declared.
+    """
+    wire = view_to_wire(Shadow)
+    assert wire.name == "shadow"
+    assert [f.name for f in wire.features] == [
+        "name",
+        "source",
+        "ttl_days",
+        "config",
+        "fields",
     ]
 
 
-def test_definition_json_uses_the_keys_rust_expects() -> None:
-    """The serialized shape matches the Rust structs field for field."""
-    config = FeatureStoreConfig(
-        project="ads",
-        views=[a_view(ttl_days=30)],
-        services=[FeatureService(name="ranking", features=["user_clicks:click_count"])],
-    )
-    payload = json.loads(config.model_dump_json())
-
-    assert payload["project"] == "ads"
-    view = payload["views"][0]
-    assert view["name"] == "user_clicks"
-    assert view["entities"] == [{"name": "user_id", "join_key": "user_id"}]
-    assert view["source"] == {"path": "data/user_stats.parquet"}
-    assert view["features"] == [{"name": "click_count", "dtype": "int64"}]
-    assert view["ttl_days"] == 30
-    # Absent optional fields serialize as null, which serde's default handles.
-    assert view["timestamp_field"] is None
-    assert view["created_timestamp_field"] is None
-    assert payload["services"][0] == {
-        "name": "ranking",
-        "features": ["user_clicks:click_count"],
-    }
+def test_the_base_class_declares_nothing_but_dunders() -> None:
+    """Pins that the base cannot take a name away from a schema."""
+    non_dunder = [
+        name for name in vars(FeatureView) if not (name.startswith("__") and name.endswith("__"))
+    ]
+    assert non_dunder == []
 
 
-def test_dtype_covers_exactly_the_rust_variants() -> None:
-    """Guard against a dtype being added on one side of the boundary only.
-
-    Rust's DType enum and this one must stay in step. A variant added to one side
-    and not the other fails at deserialization, which is a runtime failure in a
-    place nothing else tests.
-    """
-    assert {d.name for d in DType} == {
-        "INT64",
-        "FLOAT64",
-        "BOOLEAN",
-        "UTF8",
-        "TIMESTAMP_MICROS",
-    }
+def test_fields_carry_their_view_and_keep_declaration_order() -> None:
+    """A field is self-describing, which is what lets a reference be an object."""
+    fields = view_fields(UserClicks)
+    assert [f.name for f in fields] == ["click_count", "purchase_count"]
+    assert {f.view for f in fields} == {"user_clicks"}
+    assert all(f.dtype is Int64 for f in fields)
 
 
-def test_optional_defaults_are_left_to_rust() -> None:
-    """The Python layer does not invent defaults that Rust owns.
-
-    `timestamp_field` defaults to `event_timestamp` in feather-core, not here.
-    Inventing it on this side would create a second source of truth for a value
-    the join semantics depend on, so it must serialize as null.
-    """
-    payload = json.loads(FeatureStoreConfig(project="ads", views=[a_view()]).model_dump_json())
-    view = payload["views"][0]
-    assert view["timestamp_field"] is None
-    assert view["created_timestamp_field"] is None
+def test_a_reference_renders_as_the_wire_form() -> None:
+    """The string form still exists; it is just derived rather than written."""
+    assert repr(UserClicks.click_count) == "user_clicks:click_count (int64)"
 
 
-def test_a_view_without_a_ttl_serializes_as_null() -> None:
-    """No TTL means no expiry, and serde's Option handles the null."""
-    payload = json.loads(FeatureStoreConfig(project="ads", views=[a_view()]).model_dump_json())
-    assert payload["views"][0]["ttl_days"] is None
+def test_a_view_declaring_no_fields_is_rejected_at_decoration() -> None:
+    """The usual cause is the decorator on the wrong class."""
+    with pytest.raises(ValueError, match="declares no fields"):
+
+        @feature_view(name="empty", entity=USER, source=SOURCE)
+        class Empty(FeatureView):
+            pass
 
 
-def test_definitions_are_immutable() -> None:
-    """Definitions are data; mutating one after validation is a bug."""
-    view = a_view()
-    attribute = "name"
+def test_a_malformed_view_fails_at_decoration() -> None:
+    """Failing at import is the point: an engine never sees a bad definition."""
     with pytest.raises(pydantic.ValidationError):
-        setattr(view, attribute, "other")
+
+        @feature_view(name="bad", entity=USER, source=SOURCE, ttl_days=0)
+        class Bad(FeatureView):
+            f = Field(Int64)
 
 
-def test_unknown_keys_are_rejected() -> None:
-    """A typo in a definition is an error, not something to ignore."""
-    # Built as a dict so the deliberate typo does not need a type suppression.
-    kwargs: dict[str, object] = {
-        "name": "v",
-        "entities": [Entity(name="e", join_key="e")],
-        "source": FileSource(path="p"),
-        "features": [Field(name="f", dtype=DType.INT64)],
-        "ttl_day": 30,
-    }
-    with pytest.raises(pydantic.ValidationError):
-        FeatureView.model_validate(kwargs)
+def test_a_service_expands_a_whole_view() -> None:
+    """Passing the view means every field on it, in declaration order."""
+    service = FeatureService(name="ranking", features=[UserClicks])
+    assert [(f.view, f.name) for f in service.features] == [
+        ("user_clicks", "click_count"),
+        ("user_clicks", "purchase_count"),
+    ]
 
 
-def test_more_than_one_entity_is_rejected() -> None:
-    """v1 keys one hash per entity, so a multi-entity view cannot be stored."""
-    with pytest.raises(pydantic.ValidationError, match="exactly one"):
-        a_view(
-            entities=[
-                Entity(name="user_id", join_key="user_id"),
-                Entity(name="item_id", join_key="item_id"),
-            ]
-        )
-
-
-def test_duplicate_feature_names_are_rejected() -> None:
-    """Duplicate names would collide on one field name in the hash."""
-    with pytest.raises(pydantic.ValidationError, match="repeats a feature name"):
-        a_view(
-            features=[
-                Field(name="count", dtype=DType.INT64),
-                Field(name="count", dtype=DType.FLOAT64),
-            ]
-        )
-
-
-def test_a_shared_timestamp_field_is_rejected() -> None:
-    """The event timestamp and created timestamp cannot be the same column."""
-    with pytest.raises(pydantic.ValidationError, match="both the event"):
-        a_view(timestamp_field="ts", created_timestamp_field="ts")
-
-
-def test_a_malformed_service_reference_is_rejected() -> None:
-    """References are 'view:feature', so a bare name is an error."""
-    with pytest.raises(pydantic.ValidationError, match="malformed reference"):
-        FeatureService(name="s", features=["click_count"])
-
-
-def test_service_references_split_on_the_first_colon() -> None:
-    """A feature name containing a colon still splits correctly."""
-    service = FeatureService(name="s", features=["view:a:b"])
-    assert service.references() == [("view", "a:b")]
-
-
-def test_cross_object_references_are_validated() -> None:
-    """Pydantic cannot see across objects, so this is checked explicitly."""
-    config = FeatureStoreConfig(
-        project="ads",
-        views=[a_view()],
-        services=[FeatureService(name="s", features=["user_clicks:nope"])],
+def test_a_service_takes_a_subset_in_order() -> None:
+    """A subset is chosen by referring to the fields, so it cannot misspell one."""
+    service = FeatureService(
+        name="ranking",
+        features=[UserClicks.purchase_count, UserStats.ltv],
     )
-    with pytest.raises(ValueError, match="has no such feature"):
-        config.validate_references()
+    config = FeatureStoreConfig(project="ads", views=[UserClicks, UserStats], services=[service])
+    payload = json.loads(config_to_wire(config).model_dump_json())
+    assert payload["services"] == [
+        {
+            "name": "ranking",
+            "features": ["user_clicks:purchase_count", "user_stats:ltv"],
+        }
+    ]
 
 
-def test_a_valid_config_passes_reference_validation() -> None:
-    """The happy path does not raise."""
-    config = FeatureStoreConfig(
-        project="ads",
-        views=[a_view()],
-        services=[FeatureService(name="s", features=["user_clicks:click_count"])],
-    )
-    config.validate_references()
-
-
-def test_duplicate_view_names_are_rejected() -> None:
-    """Two views with one name would collide in the hash field namespace."""
-    config = FeatureStoreConfig(project="ads", views=[a_view(), a_view()])
+def test_two_views_sharing_a_wire_name_are_rejected() -> None:
+    """Two views with one name collide in the hash field namespace."""
+    config = FeatureStoreConfig(project="ads", views=[UserClicks, OtherUserClicks])
     with pytest.raises(ValueError, match="share a name"):
-        config.validate_references()
+        config_to_wire(config)
 
 
-def test_an_empty_project_serializes_cleanly() -> None:
-    """Empty definition lists are valid, which is what `feather init` produces."""
-    payload = json.loads(FeatureStoreConfig(project="ads").model_dump_json())
-    assert payload == {"project": "ads", "views": [], "services": []}
+def test_a_service_naming_an_undeclared_view_is_rejected() -> None:
+    """The residual cross-reference: the field exists, but not in this project."""
+    service = FeatureService(name="ranking", features=[UserClicks.click_count])
+    config = FeatureStoreConfig(project="ads", views=[UserStats], services=[service])
+    with pytest.raises(KeyError, match="no feature view named"):
+        config_to_wire(config)
+
+
+def test_an_empty_project_compiles_cleanly() -> None:
+    """Empty definitions are valid, which is what `feather init` produces."""
+    config = FeatureStoreConfig(project="ads")
+    assert json.loads(config_to_wire(config).model_dump_json()) == {
+        "project": "ads",
+        "views": [],
+        "services": [],
+    }

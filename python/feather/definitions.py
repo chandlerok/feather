@@ -1,196 +1,331 @@
 """Feature definitions.
 
-Python is the validating authority. Rust mirrors these models and deserializes
-them, so this module owns the field names and the wire format; the Rust side
-does not re-validate what Pydantic has already checked.
+Definitions are Python classes. A field's dtype is a type parameter and its name
+is the attribute it is assigned to, so a reference to a feature is a checked
+attribute access rather than a string lookup:
 
-The one thing Pydantic cannot check is a cross-reference, such as a feature
-service naming a view that does not exist. That is validated by
-:meth:`FeatureStoreConfig.validate_references`.
+    @feature_view(name="user_clicks", entity=user, source=FileSource(path="p"))
+    class UserClicks(FeatureView):
+        click_count = Field(Int64)
+
+    UserClicks.click_count        # Field[Int64]
+    UserClicks.click_cout         # a type error, not a runtime lookup failure
+
+Configuration is decorator arguments rather than class attributes, so the class
+body is only the schema. That is what lets a feature be called ``name``,
+``source``, or ``ttl_days``: there is nothing in the body for it to collide with.
+The base class is empty for the same reason, and compiling is a function rather
+than a method, so not even a method name is reserved.
+
+There is deliberately no string form on this path. A string cannot be checked at
+all, so ``features=`` takes objects; it is a type error to pass
+``"user_clicks:click_count"``. Callers that need a string, such as a debug or
+ad-hoc path, use the wire models in :mod:`feather._wire`, which are documented as
+unchecked.
+
+Declared views compile to those wire models, which is what Rust deserializes, so
+Rust sees exactly the same JSON as it did before this layer existed.
 """
 
-from typing import Annotated
+from __future__ import annotations
 
-import pydantic
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, cast
 
+from feather import _wire
 from feather.types import DType
 
-NonEmptyStr = Annotated[str, pydantic.StringConstraints(min_length=1)]
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from feather._wire import Entity, FileSource
+
+T = TypeVar("T", bound=DType, covariant=True)
+"""A field's dtype. Covariant so a selection can mix dtypes in one list."""
 
 
-class DefinitionModel(pydantic.BaseModel):
-    """Base for definition models.
+@dataclass(frozen=True)
+class _ViewConfig:
+    """What the decorator carries, kept out of the schema namespace.
 
-    Definitions are data, not code: they are immutable, and an unknown key is a
-    typo rather than something to ignore.
+    Attributes:
+        name: The view's wire name.
+        entity: The entity the view is keyed by.
+        source: The offline source the features are read from.
+        ttl_days: Whole days before a value is stale, or None for no expiry.
+        timestamp_field: Source column holding the event timestamp.
+        created_timestamp_field: Source column holding the created timestamp.
     """
 
-    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
-
-
-class Entity(DefinitionModel):
-    """A join key that features are grouped by.
-
-    `join_key` names the column in the source. The entity *values* are what the
-    key encoder caps at 512 bytes per component, and those only exist at runtime,
-    so that limit is enforced in Rust rather than here.
-    """
-
-    name: NonEmptyStr
-    join_key: NonEmptyStr
-
-
-class Field(DefinitionModel):
-    """One feature and its storage type.
-
-    `dtype` is the wire type, not a Python type. Rust maps it to an Arrow type
-    (`int64` to `Int64`, `timestamp_micros` to a microsecond timestamp, and so
-    on) and the value codec writes fixed-width columns at a fixed stride, which
-    is why the set is closed.
-    """
-
-    name: NonEmptyStr
-    dtype: DType
-
-
-class FileSource(DefinitionModel):
-    """A file-backed offline source.
-
-    A single kind in v1. Object storage and warehouse tiers use the same model
-    with a different path scheme, so no discriminator is needed yet.
-    """
-
-    path: NonEmptyStr
-
-
-class FeatureView(DefinitionModel):
-    """Features derived from one source, keyed by one entity."""
-
-    name: NonEmptyStr
-    entities: Annotated[list[Entity], pydantic.Field(min_length=1)]
+    name: str
+    entity: Entity
     source: FileSource
-    features: Annotated[list[Field], pydantic.Field(min_length=1)]
-    ttl_days: Annotated[int, pydantic.Field(gt=0)] | None = None
-    timestamp_field: NonEmptyStr | None = None
-    created_timestamp_field: NonEmptyStr | None = None
+    ttl_days: int | None
+    timestamp_field: str | None
+    created_timestamp_field: str | None
 
-    @pydantic.model_validator(mode="after")
-    def _check(self) -> "FeatureView":
-        """Reject shapes the Rust engines cannot represent.
+
+class Field(Generic[T]):
+    """A declared feature.
+
+    Assigned in a :class:`FeatureView` class body, where the attribute name
+    becomes the feature name.
+    """
+
+    name: str
+    view: str
+    dtype: type[T]
+
+    def __init__(self, dtype: type[T]) -> None:
+        """Record the storage type.
+
+        Args:
+            dtype: One of the markers in :mod:`feather.types`.
+        """
+        self.dtype = dtype
+        self.name = ""
+        self.view = ""
+
+    def __set_name__(self, owner: type[Any], name: str) -> None:
+        """Take the attribute name as the feature name.
+
+        Args:
+            owner: The class the field was assigned in. Unused: the view name is
+                bound by the decorator, which runs once the class exists.
+            name: The attribute name.
+        """
+        self.name = name
+
+    def __repr__(self) -> str:
+        """Render as a qualified name and wire type.
 
         Returns:
-            The validated view.
-
-        Raises:
-            ValueError: If the view declares more than one entity, repeats a
-                field name, or declares the same field as both timestamp and
-                created timestamp.
+            The reference, such as ``user_clicks:click_count (int64)``.
         """
-        if len(self.entities) > 1:
-            raise ValueError(
-                f"view {self.name!r} declares {len(self.entities)} entities; "
-                "v1 supports exactly one per view"
-            )
-        names = [f.name for f in self.features]
-        if len(set(names)) != len(names):
-            raise ValueError(f"view {self.name!r} repeats a feature name")
-        if (
-            self.timestamp_field is not None
-            and self.timestamp_field == self.created_timestamp_field
-        ):
-            raise ValueError(
-                f"view {self.name!r} uses {self.timestamp_field!r} as both the event "
-                "timestamp and the created timestamp"
-            )
-        return self
+        qualified = f"{self.view}:{self.name}" if self.view else self.name
+        return f"{qualified} ({self.dtype.wire})"
 
 
-class FeatureService(DefinitionModel):
-    """A named projection: a name and a list of ``view:feature`` references.
+class FeatureView:
+    """Marker base for a declared view.
 
-    Deliberately not a registry object. It carries no entities, no version, and
+    Deliberately empty, and pinned by a test. Any attribute here would take that
+    name away from the schema, so a view could no longer declare a feature
+    called ``config`` or ``fields``. The configuration lives on the decorator
+    instead, under a dunder name.
+    """
+
+    __feather_view__: ClassVar[_ViewConfig]
+
+
+S = TypeVar("S", bound="type[FeatureView]")
+"""A declared view class. Bounded so a decorator cannot be applied to anything else."""
+
+
+def feature_view(
+    *,
+    name: str,
+    entity: Entity,
+    source: FileSource,
+    ttl_days: int | None = None,
+    timestamp_field: str | None = None,
+    created_timestamp_field: str | None = None,
+) -> Callable[[S], S]:
+    """Declare a feature view around a schema class.
+
+    Args:
+        name: The view's wire name. This is what the key layout and the
+            ``view:feature`` convention use.
+        entity: The entity the view is keyed by. Not a list: v1 keys one hash per
+            entity, so the wire model rejects more than one.
+        source: The offline source the features are read from.
+        ttl_days: Whole days before a value is stale, or None for no expiry.
+            Deliberately not a duration: Rust stores whole days, so a
+            ``timedelta`` would silently truncate.
+        timestamp_field: Source column holding the event timestamp. Defaults to
+            ``event_timestamp`` in Rust, not here.
+        created_timestamp_field: Source column holding the created timestamp.
+
+    Returns:
+        A decorator that returns the class unchanged, with its configuration
+        attached and its fields bound to the view name.
+
+    Raises:
+        ValueError: If the class declares no fields.
+        pydantic.ValidationError: If the resulting view is malformed. Raised at
+            decoration, so a bad definition fails at import rather than when an
+            engine starts.
+    """
+
+    def decorate(cls: S) -> S:
+        config = _ViewConfig(
+            name=name,
+            entity=entity,
+            source=source,
+            ttl_days=ttl_days,
+            timestamp_field=timestamp_field,
+            created_timestamp_field=created_timestamp_field,
+        )
+        fields = view_fields(cls)
+        for field in fields:
+            field.view = name
+        # Cast rather than assigning on `cls` directly: S is bounded by
+        # type[FeatureView], and a checker may narrow an assignment to that bound
+        # type variable instead of resolving the ClassVar through it.
+        cast("type[FeatureView]", cls).__feather_view__ = config
+        # Compiling is validating, so doing it here makes a malformed view fail
+        # at import rather than at first use.
+        view_to_wire(cls)
+        return cls
+
+    return decorate
+
+
+def view_fields(view: type[FeatureView]) -> tuple[Field[Any], ...]:
+    """Return a view's declared fields, in declaration order.
+
+    Args:
+        view: The declared view class.
+
+    Returns:
+        The fields.
+
+    Raises:
+        ValueError: If the class declares no fields, which is almost always the
+            decorator applied to the wrong class.
+    """
+    fields = tuple(value for value in vars(view).values() if isinstance(value, Field))
+    if not fields:
+        raise ValueError(
+            f"feature view {view.__name__} declares no fields; "
+            "is the decorator applied to the schema class?"
+        )
+    return fields
+
+
+def view_to_wire(view: type[FeatureView]) -> _wire.FeatureView:
+    """Compile a declared view to the wire model Rust deserializes.
+
+    Args:
+        view: The declared view class.
+
+    Returns:
+        The compiled view.
+
+    Raises:
+        pydantic.ValidationError: If the view is one the engines cannot
+            represent.
+    """
+    config = view.__feather_view__
+    return _wire.FeatureView(
+        name=config.name,
+        entities=[config.entity],
+        source=config.source,
+        features=[_wire.Field(name=f.name, dtype=f.dtype.wire) for f in view_fields(view)],
+        ttl_days=config.ttl_days,
+        timestamp_field=config.timestamp_field,
+        created_timestamp_field=config.created_timestamp_field,
+    )
+
+
+class FeatureService:
+    """A named projection: a name and the features it exposes.
+
+    Accepts declared fields, or a whole view to mean every field on it. The name
+    is what a serving request carries, so the field set resolves once at startup
+    rather than per request.
+
+    Deliberately not a registry object: it carries no entities, no version, and
     no infrastructure, because entities come from the referenced views.
     """
 
-    name: NonEmptyStr
-    features: Annotated[list[NonEmptyStr], pydantic.Field(min_length=1)]
+    name: str
+    features: tuple[Field[Any], ...]
 
-    @pydantic.field_validator("features")
-    @classmethod
-    def _check_references(cls, value: list[str]) -> list[str]:
-        """Reject references that are not ``view:feature``.
+    def __init__(self, name: str, features: Sequence[Field[Any] | type[FeatureView]]) -> None:
+        """Resolve the references to fields.
 
-        Returns:
-            The validated references.
+        Args:
+            name: The service name.
+            features: Declared fields, or views meaning all of their fields.
 
         Raises:
-            ValueError: If a reference is malformed or repeated.
+            ValueError: If a view in ``features`` declares no fields.
         """
-        for reference in value:
-            view, separator, feature = reference.partition(":")
-            if not separator or not view or not feature:
-                raise ValueError(f"malformed reference {reference!r}; expected 'view:feature'")
-        if len(set(value)) != len(value):
-            raise ValueError("a feature service repeats a reference")
-        return value
-
-    def references(self) -> list[tuple[str, str]]:
-        """Split the references into ``(view, feature)`` pairs.
-
-        Returns:
-            One pair per reference, in declaration order.
-        """
-        pairs: list[tuple[str, str]] = []
-        for reference in self.features:
-            view, _, feature = reference.partition(":")
-            pairs.append((view, feature))
-        return pairs
+        self.name = name
+        resolved: list[Field[Any]] = []
+        for item in features:
+            if isinstance(item, Field):
+                resolved.append(item)
+            else:
+                resolved.extend(view_fields(item))
+        self.features = tuple(resolved)
 
 
-class FeatureStoreConfig(DefinitionModel):
-    """A project's definitions.
+class FeatureStoreConfig:
+    """A project: the views and services it declares.
 
-    This is the object serialized and handed to Rust.
+    Thin on purpose. It holds declarations and compiles them; the wire model owns
+    the invariants.
     """
 
-    project: NonEmptyStr
-    views: list[FeatureView] = pydantic.Field(default_factory=list)
-    services: list[FeatureService] = pydantic.Field(default_factory=list)
+    project: str
+    views: tuple[type[FeatureView], ...]
+    services: tuple[FeatureService, ...]
 
-    def view(self, name: str) -> FeatureView:
-        """Look up a view by name.
+    def __init__(
+        self,
+        project: str,
+        views: Sequence[type[FeatureView]] = (),
+        services: Sequence[FeatureService] = (),
+    ) -> None:
+        """Record the project.
 
-        Returns:
-            The view.
-
-        Raises:
-            KeyError: If no view has that name.
+        Args:
+            project: The project name.
+            views: The declared views.
+            services: The declared services.
         """
-        for candidate in self.views:
-            if candidate.name == name:
-                return candidate
-        raise KeyError(f"no feature view named {name!r}")
+        self.project = project
+        self.views = tuple(views)
+        self.services = tuple(services)
 
-    def validate_references(self) -> None:
-        """Check references that span objects, which Pydantic cannot see.
 
-        Raises:
-            ValueError: If a view name is repeated, a service name is repeated,
-                or a service references an unknown view or feature.
-        """
-        view_names = [v.name for v in self.views]
-        if len(set(view_names)) != len(view_names):
-            raise ValueError("two feature views share a name")
+def config_to_wire(config: FeatureStoreConfig) -> _wire.FeatureStoreConfig:
+    """Compile a project to the wire model Rust deserializes.
 
-        service_names = [s.name for s in self.services]
-        if len(set(service_names)) != len(service_names):
-            raise ValueError("two feature services share a name")
+    Args:
+        config: The project.
 
-        for service in self.services:
-            for view_name, feature_name in service.references():
-                view = self.view(view_name)
-                if all(f.name != feature_name for f in view.features):
-                    raise ValueError(
-                        f"feature service {service.name!r} references "
-                        f"{view_name}:{feature_name}, but {view_name!r} has no such feature"
-                    )
+    Returns:
+        The compiled project.
+
+    Raises:
+        KeyError: If a service references a view the project does not declare.
+        pydantic.ValidationError: If a definition is malformed.
+    """
+    wire = _wire.FeatureStoreConfig(
+        project=config.project,
+        views=[view_to_wire(view) for view in config.views],
+        services=[
+            _wire.FeatureService(
+                name=service.name,
+                features=[f"{field.view}:{field.name}" for field in service.features],
+            )
+            for service in config.services
+        ],
+    )
+    wire.validate_references()
+    return wire
+
+
+__all__ = [
+    "FeatureService",
+    "FeatureStoreConfig",
+    "FeatureView",
+    "Field",
+    "config_to_wire",
+    "feature_view",
+    "view_fields",
+    "view_to_wire",
+]
