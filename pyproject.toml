@@ -1,0 +1,134 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "feather-store"
+version = "0.0.1"
+description = "An opinionated feature store with a Rust core and a native Python API"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Chandler King" }]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["pydantic>=2.9"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "polars>=1.0"]
+
+[tool.maturin]
+# The Rust crates are a Cargo workspace, so point maturin at the member that
+# builds the extension.
+manifest-path = "crates/feather-py/Cargo.toml"
+module-name = "feather._core"
+python-source = "python"
+python-packages = ["feather"]
+# Deliberately no `features = ["pyo3/extension-module"]`. For PyO3 >= 0.27 maturin
+# sets PYO3_BUILD_EXTENSION_MODULE itself, and enabling the feature statically
+# breaks `cargo test` linking.
+
+[tool.uv]
+package = true
+# uv rebuilds the extension only when a cache key changes, so the Rust sources
+# must be listed or edits to them are silently ignored. This key list replaces
+# uv's defaults, so pyproject.toml stays in it.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "Cargo.lock" },
+  { file = "crates/**/*.rs" },
+  { file = "crates/**/Cargo.toml" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The package lives under python/, so tests run against the source tree without
+# requiring the Rust extension to be built and installed first.
+pythonpath = ["python"]
+markers = [
+  "integration: requires a running Valkey container",
+  "load: measures throughput or latency, not run by default",
+]
+addopts = "-q"
+
+[tool.ruff]
+# The floor of the support range, set explicitly rather than inferred, so it is
+# visible in review. Deliberately not py314: that target emits an "under
+# development" warning in ruff 0.12.x and we support 3.12 and up.
+target-version = "py312"
+line-length = 100
+src = ["python", "tests"]
+extend-exclude = ["target", "dist", "build"]
+
+[tool.ruff.lint]
+# Explicit select rather than extend-select, so the rule set cannot drift on
+# upgrade. D and ANN are included from the start because the library's public
+# surface should be documented and annotated; adding them later is noisier.
+select = [
+  "E", # pycodestyle errors
+  "W", # pycodestyle warnings
+  "F", # Pyflakes
+  "I", # isort
+  "UP", # pyupgrade
+  "B", # flake8-bugbear
+  "C4", # flake8-comprehensions
+  "SIM", # flake8-simplify
+  "RET", # flake8-return
+  "PERF", # perflint
+  "PTH", # flake8-use-pathlib
+  "RUF", # ruff-specific
+  "TC", # flake8-type-checking
+  "D", # pydocstyle
+  "ANN", # flake8-annotations
+]
+ignore = [
+  "D203", # conflicts with D211
+  "D213", # conflicts with D212
+  "E501", # line length is the formatter's job
+  "ANN401", # Any is sometimes the honest annotation
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ty is beta. Its diagnostics may change between any two 0.0.x releases, and
+# `error-on-warning` defaults to true, so a patch release could turn it red with
+# no code change. It also has no Pydantic integration (astral-sh/ty#2403), and the
+# definition models are Pydantic. It therefore runs as `mise run lint:types` and
+# is deliberately not part of `mise run check`. Promote it once ty reaches its
+# Stable milestone and these models are covered.
+[tool.ty.environment]
+# Libraries ship everywhere; do not let the build host narrow the types.
+python-platform = "all"
+
+[tool.ty.src]
+include = ["python", "tests"]
+
+[tool.ty.rules]
+# Both ship as `ignore`, which makes an unconfigured ty run under-check.
+possibly-missing-import = "error"
+possibly-missing-attribute = "error"
+
+# The Python package lives under python/ and the extension is compiled, so both
+# pyright and mypy need to be told where the source root and the virtualenv are.
+# Without this they report every third-party and first-party import as unresolved.
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["python"]
+include = ["python", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "python"
+files = ["python", "tests"]

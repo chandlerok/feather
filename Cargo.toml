@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/feather-core", "crates/feather-py"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/chandlerok/feather"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Arrow is pinned to 58 because duckdb 1.10505 depends on arrow ^58 and pyo3-arrow
+# 0.17 depends on arrow ^58. Mixing Arrow majors produces two incompatible sets of
+# types at the FFI boundary, so the whole stack shares one version.
+arrow = { version = "58", default-features = false }
+pyo3-arrow = { version = "0.17", default-features = false }
+
+duckdb = { version = "~1.10505.0", default-features = false }
+moka = { version = "0.12", default-features = false }
+redis = { version = "1.7", default-features = false }
+tokio = { version = "1.53", default-features = false }
+
+pyo3 = { version = "0.28", default-features = false }
+
+bytes = "1.12"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

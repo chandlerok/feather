@@ -1,0 +1,59 @@
+// Git hooks for feather.
+//
+// Deliberately fast checks only. `cargo clippy --all-features` is excluded
+// because it builds bundled DuckDB from source, which takes minutes; run it with
+// `mise run lint:rust` instead. The `fix` hook below can still autofix, and it is
+// opt-in via `hk fix`.
+//
+// Git here is 2.50, below the 2.54 cutoff, so `hk install` writes a script shim
+// into .git/hooks/ rather than using config-based hooks. `hk install --global`
+// requires 2.54 and is therefore unavailable.
+amends "package://github.com/jdx/hk/releases/download/v1.56.1/hk@1.56.1#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.56.1/hk@1.56.1#/Builtins.pkl"
+
+local linters = new Mapping<String, Step> {
+  // ---- Rust: formatting only. See the note above about clippy. ----
+  ["cargo-fmt"] = Builtins.cargo_fmt
+
+  // ---- Python ----
+  ["ruff"] = Builtins.ruff
+  ["ruff-format"] = Builtins.ruff_format
+
+  // ---- Everything else: JSON, TOML, YAML, Markdown, Dockerfile ----
+  // dprint owns every non-Rust, non-Python file type. Its plugin list lives in
+  // dprint.json; this step just hands it the staged files.
+  ["dprint"] = new Step {
+    glob = List(
+      "**/*.json",
+      "**/*.jsonc",
+      "**/*.toml",
+      "**/*.md",
+      "**/*.markdown",
+      "**/*.yml",
+      "**/*.yaml",
+      "**/Dockerfile",
+      "**/docker-compose.yml",
+    )
+    check = "dprint check {{files}}"
+    fix = "dprint fmt {{files}}"
+  }
+}
+
+hooks {
+  ["pre-commit"] {
+    // Check only. Autofix on every commit is surprising; use `hk fix`.
+    fix = false
+    steps = linters
+  }
+  ["pre-push"] {
+    steps = linters
+  }
+  ["check"] {
+    steps = linters
+  }
+  ["fix"] {
+    fix = true
+    stash = "git"
+    steps = linters
+  }
+}

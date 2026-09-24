@@ -15,23 +15,23 @@ A single codebase, with a strict division of labor between historical processing
 offline engine) and low-latency feature lookup (the online serving layer).
 
 ```text
-        ┌──────────────────────────────────────────────────────────────┐
-        │  Python layer                                                │
-        │  feature_store.yaml   infrastructure config (Pydantic v2)    │
-        │  definitions/*.py     entities, sources, feature views       │
-        └───────────────────────────┬──────────────────────────────────┘
-                                    │ Maturin / PyO3
-        ┌───────────────────────────▼──────────────────────────────────┐
-        │  Rust core                                                   │
-        └────────┬─────────────────────────────────────┬───────────────┘
-                 │ offline                             │ online
-   ┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
-   │  DuckDB                        │    │  L1: moka, invalidated by         │
-   │  Parquet / S3 / Iceberg        │    │      Valkey CLIENT TRACKING       │
-   │  warehouse sources (community  │    │  L2: Valkey, one hash per entity  │
-   │  extensions)                   │    │      field per feature view       │
-   │  ASOF join, Arrow out          │    │                                   │
-   └────────────────────────────────┘    └───────────────────────────────────┘
+     ┌──────────────────────────────────────────────────────────────┐
+     │  Python layer                                                │
+     │  feature_store.yaml   infrastructure config (Pydantic v2)    │
+     │  definitions/*.py     entities, sources, feature views       │
+     └───────────────────────────┬──────────────────────────────────┘
+                                 │ Maturin / PyO3
+     ┌───────────────────────────▼──────────────────────────────────┐
+     │  Rust core                                                   │
+     └────────┬─────────────────────────────────────┬───────────────┘
+              │ offline                             │ online
+┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
+│  DuckDB                        │    │  L1: moka, invalidated by         │
+│  Parquet / S3 / Iceberg        │    │      Valkey CLIENT TRACKING       │
+│  warehouse sources (community  │    │  L2: Valkey, one hash per entity  │
+│  extensions)                   │    │      field per feature view       │
+│  ASOF join, Arrow out          │    │                                   │
+└────────────────────────────────┘    └───────────────────────────────────┘
 ```
 
 Note what is absent: there is no registry, no lockfile, and no compiled definition
@@ -127,7 +127,7 @@ footgun. An explicit list also tells the serving image exactly what it must cont
 #### Why there is no registry
 
 A registry exists to hold data that the definitions cannot express. Because the definitions
-are Python data with real dtypes, the only irreducible candidate is pinning *external*
+are Python data with real dtypes, the only irreducible candidate is pinning _external_
 sources, and that is covered by read-time validation instead.
 
 For a registry to be worth its cost it would have to hold something git does not already
@@ -171,8 +171,8 @@ which means a cluster colocates them automatically, with no hash tags.
 
 ```text
 key:    {project}:{entity_name}:{encoded_entity_key}
-fields: v:{view}:{feature}   encoded feature value
-        f:{view}             event timestamp of the last write for this view (int64 micros)
+fields: v:{view}   the view's encoded feature vector, all its features in one blob
+        f:{view}   event timestamp of the last write for this view (int64 micros)
 ```
 
 #### Entity key encoding
@@ -205,7 +205,10 @@ Three consequences:
 The leading segment is a namespace, reserved so that later capabilities are additive rather
 than a key-format change:
 
-- `v:` latest value. What v1 writes.
+- `v:` one view's encoded feature vector. What v1 writes. One field per view rather
+  than per feature, because the value codec writes a whole vector in a single
+  fixed-stride blob; a per-feature field would either repeat the schema tag per feature
+  or force the codec down to one column at a time and lose the stride.
 - `f:` freshness metadata. Used for the read-time TTL check and for staleness reporting.
 - `t:` pre-aggregated tiles. Reserved for the tiling upgrade path, see "Scalability".
 
@@ -223,7 +226,7 @@ A field value is one view's feature vector for one entity:
 ```
 
 The property that matters is that **fixed-width columns are concatenated with no per-value
-length prefix**, so locating column *k* is arithmetic rather than parsing. Variable-width
+length prefix**, so locating column _k_ is arithmetic rather than parsing. Variable-width
 values (strings, lists) live in a trailing section behind an offset table, so a reader that
 wants only fixed-width columns never touches them.
 
@@ -245,8 +248,9 @@ dispatch. That is the point of the layout.
 #### Read path
 
 For a request covering any number of feature views on the same entity, serving issues **one
-`HMGET` per entity**, with exactly the requested fields. View count does not multiply round
-trips.
+`HMGET` per entity**, requesting one field per view plus one freshness field. View count does
+not multiply round trips. The caller's requested features are projected out after decoding,
+so reading two features from a wide view costs decode time for the columns it did not ask for.
 
 Feast issues one `read_from_online_store` call per feature view despite advertising entity
 collocation; a user with 11 feature views reported "abysmal" retrieval times
@@ -297,11 +301,11 @@ null") is violated in practice
 
 Three states exist, and collapsing them would lie to the consumer:
 
-| State | Cause |
-| --- | --- |
-| `null` | The source had a null, and that null was materialized. |
+| State     | Cause                                                          |
+| --------- | -------------------------------------------------------------- |
+| `null`    | The source had a null, and that null was materialized.         |
 | `missing` | The field was never written, or its schema tag does not match. |
-| `expired` | `f:{view}` is older than the view's `ttl`. |
+| `expired` | `f:{view}` is older than the view's `ttl`.                     |
 
 `expired` and `missing` both mean "unknown"; the difference is diagnostic, and both are
 reported as `missing`.
@@ -595,7 +599,7 @@ There is no protobuf anywhere in Feather's data path.
 
 ### Latest-per-entity pushdown
 
-A full refresh of *current* feature values needs only the most recent row per entity, not the
+A full refresh of _current_ feature values needs only the most recent row per entity, not the
 full history. That reduction happens inside DuckDB (`arg_max`, or
 `QUALIFY row_number() OVER (PARTITION BY entity ORDER BY ts DESC) = 1`), never in Python.
 
@@ -699,14 +703,14 @@ merging".
 
 The v1 set is closed and small, covering the aggregates that merge exactly:
 
-| Aggregate | Stored in tile | Merge | Storage |
-| --- | --- | --- | --- |
-| `sum` | sum | `sum(tile_sums)` | 1 value |
-| `count` | count | `sum(tile_counts)` | 1 value |
-| `min` | min | `min(tile_mins)` | 1 value |
-| `max` | max | `max(tile_maxes)` | 1 value |
-| `mean` | sum, count | sum both, then divide | 2 values |
-| `stddev` | sum, sumsq, count | sum all three, then derive | 3 values |
+| Aggregate | Stored in tile    | Merge                      | Storage  |
+| --------- | ----------------- | -------------------------- | -------- |
+| `sum`     | sum               | `sum(tile_sums)`           | 1 value  |
+| `count`   | count             | `sum(tile_counts)`         | 1 value  |
+| `min`     | min               | `min(tile_mins)`           | 1 value  |
+| `max`     | max               | `max(tile_maxes)`          | 1 value  |
+| `mean`    | sum, count        | sum both, then divide      | 2 values |
+| `stddev`  | sum, sumsq, count | sum all three, then derive | 3 values |
 
 > `ponytail:` `stddev` is stored as sum, sumsq, and count and derived as
 > `sumsq/n - (sum/n)^2`. That form cancels catastrophically when values are large relative to
@@ -728,7 +732,7 @@ tiles does not change existing field names.
 
 ### Sawtooth windowing
 
-Tiles alone are not enough for a *relative* window, because the freshest data is always
+Tiles alone are not enough for a _relative_ window, because the freshest data is always
 younger than the newest tile boundary. Tecton's answer is sawtooth windowing, and it is worth
 copying: the compaction job writes "a few number of small tiles at the tail (i.e. the oldest
 edge) of the aggregation window in addition to a larger compacted tile". Their example: "for
@@ -943,7 +947,7 @@ timing and the single-core behavior.
 
 Switching the per-cell format to Arrow IPC does not fix it. A reviewer on the same issue
 noted that you would "still have to serialize every individual cell of the table
-separately", and another noted that Arrow IPC encoded per single row is *larger* than
+separately", and another noted that Arrow IPC encoded per single row is _larger_ than
 protobuf, because each message carries its schema.
 
 The fix is granularity. Feather serializes one vector per entity per view, or better, encodes

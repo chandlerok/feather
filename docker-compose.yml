@@ -1,0 +1,35 @@
+# Real Valkey with production-shaped limits, so tests and load runs meet the
+# constraints they will meet in a cluster rather than on an idle laptop.
+#
+# maxmemory is deliberately below the container limit: the point is to exercise
+# eviction and the "key is gone" path, not to have a comfortable buffer.
+services:
+  valkey:
+    image: valkey/valkey:9-alpine
+    command:
+      - valkey-server
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --io-threads
+      - "2"
+      - --tcp-keepalive
+      - "60"
+    ports:
+      - "127.0.0.1:6379:6379"
+    cpus: 2
+    mem_limit: 512m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

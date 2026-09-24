@@ -1,0 +1,9 @@
+target/
+.research/
+__pycache__/
+*.py[cod]
+.venv/
+*.so
+*.dylib
+dist/
+.mise/

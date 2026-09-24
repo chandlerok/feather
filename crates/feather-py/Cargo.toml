@@ -1,0 +1,21 @@
+[package]
+name = "feather-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Python bindings for Feather"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrow.workspace = true
+feather-core = { path = "../feather-core", features = ["full"] }
+# No `extension-module` feature here on purpose. maturin sets
+# PYO3_BUILD_EXTENSION_MODULE for PyO3 >= 0.27, and enabling the feature
+# statically would stop `cargo test` from linking.
+pyo3 = { workspace = true, features = ["abi3-py312"] }
+pyo3-arrow.workspace = true

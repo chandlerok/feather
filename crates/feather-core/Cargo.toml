@@ -1,0 +1,50 @@
+[package]
+name = "feather-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Encoding, offline joins, and online storage for Feather"
+
+[dependencies]
+arrow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Heavy and slow to build. Optional so that `cargo check` and the encoding tests
+# stay fast; the mise test task uses --all-features.
+# Bundled compiles DuckDB from source: roughly 10-15 minutes cold on macOS arm64,
+# then cached in target/. `parquet` implies `bundled` and is what gives us
+# read_parquet. Note the bundled build excludes ICU, so no date arithmetic that
+# needs it (`ts::date`, `now() - interval '1 day'`). Timestamps are handled as
+# int64 microseconds and compared with integer arithmetic instead, which avoids
+# ICU entirely and is also faster.
+#
+# CI can skip the C++ build with DUCKDB_DOWNLOAD_LIB=1, which fetches a prebuilt
+# library; that requires NOT enabling `bundled` and needs the dylib on the
+# runtime search path.
+duckdb = { workspace = true, optional = true, features = ["bundled", "parquet"] }
+redis = { workspace = true, optional = true, features = [
+  "tokio-comp",
+  "connection-manager",
+] }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []
+# Bundled DuckDB. First build compiles DuckDB from source and takes minutes.
+offline = ["dep:duckdb"]
+# Real Valkey client. Unit tests use the in-memory fake instead.
+valkey = ["dep:redis", "dep:tokio"]
+full = ["offline", "valkey"]
+
+[lib]
+doctest = true

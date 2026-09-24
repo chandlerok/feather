@@ -1,0 +1,30 @@
+{
+  "$schema": "https://dprint.dev/schemas/v0.json",
+  "lineWidth": 100,
+  "incremental": true,
+  "includes": [
+    "**/*.{json,jsonc,toml,md,markdown,yml,yaml}"
+  ],
+  "excludes": [
+    "target/**",
+    ".venv/**",
+    "**/node_modules/**",
+    "**/*-lock.json",
+    ".research/**",
+    "Cargo.lock",
+    "uv.lock"
+  ],
+  "json": {
+    "indentWidth": 2
+  },
+  "markdown": {
+    "textWrap": "maintain"
+  },
+  "plugins": [
+    "npm:@dprint/json@0.24.0",
+    "npm:@dprint/toml@0.8.0",
+    "npm:@dprint/markdown@0.24.0",
+    "npm:@dprint/dockerfile@0.6.0",
+    "npm:dprint-plugin-yaml@0.6.0"
+  ]
+}

@@ -1,4 +1,102 @@
 [tools]
 rust = "latest"
 uv = "latest"
-hk = "latest"
+# Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
+# from the schema it loads.
+hk = "1.56.1"
+ruff = "latest"
+ty = "latest"
+maturin = "latest"
+# Formats every non-Rust, non-Python file type: JSON, TOML, YAML, Markdown,
+# Dockerfile. cargo owns Rust, ruff owns Python.
+dprint = "latest"
+"cargo:bacon" = "latest"
+
+[tasks.setup]
+description = "Install Python deps and the git hook"
+run = ["uv sync --all-groups", "hk install --mise"]
+
+# ---------------------------------------------------------------- formatting
+
+[tasks.format]
+description = "Format Rust, Python, and data files"
+run = ["cargo fmt --all", "ruff format python tests", "dprint fmt"]
+
+[tasks."format:check"]
+description = "Check formatting without writing"
+run = ["cargo fmt --all --check", "ruff format --check python tests", "dprint check"]
+
+# ------------------------------------------------------------------- linting
+
+[tasks.lint]
+description = "Lint everything that is fast enough for a commit hook"
+depends = ["lint:rust", "lint:python"]
+
+[tasks."lint:rust"]
+description = "Clippy over the whole workspace, including feature-gated code"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks."lint:python"]
+run = "ruff check python tests"
+
+# Advisory. ty is beta: its diagnostics may change between any two 0.0.x releases,
+# and it has no Pydantic integration yet (astral-sh/ty#2403), so it produces false
+# positives around the definition models. Run it, read it, do not gate on it.
+[tasks."lint:types"]
+run = "ty check"
+
+# ------------------------------------------------------------------- testing
+
+[tasks.test]
+description = "Unit tests. No external services required."
+run = [
+  "cargo test --workspace --all-features",
+  "uv run pytest -m 'not integration and not load'",
+]
+
+[tasks."test:integration"]
+description = "Integration tests against a real Valkey container"
+depends = ["valkey:up"]
+run = "uv run pytest -m integration"
+
+[tasks.check]
+description = "Everything a CI run would do"
+depends = ["format:check", "lint", "test"]
+
+# ---------------------------------------------------------------- containers
+
+[tasks."valkey:up"]
+description = "Start Valkey with production-shaped resource limits"
+run = "docker compose up -d --wait valkey"
+
+[tasks."valkey:down"]
+description = "Stop Valkey and delete its volume"
+run = "docker compose down -v"
+
+[tasks."valkey:logs"]
+run = "docker compose logs -f valkey"
+
+[tasks."valkey:cli"]
+run = "docker compose exec valkey valkey-cli"
+
+# ------------------------------------------------------------------ load/bench
+
+[tasks.bench]
+description = "Rust micro-benchmarks"
+run = "cargo bench --workspace --all-features"
+
+[tasks."bench:valkey"]
+description = "Raw Valkey ceiling, for comparison against our read path"
+depends = ["valkey:up"]
+run = "docker compose exec valkey valkey-benchmark -h 127.0.0.1 -p 6379 -n 200000 -c 50 -t get,set -q"
+
+[tasks."bench:load"]
+description = "Load test the online read path against real Valkey"
+depends = ["valkey:up"]
+run = "cargo run --release -p feather-core --all-features --example loadtest"
+
+# --------------------------------------------------------------------- watch
+
+[tasks.watch]
+description = "Background Rust check loop"
+run = "bacon"
