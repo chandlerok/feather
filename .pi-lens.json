@@ -2,6 +2,15 @@
   "$schema": "https://raw.githubusercontent.com/apmantza/pi-lens/master/docs/schema/pi-lens-config-v1.json",
   "ignore": ["tests/test_typing_contract.py"],
   "lsp": {
-    "disabledServers": ["pyright"]
+    "disabledServers": ["python", "python-jedi"],
+    "servers": {
+      "pyrefly": {
+        "name": "Pyrefly",
+        "extensions": [".py", ".pyi"],
+        "command": ".venv/bin/pyrefly",
+        "args": ["lsp"],
+        "rootMarkers": ["pyproject.toml"]
+      }
+    }
   }
 }
