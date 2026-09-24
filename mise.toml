@@ -9,7 +9,6 @@ uv = "latest"
 # from the schema it loads.
 hk = "1.56.1"
 ruff = "latest"
-ty = "latest"
 maturin = "latest"
 # Formats every non-Rust, non-Python file type: JSON, TOML, YAML, Markdown,
 # Dockerfile. cargo owns Rust, ruff owns Python.
@@ -43,19 +42,13 @@ run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 [tasks."lint:python"]
 run = "ruff check python tests"
 
-# Gating, unlike the advisory task below. The typed definition API is the reason a
-# feature reference is checkable at all, and tests/test_typing_contract.py pins
-# those guarantees with assert_type and with `# type: ignore[code]`, which mypy
-# rejects once it is no longer needed. pytest only imports that file, so without
-# this the guarantees are unenforced.
+# Gating. The typed definition API is the reason a feature reference is checkable
+# at all, and tests/test_typing_contract.py pins those guarantees with assert_type
+# and with `# pyrefly: ignore[kind]`, which pyrefly rejects once the ignore stops
+# being needed. pytest only imports that file, so without this the guarantees are
+# unenforced. The version is pinned in uv.lock.
 [tasks."lint:types"]
-run = "uv run --no-sync mypy"
-
-# Advisory. ty is beta: its diagnostics may change between any two 0.0.x releases,
-# and it has no Pydantic integration yet (astral-sh/ty#2403), so it produces false
-# positives around the definition models. Run it, read it, do not gate on it.
-[tasks."lint:types:advisory"]
-run = "ty check"
+run = "uv run --no-sync pyrefly check"
 
 # ------------------------------------------------------------------- testing
 

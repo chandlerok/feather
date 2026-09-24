@@ -2,21 +2,17 @@
 
 Two things are asserted here, and neither is an ordinary test:
 
-- The positive cases use `assert_type`, so if a reference stops being a
-  `Field[Int64]` this file fails the type check.
-- The negative cases carry a `# type: ignore[...]`. Because mypy runs with
-  `warn_unused_ignores`, an ignore that is no longer needed is itself an error,
-  so a check that quietly stops firing fails this file instead of passing.
+- The positive cases use `assert_type`, so a reference that stops being a
+  `Field[Int64]` fails the type check.
+- The negative cases carry a `# pyrefly: ignore[kind]`. `unused-ignore` is enabled
+  in `[tool.pyrefly.errors]`, so an ignore that is no longer needed is itself an
+  error: a check that quietly stops firing fails here instead of passing.
 
-Two shapes are deliberately avoided, because the two checkers we run disagree on
-them and a single ignore cannot satisfy both:
-
-- A decorator applied to a bad class: mypy attributes the error to the class
-  statement, pyright to the decorator line. The application is therefore written
-  out as a call, where both agree.
-- `assert_type` on a marker's `wire`: mypy infers the specific literal and pyright
-  the declared union. The closed set is pinned by the marker case below and by
-  `test_types`, which needs no agreement about inference.
+The dialect is load-bearing. Pyrefly also suppresses a diagnostic for mypy's
+`# type: ignore[code]`, but it does not audit that form for staleness, so one of
+those would pass whether or not the error still exists. Only its own
+`# pyrefly: ignore[kind]` form gets both halves, and the kind has to be pyrefly's
+kind name rather than mypy's.
 
 Nothing in here is called. The module exists to be type checked.
 """
@@ -62,21 +58,28 @@ def _positive() -> None:
 def _negative() -> None:
     """Every line here must fail the type check, or its ignore is unused."""
     # A misspelled feature is an attribute error, not a runtime lookup failure.
-    _ = UserClicks.click_cout  # type: ignore[attr-defined]
+    _ = UserClicks.click_cout  # pyrefly: ignore[missing-attribute]
 
     # A string reference cannot be checked at all, so the checked path refuses it.
-    FeatureService(name="raw", features=["user_clicks:click_count"])  # type: ignore[list-item]
+    raw_reference = ["user_clicks:click_count"]
+    FeatureService(name="raw", features=raw_reference)  # pyrefly: ignore[bad-argument-type]
 
     # A dtype has to be a marker rather than an arbitrary Python type.
-    Field(int)  # type: ignore[type-var]
+    Field(int)  # pyrefly: ignore[bad-specialization]
 
     # Configuration lives on the decorator, so its typos are caught here.
-    @feature_view(name="x", entity=USER, source=SOURCE, ttl_dayz=1)  # type: ignore[call-arg]
+    @feature_view(
+        name="x",
+        entity=USER,
+        source=SOURCE,
+        ttl_dayz=1,  # pyrefly: ignore[unexpected-keyword]
+    )
     class BadConfig(FeatureView):
         f = Field(Int64)
 
     # The decorator only applies to a declared view.
-    feature_view(name="x", entity=USER, source=SOURCE)(NotAView)  # type: ignore[type-var]
+    apply_view = feature_view(name="x", entity=USER, source=SOURCE)
+    apply_view(NotAView)  # pyrefly: ignore[bad-specialization]
 
 
 def _bad_marker() -> None:
@@ -87,4 +90,4 @@ def _bad_marker() -> None:
     """
 
     class Int32(DType):
-        wire = "int32"  # type: ignore[assignment]
+        wire = "int32"  # pyrefly: ignore[bad-assignment]

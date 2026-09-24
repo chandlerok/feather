@@ -1,4 +1,6 @@
 {
+  "$schema": "https://raw.githubusercontent.com/apmantza/pi-lens/master/docs/schema/pi-lens-config-v1.json",
+  "ignore": ["tests/test_typing_contract.py"],
   "lsp": {
     "disabledServers": ["pyright"]
   }

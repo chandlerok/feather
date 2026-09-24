@@ -18,7 +18,11 @@ classifiers = [
 dependencies = ["pydantic>=2.9"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "polars>=1.0"]
+dev = [
+  "pytest>=8.0",
+  "polars>=1.0",
+  "pyrefly>=1.3",
+]
 
 [tool.maturin]
 # The Rust crates are a Cargo workspace, so point maturin at the member that
@@ -102,55 +106,27 @@ convention = "google"
 [tool.ruff.format]
 docstring-code-format = true
 
-# ty is beta. Its diagnostics may change between any two 0.0.x releases, and
-# `error-on-warning` defaults to true, so a patch release could turn it red with
-# no code change. It also has no Pydantic integration (astral-sh/ty#2403), and the
-# definition models are Pydantic. It therefore runs as `mise run lint:types` and
-# is deliberately not part of `mise run check`. Promote it once ty reaches its
-# Stable milestone and these models are covered.
-[tool.ty.environment]
+# Pyrefly is the type checker, and the only one: no mypy, no pyright, no ty. It
+# reads this table natively, and its version is pinned in uv.lock.
+#
+# The Python package lives under python/ and the extension is compiled, so
+# Pyrefly has to be told where the source root is. Without search-path it reports
+# every first-party import as unresolved.
+#
+# Note for anyone seeing "Cannot find module" from a tooling wrapper: Pyrefly
+# takes the project root from the configuration file it finds by walking up from
+# the files being checked, and resolves imports relative to that. Invoked from
+# outside this directory on an absolute path, it never reads this table, so it
+# never learns about search-path or the interpreter's site-packages.
+[tool.pyrefly]
+project-includes = ["python", "tests"]
+search-path = ["python"]
+python-version = "3.11"
 # Libraries ship everywhere; do not let the build host narrow the types.
 python-platform = "all"
 
-[tool.ty.src]
-include = ["python", "tests"]
-# tests/test_typing_contract.py deliberately contains code that must fail a type
-# check, and pins that with mypy's `# type: ignore[code]`, which mypy verifies is
-# still needed. ty spells the same idea `# ty: ignore`, so it reports those
-# deliberate errors as errors. The file is covered by mypy and pyright instead.
-exclude = ["tests/test_typing_contract.py"]
-
-[tool.ty.rules]
-# Both ship as `ignore`, which makes an unconfigured ty run under-check.
-possibly-missing-import = "error"
-possibly-missing-attribute = "error"
-
-# The Python package lives under python/ and the extension is compiled, so both
-# pyright and mypy need to be told where the source root and the virtualenv are.
-# Without this they report every third-party and first-party import as unresolved.
-#
-# Note for anyone seeing "Import \"pydantic\" could not be resolved" from a
-# tooling wrapper: pyright discovers its configuration by walking up from the
-# working directory, not from the file. Run pyright from anywhere outside this
-# directory and it never reads this table, so it never learns about .venv or
-# extraPaths. Verified: from the repo root, 0 errors; from /tmp or a tool's own
-# directory with an absolute file path, 3 unresolved imports. The fix belongs in
-# the caller (run from the project directory, or pass --project).
-[tool.pyright]
-venvPath = "."
-venv = ".venv"
-extraPaths = ["python"]
-include = ["python", "tests"]
-
-[tool.mypy]
-python_version = "3.11"
-mypy_path = "python"
-files = ["python", "tests"]
+[tool.pyrefly.errors]
 # An ignore that is no longer needed is a claim about the code that stopped being
 # true, so it is an error rather than dead noise. tests/test_typing_contract.py
 # relies on this to pin checks that must fire.
-warn_unused_ignores = true
-# mypy finds third-party stubs through an interpreter, not through venvPath the
-# way pyright does, so it has to be pointed at the project venv explicitly.
-# Without this it cannot see pydantic or pytest at all.
-python_executable = ".venv/bin/python"
+unused-ignore = true
