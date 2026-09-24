@@ -383,15 +383,16 @@ pub fn decode_batch(
         let bitmap = reader.bytes(bitmap_len)?.to_vec();
         let is_null = |index: usize| bitmap[index / 8] & (1 << (index % 8)) != 0;
 
+        // Two passes, matching the encoder: all fixed-width columns first, then
+        // the variable-width tail. Reading them interleaved in declared order
+        // only works when no fixed-width field follows a variable-width one,
+        // which is a silent misparse rather than an error.
         for (index, field) in fields.iter().enumerate() {
+            let Some(width) = field.dtype.fixed_width() else {
+                continue;
+            };
             if is_null(index) {
-                // Still advance past the slot for fixed-width fields.
-                if let Some(width) = field.dtype.fixed_width() {
-                    reader.bytes(width)?;
-                } else {
-                    let len = reader.u32()? as usize;
-                    reader.bytes(len)?;
-                }
+                reader.bytes(width)?;
                 builders[index].null();
                 continue;
             }
@@ -425,6 +426,22 @@ pub fn decode_batch(
                         _ => unreachable!("builder matches field dtype"),
                     }
                 }
+                DType::Utf8 => unreachable!("variable-width handled in the second pass"),
+            }
+        }
+
+        for (index, field) in fields.iter().enumerate() {
+            if field.dtype.is_fixed_width() {
+                continue;
+            }
+            if is_null(index) {
+                let len = reader.u32()? as usize;
+                reader.bytes(len)?;
+                builders[index].null();
+                continue;
+            }
+
+            match field.dtype {
                 DType::Utf8 => {
                     let len = reader.u32()? as usize;
                     if len > MAX_VARIABLE_LEN {
@@ -444,6 +461,7 @@ pub fn decode_batch(
                         _ => unreachable!("builder matches field dtype"),
                     }
                 }
+                _ => unreachable!("fixed-width handled in the first pass"),
             }
         }
 
@@ -634,6 +652,53 @@ mod tests {
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![7]))];
         let encoded = encode_batch(&fields, &columns, 0..1).unwrap();
         assert_eq!(encoded.row(0).unwrap().len(), TAG_LEN + 1 + 1 + 8);
+    }
+
+    #[test]
+    fn a_variable_width_field_before_a_fixed_one_round_trips() {
+        // Regression: the encoder writes all fixed-width columns and then the
+        // variable-width tail, so a decoder that reads them interleaved in
+        // declared order misparses as soon as a fixed-width field follows a
+        // variable-width one. The original tests happened to put the only utf8
+        // field last, which hid it.
+        let fields = vec![
+            Field::new("label", DType::Utf8),
+            Field::new("count", DType::Int64),
+            Field::new("active", DType::Boolean),
+            Field::new("note", DType::Utf8),
+            Field::new("score", DType::Float64),
+        ];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some("first"), None])),
+            Arc::new(Int64Array::from(vec![Some(7), Some(8)])),
+            Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+            Arc::new(StringArray::from(vec![None, Some("last")])),
+            Arc::new(Float64Array::from(vec![Some(1.5), Some(2.5)])),
+        ];
+
+        let encoded = encode_batch(&fields, &columns, 0..2).unwrap();
+        let bufs: Vec<&[u8]> = (0..2).map(|i| encoded.row(i).unwrap()).collect();
+        let decoded = decode_batch(&fields, SchemaTag::of(&fields), &bufs).unwrap();
+
+        let labels = decoded[0].as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(labels.value(0), "first");
+        assert!(labels.is_null(1));
+
+        let counts = decoded[1].as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(counts.value(0), 7);
+        assert_eq!(counts.value(1), 8);
+
+        let active = decoded[2].as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(active.value(0));
+        assert!(!active.value(1));
+
+        let notes = decoded[3].as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(notes.is_null(0));
+        assert_eq!(notes.value(1), "last");
+
+        let scores = decoded[4].as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(scores.value(0), 1.5);
+        assert_eq!(scores.value(1), 2.5);
     }
 
     #[test]

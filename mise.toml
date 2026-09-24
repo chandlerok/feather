@@ -93,7 +93,9 @@ run = "docker compose exec valkey valkey-benchmark -h 127.0.0.1 -p 6379 -n 20000
 [tasks."bench:load"]
 description = "Load test the online read path against real Valkey"
 depends = ["valkey:up"]
-run = "cargo run --release -p feather-core --all-features --example loadtest"
+# Only the valkey feature: the load test measures the online path, and pulling in
+# bundled DuckDB would add minutes to the build for nothing.
+run = "cargo run --release -p feather-core --features valkey --example loadtest"
 
 # --------------------------------------------------------------------- watch
 

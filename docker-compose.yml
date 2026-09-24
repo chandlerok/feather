@@ -1,3 +1,4 @@
+---
 # Real Valkey with production-shaped limits, so tests and load runs meet the
 # constraints they will meet in a cluster rather than on an idle laptop.
 #

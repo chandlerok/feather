@@ -46,5 +46,11 @@ offline = ["dep:duckdb"]
 valkey = ["dep:redis", "dep:tokio"]
 full = ["offline", "valkey"]
 
+[[example]]
+name = "loadtest"
+# Declared here rather than with an inner #![cfg] in the file, which would cfg
+# out `main` too and break a plain `cargo test`.
+required-features = ["valkey"]
+
 [lib]
 doctest = true
