@@ -98,6 +98,45 @@ The user interface is a native Python extension compiled with Maturin and PyO3.
   - pandas DataFrames are converted to Arrow before the boundary, which copies. Only inputs
     that already expose Arrow buffers avoid the copy entirely.
 
+#### Declared views compile to the wire models
+
+Definitions are declared as classes and compiled to the Pydantic models above, so there are
+two layers rather than one:
+
+- **Authoring** (`feather.definitions`): a feature is a typed class attribute, as in
+  `click_count = Field(Int64)`, inside a class whose configuration comes from a decorator.
+- **The wire** (`feather._wire`): the Pydantic models that serialize and cross into Rust.
+  Private, because the shape is a contract rather than a user interface.
+
+The split exists because a reference to a feature has to be checkable. A string cannot be
+checked, and neither can attribute access on an object whose fields are populated at runtime:
+a checker only knows attributes declared in a class body, so `fv.click_count` would resolve
+through `__getattr__` and catch no typo at all. Only moving the declaration into the class body
+makes the reference a checked attribute access.
+
+Two consequences, both measured rather than assumed:
+
+- **A dtype is a class, not an enum member.** It is used as a type argument, `Field[Int64]`. The
+  enum-alias form `Int64 = DType.INT64` is a value, and a checker reports "not valid as a type"
+  while runtime accepts the subscript silently, which is the worst combination.
+- **Configuration is decorator arguments, not class attributes.** Every config key in the body
+  would take that name away from the schema, so a feature could never be called `name`,
+  `source`, or `ttl_days`. Putting configuration on the decorator also makes a typo in it a
+  static error with a suggestion. The base class is empty for the same reason, and a test pins
+  that it declares nothing but dunders.
+
+Rust is unaffected: the compiled JSON is identical to what the models produced before this layer
+existed.
+
+> `ponytail:` the frame returned by a historical join is not schema-typed, so
+> `frame["click_count"]` is unchecked. The output schema is a function of a list argument, and
+> a checker cannot turn `list[Field[Int64]]` into a typed frame. Polars has no
+> `DataFrame[Schema]` yet ([#22119](https://github.com/pola-rs/polars/issues/22119), open since
+> April 2025), so the options today are a user-declared `TypedDict` that restates the field
+> names, or a third-party layer such as pandera. Ceiling: a misspelled output column is a
+> runtime `KeyError` rather than a static error. Upgrade path: `DataFrame[Schema]` when Polars
+> ships it, which needs no Feather-owned wrapper.
+
 #### Definitions are imported, not compiled
 
 Feature definitions are Python modules. Both the offline path and the serving path import
@@ -954,6 +993,41 @@ A compile step is only necessary when the authoring language is a program that m
 data. It buys decoupling from user code at the cost of an artifact, a drift check, and the
 conflation above. The alternative is to keep the definition surface declarative and thin, and
 import it.
+
+### Typed references, not strings
+
+**Rejected:** `"view:feature"` strings as the reference a caller writes.
+
+Feast is the cautionary case. Its `my_fv[[selections]]` syntax looks object-shaped, but it
+builds a `FeatureViewProjection` that exists "for 1 second", after which "everything goes back
+to `feature_ref` strings" ([#1907](https://github.com/feast-dev/feast/issues/1907)). The object
+form is surface sugar over a string interior, so nothing downstream is checkable and a
+misspelling is a runtime lookup failure. Tecton's `my_feature_view[["count"]]` has the same
+shape: objects for the definition, strings for the selection.
+
+References are therefore objects, and the string form exists only as a derived rendering:
+
+- `features=[UserClicks.click_count, UserStats.ltv]` selects a subset.
+- `features=[UserClicks]` selects every field on a view.
+
+One unchecked entry point is kept on purpose. A raw `"user_clicks:click_count"` string is
+useful for ad-hoc and debug work, so it lives in its own argument rather than in the same list,
+which is what keeps the checked path checked.
+
+Rejected alternatives:
+
+- **Module-level attribute objects**, as Tecton declares with `Attribute`. Checkable, but it
+  drops the view namespace, so a reference is `click_count` rather than
+  `UserClicks.click_count`, and a field shared by two views is ambiguous.
+- **Configuration in the class body**, as `name = ...`, `source = ...`, `ttl_days = ...`
+  alongside the fields. Every one of those names becomes undeclarable as a feature.
+- **Configuration as class keyword arguments**, as `class V(FeatureView, name=...)`. The body
+  stays clean, but an unexpected keyword falls into `**kwargs` and is silently ignored, so a
+  configuration typo is not caught. Verified against the type checker rather than reasoned
+  about.
+- **Integer feature ids**, as Fennel assigns, unique within a featureset. They buy rename-safety
+  at the cost of a registry-shaped artifact, and this design has no registry. A rename is a
+  rewrite under full refresh, which is the migration path anyway.
 
 ### One hash per entity, one field per view
 
