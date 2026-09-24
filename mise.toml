@@ -1,5 +1,9 @@
 [tools]
-rust = "latest"
+# rustfmt and clippy are components of the toolchain, not separate tools. mise
+# delegates to rustup, whose default profile includes both, but a cache hit can
+# skip the install entirely and leave them missing. The explicit component step
+# in CI is the one that actually holds; this declaration is for a fresh machine.
+rust = { version = "latest", components = ["rustfmt", "clippy"] }
 uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
 # from the schema it loads.

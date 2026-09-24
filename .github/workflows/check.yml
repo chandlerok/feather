@@ -31,6 +31,13 @@ jobs:
       # minutes on a Linux runner, then stays cached. DUCKDB_DOWNLOAD_LIB=1
       # would skip the C++ build but links dynamically, and how the dylib is
       # resolved at runtime is unverified, so correctness wins over speed.
+      # fmt and clippy are components of the toolchain rather than tools, so
+      # mise does not treat them as missing, and a mise-action cache hit can
+      # leave them uninstalled: the first run died on `cargo-fmt` not being
+      # installed for the toolchain. Installing them here is explicit and does
+      # not depend on the cache being cold.
+      - name: rust components
+        run: rustup component add rustfmt clippy
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
