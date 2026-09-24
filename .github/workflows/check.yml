@@ -105,5 +105,12 @@ jobs:
         run: |
           uv run --no-sync ruff check python tests
           uv run --no-sync ruff format --check python tests
+      # Gating, and not covered by pytest: tests/test_typing_contract.py
+      # pins the typed definition API with assert_type and with
+      # `# type: ignore[code]`, which mypy rejects once it stops being
+      # needed. pytest only imports that file, so without this step those
+      # guarantees go unenforced.
+      - name: mypy
+        run: uv run --no-sync mypy
       - name: pytest
         run: uv run --no-sync pytest
