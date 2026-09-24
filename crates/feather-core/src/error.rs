@@ -103,9 +103,47 @@ pub enum Error {
     #[error("{key}: ${{{reference}}} is not a valid environment variable name")]
     MalformedEnvironmentReference { key: String, reference: String },
 
+    #[error("arrow: {0}")]
+    Arrow(#[from] arrow::error::ArrowError),
+
     #[cfg(feature = "offline")]
     #[error("duckdb: {0}")]
     DuckDb(#[from] duckdb::Error),
+
+    #[cfg(feature = "offline")]
+    #[error("{location} has no column `{column}`")]
+    MissingColumn { location: String, column: String },
+
+    #[cfg(feature = "offline")]
+    #[error(
+        "unsupported {role} type `{dtype}`; an entity key is an integer or a string, and a timestamp is integer microseconds or microsecond precision"
+    )]
+    UnsupportedOfflineType { role: String, dtype: String },
+
+    #[cfg(feature = "offline")]
+    #[error(
+        "the entity frame's `{label}` is {label_type} and the source's `{source_column}` is {source_type}, \
+         which cannot be compared without coercing one of them"
+    )]
+    OfflineTypeMismatch {
+        label: String,
+        label_type: String,
+        source_column: String,
+        source_type: String,
+    },
+
+    #[cfg(feature = "offline")]
+    #[error(
+        "view `{view}` has {rows} rows for `{key_column}` = `{key}` at timestamp {timestamp}, and \
+         declares no created_timestamp_field, so which one wins would depend on the query plan"
+    )]
+    AmbiguousTimestamp {
+        view: String,
+        key_column: String,
+        key: String,
+        timestamp: i64,
+        rows: i64,
+    },
 
     #[cfg(feature = "offline")]
     #[error("could not read `{path}`: {source}")]

@@ -18,6 +18,8 @@
 pub mod definitions;
 pub mod error;
 pub mod key;
+#[cfg(feature = "offline")]
+pub mod offline;
 pub mod online;
 pub mod settings;
 pub mod value;
@@ -28,6 +30,8 @@ pub use key::{
     MAX_COMPONENT_LEN, decode_entity_key, encode_entity_key, entity_hash_key, freshness_field,
     parse_entity_hash_key, value_field,
 };
+#[cfg(feature = "offline")]
+pub use offline::{Engine as OfflineEngine, JoinOptions, Limits, OnMissing};
 #[cfg(feature = "valkey")]
 pub use online::valkey::ValkeyStore;
 pub use online::{

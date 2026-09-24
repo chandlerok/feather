@@ -1022,6 +1022,25 @@ and that layer is a duplicate rather than the rule.
 The cost is that a binding which wants the best error message does the work twice. The benefit is
 that adding a language means writing an authoring surface, not a second validator.
 
+### The join materializes its result rather than panicking
+
+**Rejected:** reading the join's Arrow batches straight out of the statement.
+
+`duckdb`'s Arrow iterator panics on a step error rather than yielding one:
+
+```rust
+Err(err) => panic!("Failed to fetch Arrow record batch: {err}"),
+```
+
+This library is called across FFI, so a panic here aborts the host process instead of
+returning a bad result, and the caller cannot catch it. `CREATE TEMPORARY TABLE ... AS`
+reports the same failure as a value, so the join is executed into a table and only a plain
+scan is read through the Arrow path.
+
+The cost is materializing the result. The ordering is applied to the scan rather than at
+materialization, because a sort performed while building the table would not order a later
+scan, and the row order is the thing that keeps labels and features aligned.
+
 ### No registry, no lockfile
 
 **Rejected:** a generated registry artifact (a lockfile) holding compiled definitions.
