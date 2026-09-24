@@ -387,9 +387,25 @@ Subscription detail: invalidations arrive on `__valkey__:invalidate`. Valkey ren
 `__redis__:invalidate` and keeps the old name only for Redis 7.2 compatibility, so subscribe
 to the Valkey name.
 
-Targets: single-digit-millisecond p99 online reads, with L1 hits well under that. These are
-targets. Publish a benchmark with hardware, key cardinality, and payload size before quoting
-numbers.
+Measured, on a container limited to 2 CPUs and 512MiB with `maxmemory` 384MiB and
+`allkeys-lru`, over 100k entities across 4 views of 8 features each, with 66-byte vectors:
+
+| Measurement                  | Result                                    |
+| ---------------------------- | ----------------------------------------- |
+| read, 1 entity x 4 views     | p50 0.327ms, p95 0.411ms, p99 0.741ms     |
+| read, 100 entities x 4 views | p50 2.36ms, p99 5.10ms, 24.2us per entity |
+| write, materialization shape | 193k vectors/s, 386k field writes/s       |
+
+Single-entity p99 is sub-millisecond across four views, which is the one-`HMGET`-per-entity
+rule and the fixed-stride encoding doing their job. The 17.7ms tail maximum on single reads is
+unexplained and worth investigating.
+
+Reproduce with `mise run bench:load`, which prints hardware, key cardinality, and payload size
+alongside the numbers so a figure cannot be quoted without them. Compare against
+`mise run bench:valkey` for the server's own ceiling on the same container.
+
+These numbers are from one host and one container shape. Treat them as an order of magnitude,
+not a guarantee.
 
 ### 3. Serving API (Arrow Flight)
 
@@ -647,9 +663,11 @@ because the definitions artifact itself is still never written at runtime.
 ### Ceiling
 
 Full refresh cost scales with total entity-view pairs, not new data. With one hash per entity
-and one field per view, a refresh writes `entities x views` field values. At roughly 100k
-pipelined operations per second, tens of millions of entity-view pairs is minutes; low
-hundreds of millions is hours.
+and one field per view, a refresh writes `entities x views` field values. Measured at 386k
+field writes per second on the constrained container described under "Two-tier cache", tens of
+millions of entity-view pairs is about a minute and low hundreds of millions is minutes. The
+earlier estimate in this document, which said hours for the second case, was several times too
+pessimistic.
 
 That is the v1 ceiling, and it is deliberate. See "Scalability" for the documented path past
 it.
