@@ -20,6 +20,14 @@
 //!
 //! `flags` is reserved and written as zero. It exists so an encoding-level change
 //! has somewhere to announce itself without changing the layout.
+//!
+//! > `ponytail:` [`decode_batch`] decodes every column of a view, and the caller
+//! > projects the ones it asked for. The fixed-stride layout makes the byte offset
+//! > of any fixed-width column computable from the schema, so a wide view could
+//! > decode only the requested columns. Deliberately not done yet, because no
+//! > measurement justifies it: requesting 3 of 8 features measures p99 0.741ms,
+//! > where the round trip dominates and decode does not show up. Revisit when a
+//! > profile puts decode on the map, or when one request spans many wide views.
 
 use std::ops::Range;
 

@@ -17,5 +17,7 @@ feather-core = { path = "../feather-core", features = ["full"] }
 # No `extension-module` feature here on purpose. maturin sets
 # PYO3_BUILD_EXTENSION_MODULE for PyO3 >= 0.27, and enabling the feature
 # statically would stop `cargo test` from linking.
-pyo3 = { workspace = true, features = ["abi3-py312"] }
+# abi3-py311 rather than py312: the Python floor is 3.11 (StrEnum), so one wheel
+# covers 3.11 through 3.14. Nothing here needs a newer limited API.
+pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-arrow.workspace = true

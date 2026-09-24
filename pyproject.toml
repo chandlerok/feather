@@ -7,7 +7,7 @@ name = "feather-store"
 version = "0.0.1"
 description = "An opinionated feature store with a Rust core and a native Python API"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Chandler King" }]
 classifiers = [
@@ -57,9 +57,10 @@ addopts = "-q"
 
 [tool.ruff]
 # The floor of the support range, set explicitly rather than inferred, so it is
-# visible in review. Deliberately not py314: that target emits an "under
-# development" warning in ruff 0.12.x and we support 3.12 and up.
-target-version = "py312"
+# visible in review. 3.11 is the real floor: `StrEnum` in feather/types.py is the
+# only version-sensitive thing we use, and it is 3.11+. Not py314, because that
+# target emits an "under development" warning in ruff 0.12.x.
+target-version = "py311"
 line-length = 100
 src = ["python", "tests"]
 extend-exclude = ["target", "dist", "build"]
@@ -122,6 +123,14 @@ possibly-missing-attribute = "error"
 # The Python package lives under python/ and the extension is compiled, so both
 # pyright and mypy need to be told where the source root and the virtualenv are.
 # Without this they report every third-party and first-party import as unresolved.
+#
+# Note for anyone seeing "Import \"pydantic\" could not be resolved" from a
+# tooling wrapper: pyright discovers its configuration by walking up from the
+# working directory, not from the file. Run pyright from anywhere outside this
+# directory and it never reads this table, so it never learns about .venv or
+# extraPaths. Verified: from the repo root, 0 errors; from /tmp or a tool's own
+# directory with an absolute file path, 3 unresolved imports. The fix belongs in
+# the caller (run from the project directory, or pass --project).
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
@@ -129,6 +138,6 @@ extraPaths = ["python"]
 include = ["python", "tests"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 mypy_path = "python"
 files = ["python", "tests"]

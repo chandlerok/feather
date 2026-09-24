@@ -233,6 +233,19 @@ wants only fixed-width columns never touches them.
 `tag` identifies the view's schema version: field names, dtypes, and declaration order. A
 mismatch means the value is treated as missing rather than decoded.
 
+One field per view, not per feature. That is a deliberate reversal of this document's earlier
+naming, which was inconsistent with the codec: the codec writes a whole view's vector as a
+single fixed-stride blob, so a per-feature field name would either repeat the schema tag per
+feature or force the codec down to one column at a time and lose the stride. Measured on the
+benchmark schema, one field per view is 66 bytes against roughly 108 for per-feature fields,
+because a schema tag on a single `Int64` is most of its payload.
+
+The cost is that requesting two features from a wide view decodes the whole vector. That is
+currently free: requesting 3 of 8 features measures p99 0.741ms, where the round trip dominates.
+The layout does make the fix available when it stops being free, since the byte offset of any
+fixed-width column is computable from the schema, so a decoder could read only the columns the
+caller asked for.
+
 Rejected encodings, and why:
 
 - **MessagePack or JSON.** Self-describing, so every cell is parsed individually. That is
