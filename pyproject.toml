@@ -141,3 +141,7 @@ include = ["python", "tests"]
 python_version = "3.11"
 mypy_path = "python"
 files = ["python", "tests"]
+# mypy finds third-party stubs through an interpreter, not through venvPath the
+# way pyright does, so it has to be pointed at the project venv explicitly.
+# Without this it cannot see pydantic or pytest at all.
+python_executable = ".venv/bin/python"

@@ -75,6 +75,35 @@ def test_definition_json_uses_the_keys_rust_expects() -> None:
     }
 
 
+def test_dtype_covers_exactly_the_rust_variants() -> None:
+    """Guard against a dtype being added on one side of the boundary only.
+
+    Rust's DType enum and this one must stay in step. A variant added to one side
+    and not the other fails at deserialization, which is a runtime failure in a
+    place nothing else tests.
+    """
+    assert {d.name for d in DType} == {
+        "INT64",
+        "FLOAT64",
+        "BOOLEAN",
+        "UTF8",
+        "TIMESTAMP_MICROS",
+    }
+
+
+def test_optional_defaults_are_left_to_rust() -> None:
+    """The Python layer does not invent defaults that Rust owns.
+
+    `timestamp_field` defaults to `event_timestamp` in feather-core, not here.
+    Inventing it on this side would create a second source of truth for a value
+    the join semantics depend on, so it must serialize as null.
+    """
+    payload = json.loads(FeatureStoreConfig(project="ads", views=[a_view()]).model_dump_json())
+    view = payload["views"][0]
+    assert view["timestamp_field"] is None
+    assert view["created_timestamp_field"] is None
+
+
 def test_a_view_without_a_ttl_serializes_as_null() -> None:
     """No TTL means no expiry, and serde's Option handles the null."""
     payload = json.loads(FeatureStoreConfig(project="ads", views=[a_view()]).model_dump_json())

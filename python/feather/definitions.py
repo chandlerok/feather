@@ -17,9 +17,6 @@ from feather.types import DType
 
 NonEmptyStr = Annotated[str, pydantic.StringConstraints(min_length=1)]
 
-# Mirrors MAX_COMPONENT_LEN in feather-core's key module.
-MAX_ENTITY_KEY_COMPONENT_LEN = 512
-
 
 class DefinitionModel(pydantic.BaseModel):
     """Base for definition models.
@@ -32,14 +29,25 @@ class DefinitionModel(pydantic.BaseModel):
 
 
 class Entity(DefinitionModel):
-    """A join key that features are grouped by."""
+    """A join key that features are grouped by.
+
+    `join_key` names the column in the source. The entity *values* are what the
+    key encoder caps at 512 bytes per component, and those only exist at runtime,
+    so that limit is enforced in Rust rather than here.
+    """
 
     name: NonEmptyStr
     join_key: NonEmptyStr
 
 
 class Field(DefinitionModel):
-    """One feature and its storage type."""
+    """One feature and its storage type.
+
+    `dtype` is the wire type, not a Python type. Rust maps it to an Arrow type
+    (`int64` to `Int64`, `timestamp_micros` to a microsecond timestamp, and so
+    on) and the value codec writes fixed-width columns at a fixed stride, which
+    is why the set is closed.
+    """
 
     name: NonEmptyStr
     dtype: DType
