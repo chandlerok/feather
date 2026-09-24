@@ -118,11 +118,11 @@ fn measure(width: usize) {
 
 fn main() {
     println!("value decode cost, isolated from the network");
+    println!("  {ENTITIES} entities per batch, {ITERATIONS} iterations, release build\n");
     println!(
-        "  {ENTITIES} entities per batch, {ITERATIONS} iterations, release build\n"
+        "  reference: a measured single-entity read across four views is {:.0}ns p50\n",
+        REFERENCE_READ_NS
     );
-    println!("  reference: a measured single-entity read across four views is {:.0}ns p50\n",
-        REFERENCE_READ_NS);
 
     for width in [8usize, 32, 128, 512] {
         measure(width);

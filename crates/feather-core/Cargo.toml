@@ -43,6 +43,9 @@ redis = { workspace = true, optional = true, features = [
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Only for the input-mechanism comparison, which needs to write an Arrow batch to
+# Parquet to represent the temp-file route.
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
@@ -58,6 +61,12 @@ name = "loadtest"
 # Declared here rather than with an inner #![cfg] in the file, which would cfg
 # out `main` too and break a plain `cargo test`.
 required-features = ["valkey"]
+
+[[example]]
+name = "duckdb_input"
+# Needs the offline feature for the duckdb crate. Without this, a plain
+# `cargo test --features valkey` fails to compile the example.
+required-features = ["offline"]
 
 [lib]
 doctest = true
