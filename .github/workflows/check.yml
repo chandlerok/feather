@@ -41,12 +41,11 @@ jobs:
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # Bundled DuckDB compiles from source on a cold cache. Measured on a
-      # 2-core runner: clippy 18 minutes, then test 19 minutes, and the test
-      # step is what ran out of disk. The build is cached afterwards.
-      # DUCKDB_DOWNLOAD_LIB=1 would skip the C++ build but links dynamically,
-      # and how the dylib is resolved at runtime is unverified, so correctness
-      # wins over speed.
+      # Bundled DuckDB compiles from source on a cold cache: measured on a
+      # 2-core runner the rust job takes around 45 minutes, nearly all of it in
+      # clippy and test. The build is cached afterwards. DUCKDB_DOWNLOAD_LIB=1
+      # would skip the C++ build but links dynamically, and how the dylib is
+      # resolved at runtime is unverified, so correctness wins over speed.
       # fmt and clippy are components of the toolchain rather than tools, so
       # mise does not treat them as missing, and a mise-action cache hit can
       # leave them uninstalled: the first run died on `cargo-fmt` not being
