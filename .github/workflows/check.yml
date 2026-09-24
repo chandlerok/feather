@@ -37,8 +37,18 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features \
             -- -D warnings
+      # The suite includes the Valkey integration tests, which connect eagerly
+      # and have no skip guard: with nothing listening they fail rather than
+      # skip. docker-compose.yml is reused rather than a bare container so the
+      # tests meet the same maxmemory and eviction constraints they are written
+      # against, rather than passing on a roomier server than they target.
+      - name: valkey
+        run: docker compose up -d --wait
       - name: test
         run: cargo test --workspace --all-features
+      - name: valkey down
+        if: always()
+        run: docker compose down -v
       - name: data files
         run: mise exec -- dprint check
 
