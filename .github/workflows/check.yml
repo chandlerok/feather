@@ -1,0 +1,77 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to commit SHAs, not moving tags: a tag can be
+      # repointed at new code without warning. The version is in the comment.
+      # renovate: datasource=github-tags depName=actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # renovate: datasource=github-tags depName=jdx/mise-action
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      # renovate: datasource=github-tags depName=Swatinem/rust-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Bundled DuckDB compiles from source on a cold cache, roughly 3.5
+      # minutes on a Linux runner, then stays cached. DUCKDB_DOWNLOAD_LIB=1
+      # would skip the C++ build but links dynamically, and how the dylib is
+      # resolved at runtime is unverified, so correctness wins over speed.
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: |
+          cargo clippy --workspace --all-targets --all-features \
+            -- -D warnings
+      - name: test
+        run: cargo test --workspace --all-features
+      - name: data files
+        run: mise exec -- dprint check
+
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the declared floor and 3.14 is the newest supported.
+        # Testing both is the only thing that keeps the floor honest, and
+        # this machine has no 3.11 interpreter to check it locally.
+        python: ["3.11", "3.14"]
+    steps:
+      # renovate: datasource=github-tags depName=actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # renovate: datasource=github-tags depName=jdx/mise-action
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      # astral-sh/setup-uv, pinned at v10.2.0
+      # renovate: datasource=github-tags depName=astral-sh/setup-uv
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      - name: pin the interpreter
+        run: uv venv --python ${{ matrix.python }}
+      # --no-install-project skips building the Rust extension. This job
+      # tests the Python layer, and pytest finds the package through
+      # `pythonpath` in pyproject.toml, so no build is needed.
+      - name: sync
+        run: uv sync --no-install-project
+      - name: ruff
+        run: |
+          uv run --no-sync ruff check python tests
+          uv run --no-sync ruff format --check python tests
+      - name: pytest
+        run: uv run --no-sync pytest

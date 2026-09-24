@@ -28,7 +28,14 @@ tracing.workspace = true
 # CI can skip the C++ build with DUCKDB_DOWNLOAD_LIB=1, which fetches a prebuilt
 # library; that requires NOT enabling `bundled` and needs the dylib on the
 # runtime search path.
-duckdb = { workspace = true, optional = true, features = ["bundled", "parquet"] }
+duckdb = { workspace = true, optional = true, features = [
+  "bundled",
+  "parquet",
+  # Arrow appender, for getting the entity frame in without per-row work.
+  # Costs extra C++ template compilation on a clean build; see the input-mechanism
+  # comparison in examples/duckdb_input.rs.
+  "appender-arrow",
+] }
 redis = { workspace = true, optional = true, features = [
   "tokio-comp",
   "connection-manager",
