@@ -16,6 +16,12 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-latest
+    env:
+      # Line tables only. A bundled DuckDB build is the bulk of target/: the
+      # static archive alone is 1.8GB, and most of that is debug info. Level 2
+      # does not fit on a runner and tests never needed variables, but level 1
+      # keeps file and line in panic backtraces.
+      CARGO_PROFILE_DEV_DEBUG: "1"
     steps:
       # Actions are pinned to commit SHAs, not moving tags: a tag can be
       # repointed at new code without warning. The version is in the comment.
@@ -23,14 +29,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # The runner image carries tens of gigabytes of SDKs this job never
+      # touches, and the DuckDB build filled what was left: the C++ archive step
+      # died with "No space left on device" writing libduckdb.a.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup
+          df -h /
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # Bundled DuckDB compiles from source on a cold cache, roughly 3.5
-      # minutes on a Linux runner, then stays cached. DUCKDB_DOWNLOAD_LIB=1
-      # would skip the C++ build but links dynamically, and how the dylib is
-      # resolved at runtime is unverified, so correctness wins over speed.
+      # Bundled DuckDB compiles from source on a cold cache. Measured on a
+      # 2-core runner: clippy 18 minutes, then test 19 minutes, and the test
+      # step is what ran out of disk. The build is cached afterwards.
+      # DUCKDB_DOWNLOAD_LIB=1 would skip the C++ build but links dynamically,
+      # and how the dylib is resolved at runtime is unverified, so correctness
+      # wins over speed.
       # fmt and clippy are components of the toolchain rather than tools, so
       # mise does not treat them as missing, and a mise-action cache hit can
       # leave them uninstalled: the first run died on `cargo-fmt` not being
