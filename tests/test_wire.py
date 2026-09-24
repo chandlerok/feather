@@ -1,8 +1,8 @@
 """Contract tests for the Python-to-Rust definition wire format.
 
-Rust deserializes these models with serde and does not re-validate them, so a
-rename here would fail at runtime rather than at import. These tests pin the exact
-keys and values Rust expects.
+These tests pin the exact keys and values the core expects, so a rename is caught
+here rather than inside an engine. The core validates what it accepts, so what is
+pinned here is the shape of the handoff, not the enforcement of it.
 
 The models are not the authoring surface: authors declare views with
 :mod:`feather.definitions`, which compiles to these. The end-to-end version of

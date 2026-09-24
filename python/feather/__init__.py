@@ -1,12 +1,13 @@
 """Feather: an opinionated feature store with a Rust core.
 
-Definitions are declared in Python and validated by Pydantic before anything
-crosses into Rust. The engines are in Rust; they receive the validated
-definitions as JSON and do not re-validate them.
+Definitions are declared in Python and validated by Pydantic at authoring time, so
+a mistake is reported in the language it was written in. That is an early warning,
+not the contract: the Rust core validates everything it accepts, so an engine never
+works from a value it cannot represent.
 
-Importing this package does not require the compiled extension. Only the parts
-that actually call into Rust do, so the definition layer stays usable and
-testable without a build.
+Importing this package does not require the compiled extension. Only the calls that
+reach into Rust do, so the definition layer stays usable and testable without a
+build.
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -22,6 +23,7 @@ from feather.definitions import (
     view_fields,
     view_to_wire,
 )
+from feather.settings import FeatherSettings, load_settings
 from feather.types import (
     Boolean,
     DType,
@@ -33,7 +35,7 @@ from feather.types import (
 )
 
 try:
-    __version__ = version("feather-store")
+    __version__ = version("feather-py")
 except PackageNotFoundError:  # pragma: no cover - running from a bare source tree
     __version__ = "0.0.0+uninstalled"
 
@@ -41,6 +43,7 @@ __all__ = [
     "Boolean",
     "DType",
     "Entity",
+    "FeatherSettings",
     "FeatureService",
     "FeatureStoreConfig",
     "FeatureView",
@@ -54,6 +57,7 @@ __all__ = [
     "__version__",
     "config_to_wire",
     "feature_view",
+    "load_settings",
     "view_fields",
     "view_to_wire",
 ]

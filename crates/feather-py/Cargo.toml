@@ -21,3 +21,5 @@ feather-core = { path = "../feather-core", features = ["full"] }
 # covers 3.11 through 3.14. Nothing here needs a newer limited API.
 pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-arrow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

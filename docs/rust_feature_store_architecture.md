@@ -19,7 +19,7 @@ offline engine) and low-latency feature lookup (the online serving layer).
 ```text
      ┌──────────────────────────────────────────────────────────────┐
      │  Python layer                                                │
-     │  feature_store.yaml   infrastructure config (Pydantic v2)    │
+     │  feather.toml         infrastructure config (Rust core)      │
      │  definitions/*.py     entities, sources, feature views       │
      └───────────────────────────┬──────────────────────────────────┘
                                  │ Maturin / PyO3
@@ -79,16 +79,18 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 
 ## Execution layers
 
-### 1. Python and Rust boundary (Maturin + Pydantic v2)
+### 1. Python and Rust boundary (Maturin + PyO3)
 
 The user interface is a native Python extension compiled with Maturin and PyO3.
 
-- **Type safety.** Pydantic v2 models validate `feature_store.yaml`, entity definitions,
-  data sources, and feature views. Misconfiguration raises before any engine or connection
-  is created.
-- **Configuration handoff.** Validated config is serialized with `model_dump_json()` and
-  deserialized in Rust with `serde_json`. This runs once per process, so it is a correctness
-  boundary, not a performance boundary.
+- **Type safety.** Two layers, and the core is the authority. Pydantic validates a definition as
+  it is written, so a mistake is reported in the language it was written in, before the process
+  does anything else. The core validates what it accepts, so a binding that skips its own checks
+  still cannot hand over a value an engine cannot represent, and a second binding has nothing
+  new to implement.
+- **Configuration handoff.** The core reads `feather.toml` itself: it parses the TOML, resolves
+  `${VAR}`, and validates the schema. A binding passes a path and receives the validated result,
+  so the file format and its rules have one implementation rather than one per language.
 - **Data handoff.** DataFrames submitted for point-in-time joins cross the boundary through
   the Arrow PyCapsule interface, so Rust reads the existing Polars or pandas buffers instead
   of receiving a serialized copy. This makes the **input transfer** zero-copy.
@@ -106,7 +108,9 @@ two layers rather than one:
 - **Authoring** (`feather.definitions`): a feature is a typed class attribute, as in
   `click_count = Field(Int64)`, inside a class whose configuration comes from a decorator.
 - **The wire** (`feather._wire`): the Pydantic models that serialize and cross into Rust.
-  Private, because the shape is a contract rather than a user interface.
+  Private, because the shape is a contract rather than a user interface. These constraints bound
+  the shape on the Python side and the core validates what it receives, so they are a duplicate
+  of the core's rules rather than the rule itself.
 
 The split exists because a reference to a feature has to be checkable. A string cannot be
 checked, and neither can attribute access on an object whose fields are populated at runtime:
@@ -146,19 +150,17 @@ The consequence to accept: serving executes user code at import. Two rules keep 
 tractable.
 
 1. **The definition surface depends only on `feather`.** A feature view declares
-   `Field("click_count", dtype=Int64)`, where `Int64` comes from `feather.types`. It does not
+   `click_count = Field(Int64)`, where `Int64` comes from `feather.types`. It does not
    import Polars, PyArrow, or a warehouse client. This keeps the serving image thin and makes
    the definitions importable in any environment that can import `feather`.
 2. **Definitions are declarative data.** No module-level I/O, no network calls, no
    computation at import. A definition module is a list of constructor calls. CI imports
    every declared module and fails on import errors, which is the backstop for rule 2.
 
-`feature_store.yaml` lists the definition modules explicitly:
+`feather.toml` lists the definition modules explicitly:
 
-```yaml
-definitions:
-  - definitions/user_clicks.py
-  - definitions/user_stats.py
+```toml
+definitions = ["definitions/user_clicks.py", "definitions/user_stats.py"]
 ```
 
 Explicit listing rather than recursive discovery. Feast reads every `.py` file under the
@@ -180,13 +182,13 @@ The failure modes this avoids are documented in "Recorded decisions".
 
 #### Feature services
 
-A feature service is a **named projection**: a name and a list of view-and-feature references.
-Nothing else.
+A feature service is a **named projection**: a name and a list of declared fields, or a
+whole view to mean all of its fields. Nothing else.
 
 ```python
 FeatureService(
     name="ranking_v3",
-    features=["user_clicks:click_count", "user_stats:ltv"],
+    features=[UserClicks.click_count, UserStats.ltv],
 )
 ```
 
@@ -890,59 +892,83 @@ Any of these, and the answer is tiles first, watermarks only if tiles do not app
 
 ## Configuration
 
-`feature_store.yaml` holds infrastructure. Python modules hold definitions. Both are
-validated by Pydantic v2, and this section is the single source of truth for the schema; the
-README links here instead of restating it.
+`feather.toml` holds infrastructure. Python modules hold definitions. The core owns the file:
+`crates/feather-core/src/settings.rs` is the schema, and it parses the TOML, resolves `${VAR}`,
+and validates the keys. `python/feather/settings.py` is a typed view of the validated result, so
+Python code gets autocomplete without a second implementation of the schema. The README links
+here rather than restating the keys.
 
-```yaml
-project: ad_recommendations
+```toml
+project = "ad_recommendations"
+definitions = ["definitions/user_clicks.py", "definitions/user_stats.py"]
 
-definitions:
-  - definitions/user_clicks.py
-  - definitions/user_stats.py
+[connections.snowflake_prod]
+type = "snowflake"
+account = "xy12345.us-east-1"
+warehouse = "PROD_WH"
+username = "fs_runner"
+password = "${SNOWFLAKE_PASSWORD}"
 
-offline_store:
-  type: snowflake
-  config:
-    account: "xy12345.us-east-1"
-    warehouse: "PROD_WH"
-    username: "fs_runner"
-    password: ${SNOWFLAKE_PASSWORD}
+[connections.s3_lake]
+type = "s3"
+region = "us-east-1"
+key_id = "${AWS_ACCESS_KEY_ID}"
+secret = "${AWS_SECRET_ACCESS_KEY}"
 
-online_store:
-  type: valkey
-  config:
-    endpoint: "valkey-cluster.internal.svc:6379"
-    tls: true
-    # Requires Valkey 9.0+ / Redis 8.0+ for native field expiration.
-    # Older servers fall back to read-time TTL checks only.
-    field_expiration: true
-    l1_cache:
-      enabled: true
-      max_capacity_mb: 2048
-      # Only used when CLIENT TRACKING is unavailable. This is the
-      # staleness contract in that case.
-      fallback_ttl_seconds: 30
+[valkey]
+endpoint = "valkey-cluster.internal.svc:6379"
+tls = true
+# Needs Valkey 9.0+ / Redis 8.0+ for native field expiration.
+# Older servers fall back to read-time TTL checks only.
+field_expiration = true
+
+[l1_cache]
+enabled = true
+max_capacity_mb = 2048
+# Always on, not conditional on push invalidation. It is the staleness
+# contract when an invalidation message is missed.
+fallback_ttl_seconds = 30
 ```
+
+Three absences are deliberate.
+
+- **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
+  so there is no deployment-wide offline store to name. See "Offline engine".
+- **No `type` on `[valkey]`.** Valkey is the only L2, and a pluggable online store is a
+  non-goal. The table name carries the kind, so a key that could only hold one value is not
+  written down.
+- **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
+  prefix, and a warehouse table differ only in their path scheme.
+
+`connections` is declared before its first consumer. No source kind in the wire model
+references a connection yet, because v1 declares a source as a path, so these entries are
+inert until a source kind needs credentials. They exist so that a credential has a home that
+is not a committed definition module.
 
 ### Secrets
 
-`${VAR}` in any config value is interpolated from the process environment at load time. A
-referenced variable that is unset is a load error, not an empty string. `feature_store.yaml`
-is committed, so it must never contain a literal credential: use environment interpolation,
-or a secret manager reference. A literal secret in this file is a bug.
+`${VAR}` in any config value is interpolated from the process environment at load time, by the
+core rather than by a binding, so every language resolves it the same way. A referenced variable
+that is unset is a load error, not an empty string. `feather.toml` is committed, so it must never
+contain a literal credential. Either interpolate the value or have the platform inject the
+variable before load. A literal secret in this file is a bug.
+
+A `[connections]` entry is the only place a credential is expected, and it is the only
+consumer of `${VAR}` today. Credentials are never declared in a definition module, because
+those are committed and every process reads them.
 
 ### Backend coverage
 
-The schema above shows Snowflake and Valkey. The same `type` plus `config` shape applies to
-the other backends, but only the two shown have a settled schema. BigQuery, Azure, and the
-object-storage tier still need their `config` keys specified before they can be documented.
+`[connections]` shows the two kinds with a settled schema, Snowflake and S3. Each declares
+`type` plus its own keys, and a kind is added when a source needs it. BigQuery, Azure Blob
+Storage, and a local SQLite database still need their keys specified before they can be
+documented.
 
 ---
 
 ## Deployment
 
-1. **Local development.** `pip install feather-store`. Everything runs in-process: local
+1. **Local development.** `pip install feather-py`. Everything runs in-process: local
    Parquet, an in-memory DuckDB, and the L1 memory cache. No external services.
 2. **Production.** Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled
    Deployment behind gRPC and REST; materialization runs as resource-isolated Kubernetes
@@ -955,16 +981,44 @@ should link to them rather than describe them.
 
 ## Naming
 
-The distribution is `feather-store` and the import name is `feather`. The import name
-collides with the pre-existing PyPI package `feather` (the Feather dataframe format), so an
-environment must not contain both. If that becomes a problem, the import name should change
-before the first release, since renaming after publication is far more expensive.
+The distribution is `feather-py`, because `feather` is already registered on PyPI. The import
+name is `feather`.
+
+That pairing is what creates the collision this section exists to name. Installing
+`feather-py` puts a top-level `feather` on the path, and the PyPI package `feather` (the
+Feather dataframe format) provides the same module name. An environment must not contain
+both, because which one an import resolves to depends on install order. This is accepted for
+now rather than resolved. If it becomes a problem, the import name should change before the
+first release, since renaming after publication is far more expensive.
+
+`crates/feather-py` is the PyO3 binding crate and shares the name. It is internal and is not
+published.
 
 ---
 
 ## Recorded decisions and rejected alternatives
 
 Recorded so they are not re-litigated. Each cites the evidence that drove it.
+
+### The core validates, not the binding
+
+**Rejected:** one validator per language, with the core trusting whatever it deserializes.
+
+The first version of this design had Python validate `feather.toml`, the entity definitions, and
+the feature views, and had Rust deserialize the result without re-checking it. Two facts made
+that untenable. The core already re-checked part of it, because `Definitions::validate` has to
+resolve cross-references Pydantic cannot see, so there were two validators rather than one and
+the "does not re-validate" claim was false. And a second binding would have had to reimplement
+the schema, the `${VAR}` rule, and the reference checks, which is a third and fourth
+implementation of rules that only need one.
+
+The core is now the authority for both halves: `crates/feather-core/src/settings.rs` reads and
+validates `feather.toml`, and `Definitions::validate` owns the definition rules. A binding keeps
+its own layer for authoring ergonomics and for reporting a mistake as early as its language can,
+and that layer is a duplicate rather than the rule.
+
+The cost is that a binding which wants the best error message does the work twice. The benefit is
+that adding a language means writing an authoring surface, not a second validator.
 
 ### No registry, no lockfile
 

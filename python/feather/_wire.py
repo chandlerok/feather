@@ -1,10 +1,14 @@
-"""Definition models: the wire format Rust deserializes.
+"""Definition models: the wire format the Rust core deserializes.
 
-These are the models that cross into Rust, and they own the invariants the
-engines rely on. They are deliberately not the authoring surface: features are
-declared with :mod:`feather.definitions`, which compiles to these. The split
-exists because a reference to a feature has to be a checked object rather than a
-string, and only a class-body declaration can be checked.
+These are the models that cross into Rust. They bound the shape on the Python side,
+so a malformed definition fails while it is being written rather than at engine
+startup, but the core is the authority: it validates what it accepts, and these
+constraints are a duplicate of the core's rules rather than the rule itself.
+
+They are deliberately not the authoring surface: features are declared with
+:mod:`feather.definitions`, which compiles to these. The split exists because a
+reference to a feature has to be a checked object rather than a string, and only a
+class-body declaration can be checked.
 
 ``Entity`` and ``FileSource`` are used directly when authoring as well, because
 each is a leaf value with no schema of its own.

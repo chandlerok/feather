@@ -60,6 +60,9 @@ pub enum Error {
     #[error("view `{view}` declares an unsupported number of entities: {count}")]
     UnsupportedEntityCount { view: String, count: usize },
 
+    #[error("view `{view}` {reason}")]
+    MalformedView { view: String, reason: String },
+
     #[error(
         "one request mixed entities `{first}` and `{second}`; all views in a request must \
          share the same entity"
@@ -74,6 +77,28 @@ pub enum Error {
 
     #[error("no feature service named `{0}`")]
     UnknownService(String),
+
+    #[error("could not read `{path}`: {source}")]
+    SettingsIo {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("malformed settings: {reason}")]
+    MalformedSettings { reason: String },
+
+    #[error("{field} must not be empty")]
+    EmptySettingsField { field: String },
+
+    #[error("{key}: environment variable {variable} is not set")]
+    MissingEnvironmentVariable { key: String, variable: String },
+
+    #[error("{key}: environment variable {variable} is not valid UTF-8")]
+    NonUnicodeEnvironmentVariable { key: String, variable: String },
+
+    #[error("{key}: ${{{reference}}} is not a valid environment variable name")]
+    MalformedEnvironmentReference { key: String, reference: String },
 
     #[cfg(feature = "offline")]
     #[error("duckdb: {0}")]

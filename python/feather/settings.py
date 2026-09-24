@@ -1,0 +1,135 @@
+"""Project settings, read from ``feather.toml``.
+
+The core owns this file: it parses the TOML, resolves ``${VAR}`` from the
+environment, and decides whether the values are valid. This module is the typed
+view of the result, so Python code gets autocomplete and a checked attribute set
+without a second implementation of the schema.
+
+The models below therefore mirror the core's, and their constraints are a
+deliberate duplicate rather than the rule. A mismatch between the two is caught
+here, at the binding, instead of inside an engine.
+
+Offline sources are not here. A source is declared on the view it feeds, as
+``FileSource(path=...)`` in a definition module. What this file holds is the
+credentials a source must not carry, since a definition module is committed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Literal
+
+import pydantic
+
+from feather._wire import NonEmptyStr
+
+if TYPE_CHECKING:
+    import os
+
+DEFAULT_PATH = Path("feather.toml")
+"""The file :func:`load_settings` reads when no path is given."""
+
+
+class SnowflakeConnection(pydantic.BaseModel):
+    """A Snowflake account a source can read from."""
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["snowflake"]
+    account: NonEmptyStr
+    warehouse: NonEmptyStr
+    username: NonEmptyStr
+    password: pydantic.SecretStr
+
+
+class S3Connection(pydantic.BaseModel):
+    """An S3 or S3-compatible object store a source can read from.
+
+    ``key_id`` is not a secret and is left readable, so a misconfigured key is
+    diagnosable from a log. ``secret`` is not.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["s3"]
+    region: NonEmptyStr
+    key_id: NonEmptyStr
+    secret: pydantic.SecretStr
+
+
+Connection = Annotated[SnowflakeConnection | S3Connection, pydantic.Field(discriminator="type")]
+"""A named credential set, discriminated on ``type``."""
+
+
+class L1Cache(pydantic.BaseModel):
+    """The in-process cache in front of Valkey.
+
+    Present whether or not Valkey is, because local mode has an L1 and no L2.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    enabled: bool = True
+    max_capacity_mb: Annotated[int, pydantic.Field(gt=0)] | None = None
+    fallback_ttl_seconds: Annotated[int, pydantic.Field(gt=0)] | None = None
+
+
+class Valkey(pydantic.BaseModel):
+    """The Valkey connection. The only L2, so nothing discriminates it."""
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    endpoint: NonEmptyStr
+    tls: bool
+    field_expiration: bool = False
+
+
+class FeatherSettings(pydantic.BaseModel):
+    """A validated ``feather.toml``.
+
+    ``valkey`` and ``l1_cache`` absent is local mode: an in-process DuckDB over
+    local files, and the engine's own cache defaults.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    project: NonEmptyStr
+    definitions: Annotated[list[NonEmptyStr], pydantic.Field(min_length=1)]
+    connections: dict[NonEmptyStr, Connection] = pydantic.Field(default_factory=dict)
+    valkey: Valkey | None = None
+    l1_cache: L1Cache | None = None
+
+
+def load_settings(path: str | os.PathLike[str] = DEFAULT_PATH) -> FeatherSettings:
+    """Read and validate a ``feather.toml``.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The validated settings, as the core resolved them.
+
+    Raises:
+        FileNotFoundError: If no file is at ``path``.
+        OSError: If the file exists but cannot be read.
+        ValueError: If it is not valid TOML, holds an unknown key, is missing a
+            required one, or has a ``${VAR}`` reference that cannot be resolved.
+            The message carries the dotted key path.
+    """
+    # Imported here rather than at module scope, so that importing `feather` still
+    # works without the compiled extension. Only this call needs it.
+    from feather import _core
+
+    return FeatherSettings.model_validate_json(_core.load_settings(str(path)))
+
+
+__all__ = [
+    "DEFAULT_PATH",
+    "Connection",
+    "FeatherSettings",
+    "L1Cache",
+    "S3Connection",
+    "SnowflakeConnection",
+    "Valkey",
+    "load_settings",
+]

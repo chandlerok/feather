@@ -10,3 +10,20 @@ Keep this in sync with `crates/feather-py/src/lib.rs`.
 """
 
 __version__: str
+
+def load_settings(path: str) -> str:
+    """Read and validate a ``feather.toml``, as JSON.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The validated settings, serialized. `feather.settings` wraps this.
+
+    Raises:
+        FileNotFoundError: If no file is at ``path``.
+        OSError: If the file exists but cannot be read.
+        ValueError: If it is not valid TOML, does not match the schema, or holds a
+            ``${VAR}`` reference that cannot be resolved.
+    """
+    ...

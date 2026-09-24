@@ -1,10 +1,15 @@
-//! Definition types, mirroring the Pydantic v2 models on the Python side.
+//! Definition types: the language-neutral contract for what a view is.
 //!
-//! Python is the validating authority: it parses `feature_store.yaml` and the
-//! definition modules, and hands the result across the boundary as JSON. These
-//! types therefore deserialize that JSON and do not re-validate it. The one
-//! exception is [`Definitions::validate`], which checks the cross-references
-//! Pydantic cannot see (a feature service naming a view that does not exist).
+//! A binding's definition layer offers authoring ergonomics and reports a mistake
+//! as early as that language can, but the contract is here. These types validate on
+//! ingest, so a binding that skips its own checks still cannot hand over something
+//! the engines cannot represent, and a second binding has nothing new to implement.
+//!
+//! Validation covers what an engine depends on: exactly one entity per view, the
+//! field names a view declares, and every service reference resolving to a view and
+//! a field that both exist.
+
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -200,16 +205,45 @@ impl Definitions {
             .ok_or_else(|| Error::UnknownService(name.to_owned()))
     }
 
-    /// Check the references Pydantic cannot see, because they cross objects.
+    /// Reject a definition the engines cannot work from.
+    ///
+    /// This is the authority, not a second opinion. A binding may reject the same
+    /// thing earlier and in its own words, but a value that reaches here is checked
+    /// again, and references that cross objects are checked only here.
     pub fn validate(&self) -> Result<()> {
         for view in &self.views {
             // Surfaces the multi-entity error at validation time rather than at
             // the first read.
             view.entity()?;
+            if view.ttl_days == Some(0) {
+                return Err(Error::MalformedView {
+                    view: view.name.clone(),
+                    reason: "declares ttl_days of 0, which can never expire a value".to_owned(),
+                });
+            }
+            if view.timestamp_field.is_some()
+                && view.timestamp_field == view.created_timestamp_field
+            {
+                return Err(Error::MalformedView {
+                    view: view.name.clone(),
+                    reason: format!(
+                        "uses `{}` as both the event timestamp and the created timestamp",
+                        view.timestamp_field(),
+                    ),
+                });
+            }
+            let mut seen = HashSet::new();
             for field in &view.features {
                 if field.name.is_empty() {
-                    return Err(Error::MalformedEntityKey {
-                        reason: format!("view `{}` declares an unnamed field", view.name),
+                    return Err(Error::MalformedView {
+                        view: view.name.clone(),
+                        reason: "declares an unnamed field".to_owned(),
+                    });
+                }
+                if !seen.insert(field.name.as_str()) {
+                    return Err(Error::MalformedView {
+                        view: view.name.clone(),
+                        reason: format!("declares field `{}` twice", field.name),
                     });
                 }
             }
@@ -226,5 +260,142 @@ impl Definitions {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One valid view, with `mutate` applied before it goes into the project.
+    fn project(mutate: impl FnOnce(&mut FeatureView)) -> Definitions {
+        let mut view = FeatureView {
+            name: "user_clicks".to_owned(),
+            entities: vec![Entity::new("user_id", "user_id")],
+            source: FileSource::new("data/user_stats.parquet"),
+            features: vec![
+                Field::new("click_count", DType::Int64),
+                Field::new("purchase_count", DType::Int64),
+            ],
+            ttl_days: None,
+            timestamp_field: None,
+            created_timestamp_field: None,
+        };
+        mutate(&mut view);
+        Definitions {
+            project: "ad_recommendations".to_owned(),
+            views: vec![view],
+            services: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_valid_view_passes() {
+        project(|_| {}).validate().expect("valid");
+    }
+
+    #[test]
+    fn an_unnamed_field_is_rejected() {
+        let error = project(|v| v.features[1].name.clear())
+            .validate()
+            .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` declares an unnamed field"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_field_is_rejected() {
+        let error = project(|v| v.features[1].name = "click_count".to_owned())
+            .validate()
+            .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` declares field `click_count` twice"
+        );
+    }
+
+    #[test]
+    fn a_zero_ttl_is_rejected() {
+        let error = project(|v| v.ttl_days = Some(0))
+            .validate()
+            .expect_err("must fail");
+
+        assert!(error.to_string().contains("ttl_days of 0"), "{error}");
+    }
+
+    #[test]
+    fn a_timestamp_collision_is_rejected() {
+        let error = project(|v| {
+            v.timestamp_field = Some("ts".to_owned());
+            v.created_timestamp_field = Some("ts".to_owned());
+        })
+        .validate()
+        .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` uses `ts` as both the event timestamp and the created timestamp"
+        );
+    }
+
+    #[test]
+    fn a_multi_entity_view_is_rejected() {
+        let error = project(|v| v.entities.push(Entity::new("other", "other")))
+            .validate()
+            .expect_err("must fail");
+
+        assert!(
+            error.to_string().contains("unsupported number of entities"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_service_naming_an_unknown_view_is_rejected() {
+        let mut definitions = project(|_| {});
+        definitions.services.push(FeatureService {
+            name: "ranking_v3".to_owned(),
+            features: vec!["nope:click_count".to_owned()],
+        });
+
+        let error = definitions.validate().expect_err("must fail");
+
+        assert!(
+            error.to_string().contains("no feature view named `nope`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_service_naming_an_unknown_feature_is_rejected() {
+        let mut definitions = project(|_| {});
+        definitions.services.push(FeatureService {
+            name: "ranking_v3".to_owned(),
+            features: vec!["user_clicks:click_cout".to_owned()],
+        });
+
+        let error = definitions.validate().expect_err("must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("`click_cout` is not part of view"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_resolvable_service_passes() {
+        let mut definitions = project(|_| {});
+        definitions.services.push(FeatureService {
+            name: "ranking_v3".to_owned(),
+            features: vec!["user_clicks:click_count".to_owned()],
+        });
+
+        definitions.validate().expect("valid");
     }
 }

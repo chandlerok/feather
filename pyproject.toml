@@ -3,7 +3,7 @@ requires = ["maturin>=1.15,<2"]
 build-backend = "maturin"
 
 [project]
-name = "feather-store"
+name = "feather-py"
 version = "0.0.1"
 description = "An opinionated feature store with a Rust core and a native Python API"
 readme = "README.md"
@@ -97,6 +97,14 @@ ignore = [
   "ANN401", # Any is sometimes the honest annotation
 ]
 
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic resolves field annotations when the class is created, so a type used in a
+# model field has to be importable at runtime even though `from __future__ import
+# annotations` makes the annotation text lazy. Without this, TC001 asks for the import
+# to move into a TYPE_CHECKING block, and the model then fails at import with "is not
+# fully defined; you should define NonEmptyStr".
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
@@ -121,6 +129,11 @@ docstring-code-format = true
 [tool.pyrefly]
 project-includes = ["python", "tests"]
 search-path = ["python"]
+# Pin the interpreter. Left unset, pyrefly queries `python3` and `python` on PATH
+# to find site-packages, so a wrapper whose PATH lacks the venv resolves against a
+# system Python and reports every installed dependency as an unresolved import
+# while the same check passes under `uv run`.
+python-interpreter-path = ".venv/bin/python"
 python-version = "3.11"
 # Libraries ship everywhere; do not let the build host narrow the types.
 python-platform = "all"
