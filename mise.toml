@@ -1,4 +1,4 @@
 [tools]
-biome = "latest"
-hk = "latest"
 rust = "latest"
+uv = "latest"
+hk = "latest"
