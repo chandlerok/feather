@@ -10,6 +10,7 @@ this contract is asserted there, through the declarative path.
 """
 
 import json
+from pathlib import Path
 
 import pydantic
 import pytest
@@ -22,6 +23,9 @@ from feather._wire import (
     Field,
     FileSource,
 )
+
+FIXTURE = Path(__file__).parent / "fixtures" / "definitions.json"
+"""The payload both sides read: Python emits it, the core deserializes it."""
 
 
 def a_view(**overrides: object) -> FeatureView:
@@ -42,14 +46,34 @@ def a_view(**overrides: object) -> FeatureView:
     return FeatureView.model_validate(base)
 
 
-def test_definition_json_uses_the_keys_rust_expects() -> None:
-    """The serialized shape matches the Rust structs field for field."""
-    config = FeatureStoreConfig(
+def a_config() -> FeatureStoreConfig:
+    """The canonical project: one view with a TTL, and a service referencing it.
+
+    Returns:
+        The config whose serialized form is the shared fixture.
+    """
+    return FeatureStoreConfig(
         project="ads",
         views=[a_view(ttl_days=30)],
         services=[FeatureService(name="ranking", features=["user_clicks:click_count"])],
     )
-    payload = json.loads(config.model_dump_json())
+
+
+def test_the_serialized_payload_matches_the_shared_fixture() -> None:
+    """The fixture is the one artifact both sides read, so this is what stops drift.
+
+    `crates/feather-core/tests/wire_contract.rs` deserializes this same file. A
+    change to these models fails here until the fixture is regenerated on purpose,
+    and the Rust test then proves the core still reads what was written.
+    """
+    assert json.loads(a_config().model_dump_json()) == json.loads(
+        FIXTURE.read_text(encoding="utf-8")
+    )
+
+
+def test_definition_json_uses_the_keys_rust_expects() -> None:
+    """The serialized shape matches the Rust structs field for field."""
+    payload = json.loads(a_config().model_dump_json())
 
     assert payload["project"] == "ads"
     view = payload["views"][0]

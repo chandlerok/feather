@@ -1,0 +1,34 @@
+{
+  "project": "ads",
+  "views": [
+    {
+      "name": "user_clicks",
+      "entities": [
+        {
+          "name": "user_id",
+          "join_key": "user_id"
+        }
+      ],
+      "source": {
+        "path": "data/user_stats.parquet"
+      },
+      "features": [
+        {
+          "name": "click_count",
+          "dtype": "int64"
+        }
+      ],
+      "ttl_days": 30,
+      "timestamp_field": null,
+      "created_timestamp_field": null
+    }
+  ],
+  "services": [
+    {
+      "name": "ranking",
+      "features": [
+        "user_clicks:click_count"
+      ]
+    }
+  ]
+}
