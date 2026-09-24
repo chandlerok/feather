@@ -186,8 +186,8 @@ pub fn freshness_field(view: &str) -> String {
 /// vector in a single fixed-stride blob, so a per-feature field name would either
 /// duplicate the schema tag per feature or force the codec down to one column at
 /// a time, losing the stride. The cost is that reading two features from a
-/// 50-feature view decodes 50 columns; the benefit is one field per view on the
-/// wire and roughly half the bytes.
+/// 50-feature view decodes 50 columns; the benefit is one field per view in
+/// storage and roughly half the bytes.
 pub fn value_field(view: &str) -> String {
     format!("v:{view}")
 }
