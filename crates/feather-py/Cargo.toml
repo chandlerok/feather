@@ -13,7 +13,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 arrow.workspace = true
-feather-core = { path = "../feather-core", features = ["full"] }
+# No engine features here. This crate exposes `__version__` and `load_settings`,
+# and neither touches the engines, so asking for `full` would compile bundled
+# DuckDB from source (minutes on a cold build) to ship a binding that cannot use
+# it. That cost landed on every build of the extension, including the Python CI
+# job and any `pip install`. A release that exposes the engines turns them on.
+feather-core = { path = "../feather-core" }
 # No `extension-module` feature here on purpose. maturin sets
 # PYO3_BUILD_EXTENSION_MODULE for PyO3 >= 0.27, and enabling the feature
 # statically would stop `cargo test` from linking.
@@ -23,3 +28,10 @@ pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+default = []
+# Forwarded so that `cargo test --workspace --all-features` still builds and
+# tests the engines, and so a wheel that exposes them can opt in.
+offline = ["feather-core/offline"]
+valkey = ["feather-core/valkey"]

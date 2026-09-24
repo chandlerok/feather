@@ -96,11 +96,17 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       - name: pin the interpreter
         run: uv venv --python ${{ matrix.python }}
-      # --no-install-project skips building the Rust extension. This job
-      # tests the Python layer, and pytest finds the package through
-      # `pythonpath` in pyproject.toml, so no build is needed.
+      # The extension is built, because these tests exercise it: load_settings
+      # reads feather.toml through the core rather than parsing it in Python.
+      # That is affordable because crates/feather-py does not ask feather-core
+      # for the engines, so this build is Rust and Arrow rather than the bundled
+      # DuckDB C++ build the rust job pays for. It is also the only place the
+      # Python-to-Rust handoff is tested at all: the rust job links the core
+      # directly and never loads the extension.
+      # renovate: datasource=github-tags depName=Swatinem/rust-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: sync
-        run: uv sync --no-install-project
+        run: uv sync
       - name: ruff
         run: |
           uv run --no-sync ruff check python tests
