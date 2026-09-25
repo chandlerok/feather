@@ -15,7 +15,7 @@
 //! decision it makes is re-checked by the core.
 
 use feather_core::Error as CoreError;
-use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyFileNotFoundError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 
 #[cfg(feature = "offline")]
@@ -308,7 +308,7 @@ fn connect_online(
     {
         let _ = runtime;
         Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "the settings declare a Valkey at {}, and this build has no Valkey support;              install a build with the `valkey` feature",
+            "the settings declare a Valkey at {}, and this build has no Valkey support; install a build with the `valkey` feature",
             configured.endpoint
         )))
     }
