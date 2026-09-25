@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{ArrayRef, Int64Array};
-use feather_core::definitions::{DType, Entity, FeatureView, Field, FileSource};
+use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
 use feather_core::online::{
     EntityRequest, Missing, OnlineStore, ReadRequest, ViewRequest, ViewValues, WriteBatch,
@@ -40,7 +40,7 @@ fn view(name: &str, ttl_days: Option<u32>) -> FeatureView {
     FeatureView {
         name: name.to_owned(),
         entities: vec![Entity::new("user_id", "user_id")],
-        source: FileSource::new("data/x.parquet"),
+        source: Source::file("data/x.parquet"),
         features: vec![
             Field::new("count", DType::Int64),
             Field::new("label", DType::Utf8),

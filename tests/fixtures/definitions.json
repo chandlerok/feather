@@ -10,6 +10,7 @@
         }
       ],
       "source": {
+        "type": "file",
         "path": "data/user_stats.parquet"
       },
       "features": [
@@ -19,6 +20,30 @@
         }
       ],
       "ttl_days": 30,
+      "timestamp_field": null,
+      "created_timestamp_field": null
+    },
+    {
+      "name": "user_stats",
+      "entities": [
+        {
+          "name": "user_id",
+          "join_key": "user_id"
+        }
+      ],
+      "source": {
+        "type": "postgres",
+        "connection": "pg_prod",
+        "schema": "public",
+        "table": "user_stats"
+      },
+      "features": [
+        {
+          "name": "lifetime_value",
+          "dtype": "float64"
+        }
+      ],
+      "ttl_days": null,
       "timestamp_field": null,
       "created_timestamp_field": null
     }

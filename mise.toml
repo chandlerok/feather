@@ -57,7 +57,7 @@ run = "uv run --no-sync pyrefly check"
 # ------------------------------------------------------------------- testing
 
 [tasks.test]
-description = "Unit tests. No external services required."
+description = "Cargo tests and the Python unit tests; the Rust integration tests need the services CI starts."
 run = [
   "cargo test --workspace --all-features",
   "uv run pytest -m 'not integration and not load'",
@@ -123,6 +123,20 @@ run = "docker compose down -v"
 
 [tasks."s3:logs"]
 run = "docker compose logs -f rustfs"
+
+# Unlike RustFS, this image has a real readiness probe, so `--wait` returns when the
+# server accepts connections rather than when the container starts, and there is nothing
+# to seed: the integration test creates its own table through DuckDB.
+[tasks."postgres:up"]
+description = "Start Postgres for the Postgres integration test"
+run = "docker compose up -d --wait postgres"
+
+[tasks."postgres:down"]
+description = "Stop Postgres and delete its volume"
+run = "docker compose down -v"
+
+[tasks."postgres:logs"]
+run = "docker compose logs -f postgres"
 
 # ------------------------------------------------------------------ load/bench
 

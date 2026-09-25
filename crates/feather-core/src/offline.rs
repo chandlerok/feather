@@ -1,8 +1,9 @@
 //! Offline point-in-time joins, executed in the embedded DuckDB engine.
 //!
-//! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix,
-//! and a warehouse table differ only in their path scheme, so nothing here selects a
-//! compute backend.
+//! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix, and
+//! a warehouse table are read by different readers and joined the same way, so nothing here
+//! selects a compute backend: [`Engine::relation`] is the one place a source's kind decides
+//! which reader its rows come from.
 //!
 //! The rules are the ones specified under "Point-in-time join semantics" in the
 //! architecture document, and they live here rather than in the caller because getting them
@@ -33,7 +34,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::Connection;
 
-use crate::definitions::{DType, FeatureView};
+use crate::definitions::{DType, FeatureView, Source};
 use crate::error::{Error, Result};
 use crate::settings::Connection as SettingsConnection;
 use crate::value::arrow_type;
@@ -140,6 +141,10 @@ pub struct Engine {
     /// This engine's private spill directory. DuckDB removes the files inside it when the
     /// instance shuts down; the directory itself is removed when the engine is dropped.
     spill: PathBuf,
+    /// The project's named connections, retained because a source resolves its
+    /// `connection` by name when it is read. The credentials are already in DuckDB as
+    /// secrets, so keeping them here adds no exposure.
+    connections: BTreeMap<String, SettingsConnection>,
 }
 
 impl Engine {
@@ -220,7 +225,11 @@ impl Engine {
             }
         }
 
-        Ok(Self { connection, spill })
+        Ok(Self {
+            connection,
+            spill,
+            connections: connections.clone(),
+        })
     }
 
     /// The directory this engine spills into.
@@ -228,17 +237,59 @@ impl Engine {
         &self.spill
     }
 
-    /// Load the filesystem a remote source needs, the first time one is read.
+    /// Load what a source needs to be read, the first time a view is joined.
     ///
     /// Deferred rather than done at open, so a project reading local files pays nothing, and
     /// done here rather than left to DuckDB's autoload so that a machine which cannot obtain
     /// the extension says so, instead of failing later with an opaque read error.
-    fn ensure_remote_filesystem(&self, path: &str) -> Result<()> {
-        if path_needs_filesystem(path) {
-            self.connection
-                .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+    ///
+    /// Args:
+    ///     view: The view whose source decides which extension, if any, is needed.
+    ///
+    /// Returns:
+    ///     `Ok(())` once the filesystem or scanner the source needs is loaded.
+    ///
+    /// Raises:
+    ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
+    ///         source names a connection the project cannot use. Checked before the
+    ///         extension is installed, so a connection mistake fails as itself rather
+    ///         than after a fetch.
+    ///     [`Error::DuckDb`] if the extension cannot be installed or loaded.
+    fn ensure_source_loaded(&self, view: &FeatureView) -> Result<()> {
+        match &view.source {
+            Source::File { path } if path_needs_filesystem(path) => {
+                self.connection
+                    .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+            }
+            Source::File { .. } => {}
+            Source::Postgres { connection, .. } => {
+                self.postgres_conninfo(view, connection)?;
+                self.connection
+                    .execute_batch("INSTALL postgres; LOAD postgres;")?;
+            }
         }
         Ok(())
+    }
+
+    /// The libpq connection string a view's Postgres source reads through.
+    ///
+    /// The name lookup, the kind check, and libpq's own string form meet here, so a
+    /// reader has one place that turns `connection = "pg_prod"` into something connectable.
+    fn postgres_conninfo(&self, view: &FeatureView, connection: &str) -> Result<String> {
+        match self.connections.get(connection) {
+            None => Err(Error::UnknownConnection {
+                view: view.name.clone(),
+                connection: connection.to_owned(),
+            }),
+            Some(configured) => configured
+                .conninfo()
+                .ok_or_else(|| Error::SourceConnectionKind {
+                    view: view.name.clone(),
+                    source_kind: view.source.kind().to_owned(),
+                    connection: connection.to_owned(),
+                    connection_kind: configured.kind().to_owned(),
+                }),
+        }
     }
 }
 
@@ -303,7 +354,8 @@ impl Engine {
     ///     entity_frame: The label rows. Its entity key column is named after the view's
     ///         entity `join_key`, and its label timestamp column is named by
     ///         [`JoinOptions::label_timestamp_column`].
-    ///     view: The view to join. `source.path` is read as Parquet.
+    ///     view: The view to join. Its source is read as Parquet or from a Postgres
+    ///         table, depending on the kind it declares.
     ///     options: Ordering and missingness rules for this join.
     ///
     /// Returns:
@@ -319,8 +371,12 @@ impl Engine {
     ///     [`Error::OfflineTypeMismatch`] if the two sides' key families differ, or a naive
     ///         timestamp is joined against a zoned one.
     ///     [`Error::ColumnTypeMismatch`] if a source column does not have the declared dtype.
+    ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
+    ///         source names a connection the project cannot use.
     ///     [`Error::AmbiguousTimestamp`] if the source holds more than one row for a key and
     ///         timestamp and declares no `created_timestamp_field` to break the tie.
+    ///     [`Error::UnreadableSource`] if the source cannot be read at all, which names the
+    ///         view it was being read for.
     ///     [`Error::DuckDb`] if the query itself fails.
     pub fn point_in_time_join(
         &self,
@@ -340,10 +396,10 @@ impl Engine {
         let key_family = KeyFamily::of_arrow(&key_type)?;
         let label_kind = TimestampKind::of_arrow(&label_type)?;
 
-        self.ensure_remote_filesystem(&view.source.path)?;
+        self.ensure_source_loaded(view)?;
 
-        let location = format!("source `{}`", view.source.path);
-        let described = self.describe_source(&view.source.path)?;
+        let location = format!("source `{}`", view.source.description());
+        let described = self.describe_source(view)?;
 
         let source_key = described
             .get(key_column)
@@ -398,7 +454,7 @@ impl Engine {
 
         self.stage_labels(entity_frame, &frame_schema, key_index, label_index)?;
 
-        let relation = relation(&view.source.path);
+        let relation = self.relation(view)?;
         let key_expr = quote_ident(key_column);
         let source_ts_value = source_ts_kind.to_micros(&quote_ident(source_ts_column));
 
@@ -424,16 +480,32 @@ impl Engine {
     }
 
     /// The source's column names and DuckDB types, read without scanning any data.
-    fn describe_source(&self, path: &str) -> Result<TypeMap> {
-        let sql = format!("DESCRIBE SELECT * FROM {}", relation(path));
-        let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement.query([])?;
-        let mut types = TypeMap::default();
-        while let Some(row) = rows.next()? {
-            // DESCRIBE's first two columns are column_name and column_type.
-            types.insert(row.get(0)?, row.get(1)?);
-        }
-        Ok(types)
+    ///
+    /// Raises:
+    ///     [`Error::UnreadableSource`] if the source cannot be described, which is where a
+    ///         wrong host, password, or table name surfaces. The failure is attributed to
+    ///         the view here, because the scanner's own text holds neither the view nor the
+    ///         connection name.
+    fn describe_source(&self, view: &FeatureView) -> Result<TypeMap> {
+        let sql = format!("DESCRIBE SELECT * FROM {}", self.relation(view)?);
+        let describe = || -> duckdb::Result<TypeMap> {
+            let mut statement = self.connection.prepare(&sql)?;
+            let mut rows = statement.query([])?;
+            let mut types = TypeMap::default();
+            while let Some(row) = rows.next()? {
+                // DESCRIBE's first two columns are column_name and column_type.
+                types.insert(row.get(0)?, row.get(1)?);
+            }
+            Ok(types)
+        };
+        // The scanner's text is kept, because it is the only description of what went wrong
+        // and it may echo part of the conninfo. Wrapping rather than replacing it puts that
+        // text behind a message that says which view was reading.
+        describe().map_err(|error| Error::UnreadableSource {
+            view: view.name.clone(),
+            location: format!("source `{}`", view.source.description()),
+            reason: error.to_string(),
+        })
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -719,12 +791,43 @@ impl TimestampKind {
     }
 }
 
-/// The relation a source path is read through.
-///
-/// One function so that a reader added later, a warehouse table or a table format, changes
-/// one place instead of every query.
-fn relation(path: &str) -> String {
-    format!("read_parquet({})", quote_literal(path))
+impl Engine {
+    /// The table expression a view's source becomes.
+    ///
+    /// The one place a source becomes a relation, so `DESCRIBE`, the join, and the
+    /// ambiguity check all read the same expression rather than re-deriving it. A
+    /// reader added later, a warehouse table or a table format, changes only this.
+    ///
+    /// Args:
+    ///     view: The view whose source is read.
+    ///
+    /// Returns:
+    ///     A SQL expression yielding the source's rows, already quoted for DuckDB.
+    ///
+    /// Raises:
+    ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
+    ///         source names a connection the project cannot use.
+    fn relation(&self, view: &FeatureView) -> Result<String> {
+        match &view.source {
+            Source::File { path } => Ok(format!("read_parquet({})", quote_literal(path))),
+            Source::Postgres {
+                connection,
+                schema,
+                table,
+            } => {
+                // The conninfo is itself a SQL literal, so it is escaped for libpq by
+                // `postgres_conninfo` and then for DuckDB by `quote_literal`. Both
+                // layers are required; see the comment on the libpq one.
+                let conninfo = self.postgres_conninfo(view, connection)?;
+                Ok(format!(
+                    "postgres_scan({}, {}, {})",
+                    quote_literal(&conninfo),
+                    quote_literal(schema),
+                    quote_literal(table),
+                ))
+            }
+        }
+    }
 }
 
 /// DuckDB's name for a declared dtype, which is what `DESCRIBE` reports.
@@ -857,6 +960,9 @@ fn s3_secret_sql(name: &str, configured: &SettingsConnection) -> Option<String> 
         // DuckDB's snowflake extension authenticates its own way, and no reader uses this kind
         // yet.
         SettingsConnection::Snowflake { .. } => None,
+        // A Postgres source reads through the connection string the relation carries, so
+        // there is no secret for the engine to hold: the scanner takes libpq's own form.
+        SettingsConnection::Postgres { .. } => None,
     }
 }
 
@@ -887,7 +993,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
-    use crate::definitions::{Entity, Field as FeatureField, FileSource};
+    use crate::definitions::{Entity, Field as FeatureField};
 
     /// A whole day, in the units the join compares in.
     const DAY: i64 = 86_400_000_000;
@@ -895,11 +1001,11 @@ mod tests {
     static FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     /// A Parquet file that removes itself when the test ends.
-    struct Source {
+    struct Parquet {
         path: PathBuf,
     }
 
-    impl Source {
+    impl Parquet {
         fn write(batch: &RecordBatch) -> Self {
             let path = std::env::temp_dir().join(format!(
                 "feather-offline-{}-{}.parquet",
@@ -919,7 +1025,7 @@ mod tests {
         }
     }
 
-    impl Drop for Source {
+    impl Drop for Parquet {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
@@ -983,7 +1089,7 @@ mod tests {
         FeatureView {
             name: "user_clicks".to_owned(),
             entities: vec![Entity::new("user_id", "user_id")],
-            source: FileSource::new(path),
+            source: Source::file(path),
             features: vec![FeatureField::new("count", DType::Int64)],
             ttl_days,
             timestamp_field: None,
@@ -1030,7 +1136,7 @@ mod tests {
 
     #[test]
     fn matches_the_newest_row_at_or_before_the_label_time() {
-        let source = Source::write(&integer_source(&[(1, 100, 10), (1, 200, 20), (1, 300, 30)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 200, 20), (1, 300, 30)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(Some(1), 250)]),
@@ -1044,7 +1150,7 @@ mod tests {
 
     #[test]
     fn a_row_at_exactly_the_label_time_is_included() {
-        let source = Source::write(&integer_source(&[(1, 100, 10), (1, 200, 20)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 200, 20)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(Some(1), 200)]),
@@ -1058,7 +1164,7 @@ mod tests {
 
     #[test]
     fn strict_excludes_a_row_at_exactly_the_label_time() {
-        let source = Source::write(&integer_source(&[(1, 100, 10), (1, 200, 20)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 200, 20)]));
         let options = JoinOptions {
             strict: true,
             ..JoinOptions::default()
@@ -1076,7 +1182,7 @@ mod tests {
 
     #[test]
     fn a_value_exactly_ttl_days_old_is_still_fresh() {
-        let source = Source::write(&integer_source(&[(1, 0, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 0, 10)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(Some(1), DAY)]),
@@ -1090,7 +1196,7 @@ mod tests {
 
     #[test]
     fn an_expired_value_is_null_by_default_and_dropped_on_request() {
-        let source = Source::write(&integer_source(&[(1, 0, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 0, 10)]));
         let stale = labels(&[(Some(1), DAY + 1)]);
 
         let kept = engine()
@@ -1118,7 +1224,7 @@ mod tests {
 
     #[test]
     fn a_label_with_no_match_keeps_its_place() {
-        let source = Source::write(&integer_source(&[(1, 100, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(Some(2), 100)]),
@@ -1133,7 +1239,7 @@ mod tests {
 
     #[test]
     fn a_null_entity_key_never_matches() {
-        let source = Source::write(&integer_source(&[(1, 100, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(None, 100)]),
@@ -1147,7 +1253,7 @@ mod tests {
 
     #[test]
     fn output_rows_follow_the_input_order_not_the_join_order() {
-        let source = Source::write(&integer_source(&[(1, 100, 10), (1, 200, 20), (1, 300, 30)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 200, 20), (1, 300, 30)]));
         let joined = engine()
             .point_in_time_join(
                 &labels(&[(Some(1), 300), (Some(1), 100), (Some(1), 200)]),
@@ -1162,7 +1268,7 @@ mod tests {
 
     #[test]
     fn duplicate_timestamps_without_a_created_column_are_rejected() {
-        let source = Source::write(&integer_source(&[(1, 100, 10), (1, 100, 20)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 100, 20)]));
         let error = engine()
             .point_in_time_join(
                 &labels(&[(Some(1), 100)]),
@@ -1176,7 +1282,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_timestamp_takes_the_latest_created_row() {
-        let source = Source::write(&tie_breakable_source(&[(1, 100, 5, 10), (1, 100, 9, 20)]));
+        let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10), (1, 100, 9, 20)]));
         let mut view = view(&source.string(), None);
         view.created_timestamp_field = Some("created_at".to_owned());
 
@@ -1214,7 +1320,7 @@ mod tests {
             ],
         )
         .expect("source batch");
-        let source = Source::write(&batch);
+        let source = Parquet::write(&batch);
 
         let joined = engine()
             .point_in_time_join(
@@ -1254,7 +1360,7 @@ mod tests {
             ],
         )
         .expect("source batch");
-        let source = Source::write(&batch);
+        let source = Parquet::write(&batch);
 
         let label_schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Int64, true),
@@ -1312,7 +1418,7 @@ mod tests {
             ],
         )
         .expect("source batch");
-        let source = Source::write(&batch);
+        let source = Parquet::write(&batch);
 
         // The label frame's timestamp is naive, the source's is zoned.
         let label_schema = Arc::new(Schema::new(vec![
@@ -1362,7 +1468,7 @@ mod tests {
             ],
         )
         .expect("source batch");
-        let source = Source::write(&batch);
+        let source = Parquet::write(&batch);
 
         let error = engine()
             .point_in_time_join(
@@ -1377,7 +1483,7 @@ mod tests {
 
     #[test]
     fn a_missing_source_column_is_named() {
-        let source = Source::write(&integer_source(&[(1, 100, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
         let mut broken = view(&source.string(), None);
         broken.features = vec![FeatureField::new("nope", DType::Int64)];
 
@@ -1389,8 +1495,31 @@ mod tests {
     }
 
     #[test]
+    fn a_read_failure_names_the_view_and_its_source() {
+        // A source that does not exist, so the failure is the scanner's own. What is
+        // asserted is the attribution wrapped around the scanner's text, which is why the
+        // library's own wording is not asserted on.
+        let error = engine()
+            .point_in_time_join(
+                &labels(&[(Some(1), 100)]),
+                &view("no/such/source.parquet", None),
+                &JoinOptions::default(),
+            )
+            .expect_err("must fail");
+
+        assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
+        assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("source `no/such/source.parquet`"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_missing_label_column_is_named() {
-        let source = Source::write(&integer_source(&[(1, 100, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
         let frame = labels(&[(Some(1), 100)]);
         let options = JoinOptions {
             label_timestamp_column: "absent".to_owned(),
@@ -1408,7 +1537,7 @@ mod tests {
     #[test]
     fn a_label_column_name_is_quoted_into_the_query() {
         // A name that would break the SQL if it were interpolated bare.
-        let source = Source::write(&integer_source(&[(1, 100, 10)]));
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
         let named = Schema::new(vec![
             Field::new("user_id", DataType::Int64, true),
             Field::new("odd \" name", DataType::Int64, false),
@@ -1484,6 +1613,118 @@ mod tests {
         );
 
         assert!(s3_secret_sql("snowflake_prod", &configured).is_none());
+    }
+
+    /// The same view shape as [`view`], over the given source.
+    fn source_view(source: Source) -> FeatureView {
+        let mut view = view("unused", None);
+        view.source = source;
+        view
+    }
+
+    #[test]
+    fn a_file_source_becomes_a_parquet_relation() {
+        let relation = engine()
+            .relation(&view("data/user_stats.parquet", None))
+            .expect("relation");
+
+        assert_eq!(relation, "read_parquet('data/user_stats.parquet')");
+    }
+
+    #[test]
+    fn a_postgres_source_becomes_a_postgres_scan_relation() {
+        let connections = BTreeMap::from([(
+            "pg_prod".to_owned(),
+            connection(
+                r#"{"type":"postgres","host":"db.internal","port":5433,"database":"warehouse","user":"fs_runner","password":"fea'ther"}"#,
+            ),
+        )]);
+        let engine = Engine::open(&Limits::default(), &connections).expect("engine");
+        let view = source_view(Source::postgres("pg_prod", "public", "user_stats"));
+
+        // The password is escaped for libpq (`\'`, not SQL's `''`) and the resulting
+        // conninfo is then escaped for DuckDB by doubling every quote. Asserting the whole
+        // string is what pins that both layers ran and in that order.
+        let relation = engine.relation(&view).expect("relation");
+
+        assert_eq!(
+            relation,
+            r"postgres_scan('host=''db.internal'' port=''5433'' dbname=''warehouse'' user=''fs_runner'' password=''fea\''ther''', 'public', 'user_stats')"
+        );
+        assert!(!relation.contains("password=''fea''ther''"), "{relation}");
+    }
+
+    #[test]
+    fn a_postgres_source_naming_no_connection_is_rejected() {
+        let view = {
+            let mut view = source_view(Source::postgres("pg_prod", "public", "user_stats"));
+            view.name = "user_stats".to_owned();
+            view
+        };
+
+        let error = engine().relation(&view).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_stats` names connection `pg_prod`, which is not configured"
+        );
+    }
+
+    #[test]
+    fn a_postgres_source_through_another_kind_is_rejected() {
+        let connections = BTreeMap::from([(
+            "s3_lake".to_owned(),
+            connection(r#"{"type":"s3","region":"us-east-1","key_id":"k","secret":"s"}"#),
+        )]);
+        let engine = Engine::open(&Limits::default(), &connections).expect("engine");
+        let view = {
+            let mut view = source_view(Source::postgres("s3_lake", "public", "user_stats"));
+            view.name = "user_stats".to_owned();
+            view
+        };
+
+        let error = engine.relation(&view).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_stats` reads a `postgres` source through connection `s3_lake`, \
+             which is a `s3` connection"
+        );
+    }
+
+    #[test]
+    fn a_local_file_source_loads_no_extension() {
+        // The deferred design: a project reading local files must not touch the extension
+        // repository, so neither the httpfs nor the postgres scanner is loaded.
+        let engine = engine();
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+
+        engine
+            .ensure_source_loaded(&view(&source.string(), None))
+            .expect("a local file needs nothing loaded");
+
+        let loaded: i64 = engine
+            .connection
+            .query_row(
+                "SELECT count(*) FROM duckdb_extensions() \
+                 WHERE loaded AND extension_name IN ('httpfs', 'postgres')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("extensions");
+        assert_eq!(loaded, 0, "a local file loaded a remote reader");
+    }
+
+    #[test]
+    fn a_postgres_source_is_rejected_before_any_extension_loads() {
+        // The connection is resolved before `INSTALL postgres`, so a name that is not
+        // configured fails as that rather than after a fetch that may not even be possible.
+        let engine = engine();
+        let view = source_view(Source::postgres("absent", "public", "t"));
+
+        let error = engine.ensure_source_loaded(&view).expect_err("must fail");
+
+        assert!(matches!(error, Error::UnknownConnection { .. }), "{error}");
     }
 
     #[test]
@@ -1617,7 +1858,7 @@ mod tests {
         // to the spill directory. Threads are pinned because DuckDB budgets memory per
         // thread, so leaving them unpinned would move the floor with the core count and make
         // a fixed limit machine-dependent.
-        let source = Source::write(&integer_source(
+        let source = Parquet::write(&integer_source(
             &(0..1_000_000i64)
                 .map(|i| (i % 5_000, i, i))
                 .collect::<Vec<_>>(),

@@ -6,7 +6,7 @@
 //! `tests/fixtures/definitions.json`: the Python test asserts its own output
 //! equals that file, and this one asserts the core deserializes it.
 
-use feather_core::{DType, Definitions};
+use feather_core::{DType, Definitions, Source};
 
 /// The payload the Python wire layer emits.
 fn fixture() -> String {
@@ -23,13 +23,19 @@ fn the_python_payload_deserializes_field_for_field() {
 
     assert_eq!(definitions.project, "ads");
 
-    assert_eq!(definitions.views.len(), 1);
+    assert_eq!(definitions.views.len(), 2);
     let view = &definitions.views[0];
     assert_eq!(view.name, "user_clicks");
     assert_eq!(view.entities.len(), 1);
     assert_eq!(view.entities[0].name, "user_id");
     assert_eq!(view.entities[0].join_key, "user_id");
-    assert_eq!(view.source.path, "data/user_stats.parquet");
+    // The source is tagged, so the kind Python wrote is the kind the core reads back.
+    assert_eq!(
+        view.source,
+        Source::file("data/user_stats.parquet"),
+        "source is {}",
+        view.source.description()
+    );
     assert_eq!(view.features.len(), 1);
     assert_eq!(view.features[0].name, "click_count");
     assert_eq!(view.features[0].dtype, DType::Int64);
@@ -42,6 +48,21 @@ fn the_python_payload_deserializes_field_for_field() {
     // And a null timestamp_field means the core's default applies, not one the
     // Python layer invented.
     assert_eq!(view.timestamp_field(), "event_timestamp");
+
+    // The other kind, so a source's tag is compared across the boundary rather than
+    // asserted twice. A rename applied on one side alone would otherwise stay green.
+    let postgres = &definitions.views[1];
+    assert_eq!(postgres.name, "user_stats");
+    assert_eq!(
+        postgres.source,
+        Source::postgres("pg_prod", "public", "user_stats"),
+        "source is {}",
+        postgres.source.description()
+    );
+    assert_eq!(postgres.source.kind(), "postgres");
+    assert_eq!(postgres.features.len(), 1);
+    assert_eq!(postgres.features[0].name, "lifetime_value");
+    assert_eq!(postgres.features[0].dtype, DType::Float64);
 
     assert_eq!(definitions.services.len(), 1);
     assert_eq!(definitions.services[0].name, "ranking");
@@ -60,7 +81,7 @@ fn the_optional_keys_may_be_omitted() {
         "views": [{
             "name": "user_clicks",
             "entities": [{"name": "user_id", "join_key": "user_id"}],
-            "source": {"path": "data/user_stats.parquet"},
+            "source": {"type": "file", "path": "data/user_stats.parquet"},
             "features": [{"name": "click_count", "dtype": "int64"}],
         }],
     })
@@ -94,7 +115,7 @@ fn every_dtype_wire_name_is_read() {
             "views": [{
                 "name": "v",
                 "entities": [{"name": "e", "join_key": "e"}],
-                "source": {"path": "p"},
+                "source": {"type": "file", "path": "p"},
                 "features": [{"name": "f", "dtype": wire}],
             }],
         })
@@ -118,7 +139,7 @@ fn an_unknown_dtype_wire_name_is_rejected() {
         "views": [{
             "name": "v",
             "entities": [{"name": "e", "join_key": "e"}],
-            "source": {"path": "p"},
+            "source": {"type": "file", "path": "p"},
             "features": [{"name": "f", "dtype": "int32"}],
         }],
     })
@@ -135,6 +156,114 @@ fn an_unknown_dtype_wire_name_is_rejected() {
 #[test]
 fn json_that_is_not_definitions_is_rejected() {
     let error = Definitions::from_json(r#"{"project": 1}"#).expect_err("must fail");
+
+    assert!(
+        error.to_string().contains("malformed definitions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_postgres_source_is_read_from_its_tag() {
+    // The second kind, so the tag itself is what selects the variant rather than the
+    // presence of a key.
+    let json = serde_json::json!({
+        "project": "ads",
+        "views": [{
+            "name": "user_stats",
+            "entities": [{"name": "user_id", "join_key": "user_id"}],
+            "source": {
+                "type": "postgres",
+                "connection": "pg_prod",
+                "schema": "public",
+                "table": "user_stats",
+            },
+            "features": [{"name": "ltv", "dtype": "float64"}],
+        }],
+    })
+    .to_string();
+
+    let definitions = Definitions::from_json(&json).expect("valid");
+
+    assert_eq!(
+        definitions.views[0].source,
+        Source::postgres("pg_prod", "public", "user_stats")
+    );
+    // Resolving a connection is a separate step, so a source with an unconfigured name
+    // still deserializes and is rejected by `validate_sources` instead.
+    assert_eq!(
+        definitions.views[0].source.connection_name(),
+        Some("pg_prod")
+    );
+}
+
+#[test]
+fn an_untagged_source_is_rejected() {
+    // The old shape. A path without a tag has no kind, and guessing one is how a
+    // Postgres source would be silently read as a file.
+    let json = serde_json::json!({
+        "project": "ads",
+        "views": [{
+            "name": "v",
+            "entities": [{"name": "e", "join_key": "e"}],
+            "source": {"path": "data/user_stats.parquet"},
+            "features": [{"name": "f", "dtype": "int64"}],
+        }],
+    })
+    .to_string();
+
+    let error = Definitions::from_json(&json).expect_err("must fail");
+
+    assert!(
+        error.to_string().contains("malformed definitions"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_source_field_that_is_empty_is_rejected() {
+    // The Python mirror makes every source field non-empty, so this is the direction the
+    // stated authority has to hold: the core rejects what the binding would.
+    let json = serde_json::json!({
+        "project": "ads",
+        "views": [{
+            "name": "user_stats",
+            "entities": [{"name": "user_id", "join_key": "user_id"}],
+            "source": {
+                "type": "postgres",
+                "connection": "pg_prod",
+                "schema": "public",
+                "table": "",
+            },
+            "features": [{"name": "ltv", "dtype": "float64"}],
+        }],
+    })
+    .to_string();
+
+    let error = Definitions::from_json(&json).expect_err("must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "view `user_stats` declares an empty `table` in its source"
+    );
+}
+
+#[test]
+fn a_source_key_from_another_kind_is_rejected() {
+    // `deny_unknown_fields` on the enum, so a key that belongs to the other variant is
+    // a mistake rather than something ignored.
+    let json = serde_json::json!({
+        "project": "ads",
+        "views": [{
+            "name": "v",
+            "entities": [{"name": "e", "join_key": "e"}],
+            "source": {"type": "file", "path": "p", "table": "t"},
+            "features": [{"name": "f", "dtype": "int64"}],
+        }],
+    })
+    .to_string();
+
+    let error = Definitions::from_json(&json).expect_err("must fail");
 
     assert!(
         error.to_string().contains("malformed definitions"),

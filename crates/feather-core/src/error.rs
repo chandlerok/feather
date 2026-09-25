@@ -78,6 +78,20 @@ pub enum Error {
     #[error("no feature view named `{0}`")]
     UnknownView(String),
 
+    #[error("view `{view}` names connection `{connection}`, which is not configured")]
+    UnknownConnection { view: String, connection: String },
+
+    #[error(
+        "view `{view}` reads a `{source_kind}` source through connection `{connection}`, \
+         which is a `{connection_kind}` connection"
+    )]
+    SourceConnectionKind {
+        view: String,
+        source_kind: String,
+        connection: String,
+        connection_kind: String,
+    },
+
     #[error("no feature service named `{0}`")]
     UnknownService(String),
 
@@ -159,6 +173,19 @@ pub enum Error {
         path: String,
         #[source]
         source: duckdb::Error,
+    },
+
+    /// A source that could not be read, attributed to the view that reads it.
+    ///
+    /// The scanner's own text is carried in the message rather than replaced, since it is
+    /// the only description of what went wrong; naming the view and the source around it is
+    /// what makes one failing Postgres view distinguishable from another.
+    #[cfg(feature = "offline")]
+    #[error("view `{view}` could not read {location}: {reason}")]
+    UnreadableSource {
+        view: String,
+        location: String,
+        reason: String,
     },
 
     #[cfg(feature = "valkey")]

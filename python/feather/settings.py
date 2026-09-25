@@ -10,8 +10,9 @@ deliberate duplicate rather than the rule. A mismatch between the two is caught
 here, at the binding, instead of inside an engine.
 
 Offline sources are not here. A source is declared on the view it feeds, as
-``FileSource(path=...)`` in a definition module. What this file holds is the
-credentials a source must not carry, since a definition module is committed.
+``FileSource(path=...)`` or ``PostgresSource(connection=...)`` in a definition module.
+What this file holds is the credentials a source must not carry, since a definition
+module is committed.
 """
 
 from __future__ import annotations
@@ -64,7 +65,36 @@ class S3Connection(pydantic.BaseModel):
     url_style: Literal["path", "vhost"] | None = None
 
 
-Connection = Annotated[SnowflakeConnection | S3Connection, pydantic.Field(discriminator="type")]
+class PostgresConnection(pydantic.BaseModel):
+    """A Postgres database a source can read from.
+
+    ``host`` and ``port`` are libpq's rather than a URL's, which is why they are two
+    fields and not one. ``port`` is bounded where the core's is a ``u16``, so a value
+    the core cannot carry is caught here rather than at the handoff. ``password`` is a
+    secret and stays out of ``repr`` the way the other credentials do.
+
+    ``ssl_mode`` is any of libpq's ``sslmode`` values and has no default. libpq already
+    prefers TLS when the server offers it, and a security flag guessed wrong is worse
+    than one an operator had to write down.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    type: Literal["postgres"]
+    host: NonEmptyStr
+    port: Annotated[int, pydantic.Field(ge=1, le=65535)] = 5432
+    database: NonEmptyStr
+    user: NonEmptyStr
+    password: pydantic.SecretStr
+    ssl_mode: (
+        Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] | None
+    ) = None
+
+
+Connection = Annotated[
+    SnowflakeConnection | S3Connection | PostgresConnection,
+    pydantic.Field(discriminator="type"),
+]
 """A named credential set, discriminated on ``type``."""
 
 
@@ -135,6 +165,7 @@ __all__ = [
     "Connection",
     "FeatherSettings",
     "L1Cache",
+    "PostgresConnection",
     "S3Connection",
     "SnowflakeConnection",
     "Valkey",

@@ -85,13 +85,30 @@ pub enum Connection {
         #[serde(default)]
         url_style: Option<String>,
     },
+    /// A Postgres database.
+    ///
+    /// The values are libpq's, not a URL, so one connection string is assembled from
+    /// them in [`Connection::conninfo`] rather than a URL being parsed.
+    Postgres {
+        host: String,
+        #[serde(default = "default_postgres_port")]
+        port: u16,
+        database: String,
+        user: String,
+        password: Secret,
+        /// Any of libpq's `sslmode` values: `disable`, `allow`, `prefer`, `require`,
+        /// `verify-ca`, or `verify-full`. Absent leaves libpq's own default, which already
+        /// prefers TLS when the server offers it.
+        #[serde(default)]
+        ssl_mode: Option<String>,
+    },
 }
 
 impl Connection {
-    /// Reject a credential set missing a value the engine needs.
+    /// Reject a credential set the engine cannot work from.
     ///
-    /// Serde cannot express a non-empty string, so the empty cases are checked
-    /// here rather than being left to fail at the first read.
+    /// Serde cannot express a non-empty string or a closed set of strings, so the empty and
+    /// unlisted cases are checked here rather than being left to fail at the first read.
     fn validate(&self, name: &str) -> Result<()> {
         match self {
             Self::Snowflake {
@@ -124,8 +141,73 @@ impl Connection {
                     }
                 }
             }
+            Self::Postgres {
+                host,
+                database,
+                user,
+                ssl_mode,
+                ..
+            } => {
+                check_present(host, &format!("connections.{name}.host"))?;
+                check_present(database, &format!("connections.{name}.database"))?;
+                check_present(user, &format!("connections.{name}.user"))?;
+                if let Some(mode) = ssl_mode {
+                    // Checked here rather than at the connection, so a typo names the key it
+                    // is in instead of surfacing as a libpq error at the first read. The set
+                    // is libpq's own, not the `disable`/`require`/`verify-*` subset a locked
+                    // down deployment writes: `allow` and `prefer` are real values, and
+                    // refusing them would reject a working connection.
+                    if !POSTGRES_SSL_MODES.contains(&mode.as_str()) {
+                        return Err(Error::MalformedSettings {
+                            reason: format!(
+                                "connections.{name}.ssl_mode must be one of {}, not `{mode}`",
+                                POSTGRES_SSL_MODES.join(", ")
+                            ),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// This kind's wire name, which is what `type` holds.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Snowflake { .. } => "snowflake",
+            Self::S3 { .. } => "s3",
+            Self::Postgres { .. } => "postgres",
+        }
+    }
+
+    /// The libpq connection string for a Postgres connection.
+    ///
+    /// `None` for another kind, which connects some other way. Every value is quoted
+    /// by [`conninfo_value`], which is what makes a password holding a space, a quote,
+    /// or a backslash survive both this layer and the SQL literal it is embedded in.
+    pub fn conninfo(&self) -> Option<String> {
+        let Self::Postgres {
+            host,
+            port,
+            database,
+            user,
+            password,
+            ssl_mode,
+        } = self
+        else {
+            return None;
+        };
+        let mut parts = vec![
+            format!("host={}", conninfo_value(host)),
+            format!("port={}", conninfo_value(&port.to_string())),
+            format!("dbname={}", conninfo_value(database)),
+            format!("user={}", conninfo_value(user)),
+            format!("password={}", conninfo_value(password.expose())),
+        ];
+        if let Some(mode) = ssl_mode {
+            parts.push(format!("sslmode={}", conninfo_value(mode)));
+        }
+        Some(parts.join(" "))
     }
 }
 
@@ -150,6 +232,37 @@ pub struct L1Cache {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+/// The `sslmode` values libpq accepts.
+///
+/// The whole set, not the subset a locked down deployment writes: `allow` and `prefer` are
+/// real values, so a check against the subset would reject a connection that works.
+const POSTGRES_SSL_MODES: [&str; 6] = [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
+
+/// The port a Postgres connection uses when it does not say.
+fn default_postgres_port() -> u16 {
+    5432
+}
+
+/// One value in a libpq connection string.
+///
+/// Every value is single-quoted, and inside the quotes libpq reads a backslash as an
+/// escape, so `\` becomes `\\` and `'` becomes `\'`. This is not SQL quoting and must not
+/// be replaced by it: doubling the quote (`fea''ther`) is the SQL spelling, and libpq
+/// answers it with "missing = after" rather than a connection. The two layers are both
+/// required, because the conninfo is itself embedded in a SQL literal one level up:
+/// this escapes a value for libpq, and `quote_literal` in the engine escapes the
+/// resulting string for DuckDB. Removing either one breaks a password with a quote.
+fn conninfo_value(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 /// The Valkey connection.
@@ -177,9 +290,10 @@ pub struct Valkey {
 pub struct Settings {
     pub project: String,
     pub definitions: Vec<String>,
-    /// Declared ahead of its first consumer. No source kind references a
-    /// connection yet, since v1 declares a source as a path, so these entries are
-    /// inert until one does.
+    /// Declared ahead of its first consumer. A Postgres source names an entry in
+    /// here, and the definitions-and-settings seam rejects a name that is not
+    /// configured, so a credential has a home that is not a committed definition
+    /// module.
     #[serde(default)]
     pub connections: BTreeMap<String, Connection>,
     #[serde(default)]
@@ -280,14 +394,16 @@ pub fn parse_settings(text: &str) -> Result<Settings> {
 /// Args:
 ///     text: The file contents.
 ///     env: The variable lookup. Taken as an argument so resolution is testable
-///         without writing to the process environment.
+///         without writing to the process environment, which is unsafe in edition
+///         2024 and racy between tests. Public for the same reason: a caller that
+///         owns the environment parses through here rather than around the loader.
 ///
 /// Returns:
 ///     The validated settings.
 ///
 /// Raises:
 ///     As [`parse_settings`].
-fn parse_settings_with(text: &str, env: Lookup<'_>) -> Result<Settings> {
+pub fn parse_settings_with(text: &str, env: Lookup<'_>) -> Result<Settings> {
     let mut value: toml::Value =
         toml::from_str(text).map_err(|source| Error::MalformedSettings {
             reason: source.to_string(),
@@ -448,6 +564,14 @@ region = "us-east-1"
 key_id = "AKIAEXAMPLE"
 secret = "shhh"
 
+[connections.pg_prod]
+type = "postgres"
+host = "pg.internal.svc"
+database = "warehouse"
+user = "fs_runner"
+password = "${POSTGRES_PASSWORD}"
+ssl_mode = "verify-full"
+
 [valkey]
 endpoint = "valkey-cluster.internal.svc:6379"
 tls = true
@@ -459,10 +583,11 @@ max_capacity_mb = 2048
 fallback_ttl_seconds = 30
 "#;
 
-    /// A lookup that resolves only `SNOWFLAKE_PASSWORD`.
+    /// A lookup that resolves only `SNOWFLAKE_PASSWORD` and `POSTGRES_PASSWORD`.
     fn with_password(name: &str) -> std::result::Result<String, std::env::VarError> {
         match name {
             "SNOWFLAKE_PASSWORD" => Ok("hunter2".to_owned()),
+            "POSTGRES_PASSWORD" => Ok("pgsecret".to_owned()),
             _ => Err(std::env::VarError::NotPresent),
         }
     }
@@ -504,6 +629,25 @@ fallback_ttl_seconds = 30
                 assert_eq!(secret.expose(), "shhh");
             }
             other => panic!("expected s3, got {other:?}"),
+        }
+        match &settings.connections["pg_prod"] {
+            Connection::Postgres {
+                host,
+                port,
+                database,
+                user,
+                password,
+                ssl_mode,
+            } => {
+                assert_eq!(host, "pg.internal.svc");
+                // Absent in the file, so the default is what a psql default would be.
+                assert_eq!(*port, 5432);
+                assert_eq!(database, "warehouse");
+                assert_eq!(user, "fs_runner");
+                assert_eq!(password.expose(), "pgsecret");
+                assert_eq!(ssl_mode.as_deref(), Some("verify-full"));
+            }
+            other => panic!("expected postgres, got {other:?}"),
         }
 
         let valkey = settings.valkey.expect("valkey");
@@ -547,7 +691,144 @@ fallback_ttl_seconds = 30
 
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert!(!rendered.contains("shhh"), "{rendered}");
+        assert!(!rendered.contains("pgsecret"), "{rendered}");
+        // The key id is not a secret and stays readable, so a misconfigured key is
+        // diagnosable from a log.
         assert!(rendered.contains("AKIAEXAMPLE"), "{rendered}");
+    }
+
+    /// A Postgres connection whose password is the given value.
+    fn postgres(password: &str) -> Connection {
+        serde_json::from_value(serde_json::json!({
+            "type": "postgres",
+            "host": "127.0.0.1",
+            "port": 5433,
+            "database": "feathertest",
+            "user": "feathertest",
+            "password": password,
+        }))
+        .expect("connection")
+    }
+
+    #[test]
+    fn a_postgres_connection_assembles_a_libpq_conninfo() {
+        let conninfo = postgres("feathertest").conninfo().expect("conninfo");
+
+        assert_eq!(
+            conninfo,
+            "host='127.0.0.1' port='5433' dbname='feathertest' user='feathertest' \
+             password='feathertest'"
+        );
+        // No ssl_mode, so libpq's own default applies rather than a guess.
+        assert!(!conninfo.contains("sslmode"), "{conninfo}");
+    }
+
+    #[test]
+    fn a_conninfo_value_is_quoted_and_backslash_escaped_for_libpq() {
+        // The trap: libpq reads `\` as an escape inside its quotes, so a backslash is
+        // doubled and a quote is backslashed. SQL's doubled quote is the wrong spelling
+        // here and libpq refuses it, so `''` must never appear in a conninfo value.
+        let cases = [
+            ("fea ther", "'fea ther'"),
+            ("fea'ther", r"'fea\'ther'"),
+            (r"fea\ther", r"'fea\\ther'"),
+        ];
+
+        for (password, expected) in cases {
+            let conninfo = postgres(password).conninfo().expect("conninfo");
+            assert!(
+                conninfo.contains(&format!("password={expected}")),
+                "password {password:?} became {conninfo}"
+            );
+            assert!(!conninfo.contains("''"), "{password:?} became {conninfo}");
+        }
+    }
+
+    #[test]
+    fn a_postgres_ssl_mode_is_carried_into_the_conninfo() {
+        let configured: Connection = serde_json::from_value(serde_json::json!({
+            "type": "postgres",
+            "host": "h",
+            "database": "d",
+            "user": "u",
+            "password": "p",
+            "ssl_mode": "require",
+        }))
+        .expect("connection");
+
+        assert!(
+            configured
+                .conninfo()
+                .expect("conninfo")
+                .ends_with("sslmode='require'"),
+            "{:?}",
+            configured.conninfo()
+        );
+    }
+
+    #[test]
+    fn another_connection_kind_has_no_conninfo() {
+        let configured = connection_kind("s3");
+
+        assert!(configured.conninfo().is_none());
+        assert_eq!(configured.kind(), "s3");
+    }
+
+    /// A minimal valid connection of the named kind.
+    fn connection_kind(kind: &str) -> Connection {
+        let json = match kind {
+            "s3" => serde_json::json!({
+                "type": "s3", "region": "us-east-1", "key_id": "k", "secret": "s"
+            }),
+            "snowflake" => serde_json::json!({
+                "type": "snowflake", "account": "a", "warehouse": "w", "username": "u", "password": "p"
+            }),
+            other => panic!("unknown kind {other}"),
+        };
+        serde_json::from_value(json).expect("connection")
+    }
+
+    #[test]
+    fn an_empty_postgres_host_is_rejected_naming_the_key() {
+        let text = format!(
+            "{LOCAL}\n[connections.pg]\ntype = \"postgres\"\nhost = \"\"\n\
+             database = \"d\"\nuser = \"u\"\npassword = \"p\"\n"
+        );
+        let error = parse_settings(&text).expect_err("must fail");
+
+        assert_eq!(error.to_string(), "connections.pg.host must not be empty");
+    }
+
+    /// A Postgres connection entry whose `ssl_mode` is the given value.
+    fn postgres_with_ssl_mode(mode: &str) -> String {
+        format!(
+            "{LOCAL}\n[connections.pg]\ntype = \"postgres\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\npassword = \"p\"\nssl_mode = \"{mode}\"\n"
+        )
+    }
+
+    #[test]
+    fn an_unknown_postgres_ssl_mode_is_rejected_naming_the_key() {
+        // Named here rather than at the connection, for the same reason `url_style` is:
+        // otherwise a typo reaches libpq and comes back as a connection failure.
+        let error = parse_settings(&postgres_with_ssl_mode("verfiy-full")).expect_err("must fail");
+
+        assert!(
+            error.to_string().contains("connections.pg.ssl_mode"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("verfiy-full"), "{error}");
+    }
+
+    #[test]
+    fn every_ssl_mode_libpq_accepts_is_accepted() {
+        // The comment above the set used to list only the strict subset, so this pins the
+        // whole set: `allow` and `prefer` are what a check copied from that list would
+        // wrongly refuse.
+        for mode in POSTGRES_SSL_MODES {
+            parse_settings(&postgres_with_ssl_mode(mode))
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+        }
     }
 
     #[test]

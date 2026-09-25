@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-use feather_core::definitions::{DType, Entity, FeatureView, Field, FileSource};
+use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
 use feather_core::online::{
     EntityRequest, OnlineStore, ViewRequest, ViewValues, WriteBatch, read_entities,
@@ -65,7 +65,7 @@ fn view(name: &str) -> FeatureView {
     FeatureView {
         name: name.to_owned(),
         entities: vec![Entity::new("user_id", "user_id")],
-        source: FileSource::new("data/user_stats.parquet"),
+        source: Source::file("data/user_stats.parquet"),
         features,
         ttl_days: Some(30),
         timestamp_field: None,

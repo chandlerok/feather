@@ -116,20 +116,25 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features \
             -- -D warnings
-      # The suite includes the Valkey and RustFS integration tests, which
-      # connect eagerly and have no skip guard: with nothing listening they fail
-      # rather than skip. docker-compose.yml is reused rather than a bare
-      # container so the tests meet the same maxmemory and eviction constraints
-      # they are written against, rather than passing on a roomier server than
-      # they target. RustFS comes up through the same task a developer runs,
-      # because the bucket these tests read from is created there: the image
-      # ignores RUSTFS_DEFAULT_BUCKETS and has no bucket-create subcommand. The
-      # first remote read installs the httpfs extension from the DuckDB
-      # extension repository, so the job needs network beyond those containers.
-      - name: valkey and rustfs
+      # The suite includes the Valkey, RustFS, and Postgres integration
+      # tests, which connect eagerly and have no skip guard: with nothing
+      # listening they fail rather than skip. docker-compose.yml is reused
+      # rather than bare containers so the tests meet the same maxmemory and
+      # eviction constraints they are written against, rather than passing on
+      # a roomier server than they target. RustFS comes up through the same
+      # task a developer runs, because the bucket these tests read from is
+      # created there: the image ignores RUSTFS_DEFAULT_BUCKETS and has no
+      # bucket-create subcommand. Postgres needs no such step, because
+      # `pg_isready` is a real healthcheck for `--wait` to wait on and the
+      # test creates its own table through DuckDB. The first read of a remote
+      # source installs an extension from the DuckDB extension repository,
+      # `httpfs` for a URI and `postgres` for a table, so the job needs
+      # network beyond these containers.
+      - name: valkey, rustfs, and postgres
         run: |
           mise run valkey:up
           mise run s3:up
+          mise run postgres:up
       - name: test
         run: cargo test --workspace --all-features
       - name: services down

@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use feather_core::definitions::{DType, Entity, FeatureView, Field as FeatureField, FileSource};
+use feather_core::definitions::{DType, Entity, FeatureView, Field as FeatureField, Source};
 use feather_core::offline::{Engine, JoinOptions, Limits};
 use feather_core::settings::Connection;
 use parquet::arrow::ArrowWriter;
@@ -186,11 +186,11 @@ fn literal(value: &str) -> String {
 }
 
 /// A Parquet file that removes itself when the test ends.
-struct Source {
+struct Parquet {
     path: PathBuf,
 }
 
-impl Source {
+impl Parquet {
     fn write(batch: &RecordBatch) -> Self {
         let path = std::env::temp_dir().join(format!(
             "feather-s3-{}-{}.parquet",
@@ -209,7 +209,7 @@ impl Source {
     }
 }
 
-impl Drop for Source {
+impl Drop for Parquet {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -253,7 +253,7 @@ fn view(path: &str, ttl_days: Option<u32>) -> FeatureView {
     FeatureView {
         name: "user_clicks".to_owned(),
         entities: vec![Entity::new("user_id", "user_id")],
-        source: FileSource::new(path),
+        source: Source::file(path),
         features: vec![FeatureField::new("count", DType::Int64)],
         ttl_days,
         timestamp_field: None,
@@ -296,7 +296,7 @@ fn a_join_over_s3_matches_the_same_join_over_a_local_file() {
 
     // Two users, timestamps far enough apart that the newest row at or before a label time
     // is unambiguous, and a row that the earlier labels must not pick up.
-    let source = Source::write(&integer_source(&[(1, 100, 10), (1, 400, 40), (2, 150, 7)]));
+    let source = Parquet::write(&integer_source(&[(1, 100, 10), (1, 400, 40), (2, 150, 7)]));
     let remote = location("join");
     upload(&source.path, &remote);
 

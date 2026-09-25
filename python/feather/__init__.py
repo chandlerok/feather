@@ -12,7 +12,7 @@ build.
 
 from importlib.metadata import PackageNotFoundError, version
 
-from feather._wire import Entity, FileSource
+from feather._wire import Entity, FileSource, PostgresSource
 from feather.definitions import (
     FeatureService,
     FeatureStoreConfig,
@@ -54,6 +54,7 @@ __all__ = [
     "Float64",
     "Int64",
     "MissingPolicy",
+    "PostgresSource",
     "TimestampMicros",
     "Utf8",
     "WireDType",

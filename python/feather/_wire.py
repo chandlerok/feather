@@ -10,11 +10,12 @@ They are deliberately not the authoring surface: features are declared with
 reference to a feature has to be a checked object rather than a string, and only a
 class-body declaration can be checked.
 
-``Entity`` and ``FileSource`` are used directly when authoring as well, because
-each is a leaf value with no schema of its own.
+``Entity``, ``FileSource``, and ``PostgresSource`` are used directly when authoring as
+well, because each is a leaf value with no schema of its own.
 """
 
-from typing import Annotated
+import warnings
+from typing import Annotated, Literal
 
 import pydantic
 
@@ -61,11 +62,47 @@ class Field(DefinitionModel):
 class FileSource(DefinitionModel):
     """A file-backed offline source.
 
-    A single kind in v1. Object storage and warehouse tiers use the same model
-    with a different path scheme, so no discriminator is needed yet.
+    A Parquet file, local or reached through a URI scheme such as ``s3://``.
+    ``type`` is what the union below discriminates on, and it is defaulted so that
+    ``FileSource(path="...")`` stays the way a file source is written.
     """
 
+    type: Literal["file"] = "file"
     path: NonEmptyStr
+
+
+# `schema` is the key the core expects for a Postgres table, and it is also the name of a
+# deprecated method on `pydantic.BaseModel`, so pydantic warns that the field shadows it.
+# The method is not used anywhere here, and renaming the field would put the wire contract
+# behind an alias, which is a worse problem than the shadowing. Scoped to this class
+# rather than the whole process, so a field that shadows something for a real reason
+# still warns.
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message='Field name "schema" in "PostgresSource" shadows an attribute',
+        category=UserWarning,
+    )
+
+    class PostgresSource(DefinitionModel):
+        """A table in a Postgres database.
+
+        ``connection`` names a ``[connections]`` entry rather than carrying credentials,
+        because a definition module is committed.
+        """
+
+        type: Literal["postgres"] = "postgres"
+        connection: NonEmptyStr
+        # The name is the wire key the core reads, and it also collides with the
+        # deprecated `BaseModel.schema()` method. Pyrefly sees the override as
+        # inconsistent because that method is not a field; nothing here calls it, and
+        # the ignore is audited for staleness by `unused-ignore` in pyproject.toml.
+        schema: NonEmptyStr  # pyrefly: ignore[bad-override]
+        table: NonEmptyStr
+
+
+Source = Annotated[FileSource | PostgresSource, pydantic.Field(discriminator="type")]
+"""A view's source, discriminated on ``type``."""
 
 
 class FeatureView(DefinitionModel):
@@ -73,7 +110,7 @@ class FeatureView(DefinitionModel):
 
     name: NonEmptyStr
     entities: Annotated[list[Entity], pydantic.Field(min_length=1)]
-    source: FileSource
+    source: Source
     features: Annotated[list[Field], pydantic.Field(min_length=1)]
     ttl_days: Annotated[int, pydantic.Field(gt=0)] | None = None
     timestamp_field: NonEmptyStr | None = None

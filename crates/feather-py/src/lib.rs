@@ -137,6 +137,12 @@ impl FeatureStore {
     fn new(settings_path: &str, definitions_json: &str) -> PyResult<Self> {
         let settings = feather_core::load_settings(settings_path).map_err(core_error)?;
         let definitions = Definitions::from_json(definitions_json).map_err(core_error)?;
+        // Definitions and settings first meet here, so a source naming a connection the
+        // project does not have fails now rather than at the first read. The join checks
+        // the same source again as a backstop.
+        definitions
+            .validate_sources(&settings.connections)
+            .map_err(core_error)?;
         let engine =
             OfflineEngine::open(&Limits::default(), &settings.connections).map_err(core_error)?;
         Ok(Self {

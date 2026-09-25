@@ -70,6 +70,20 @@ class Other(FeatureView):
 """
 
 
+ABSENT_CONNECTION = """
+from feather import Entity, FeatureView, Field, PostgresSource, feature_view
+from feather.types import Int64
+
+user_entity = Entity(name="user_id", join_key="user_id")
+stats_source = PostgresSource(connection="absent", schema="public", table="user_stats")
+
+
+@feature_view(name="user_stats", entity=user_entity, source=stats_source)
+class UserStats(FeatureView):
+    ltv = Field(Int64)
+"""
+
+
 def micros(values: list[int]) -> pl.Series:
     """Build a microsecond timestamp column from epoch counts.
 
@@ -426,4 +440,22 @@ def test_malformed_settings_are_reported(tmp_path: Path) -> None:
     config.write_text('project = "ads"\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match="definitions"):
+        FeatureStore(config)
+
+
+def test_a_source_naming_an_unconfigured_connection_fails_at_construction(
+    tmp_path: Path,
+) -> None:
+    """Definitions and settings meet when the store opens, not at the first read.
+
+    A definition module is committed and the connection is not, so a name the file does
+    not define is how the two drift apart. It has to fail here, naming the connection,
+    rather than as a scanner error inside a later join.
+    """
+    (tmp_path / "definitions").mkdir()
+    (tmp_path / "definitions/stats.py").write_text(ABSENT_CONNECTION, encoding="utf-8")
+    config = tmp_path / "feather.toml"
+    config.write_text('project = "ads"\ndefinitions = ["definitions/stats.py"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="names connection `absent`"):
         FeatureStore(config)

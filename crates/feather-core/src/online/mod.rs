@@ -291,7 +291,7 @@ pub fn ttl_duration(ttl_days: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definitions::{DType, Entity, Field, FileSource};
+    use crate::definitions::{DType, Entity, Field, Source};
     use crate::online::memory::MemoryStore;
     use crate::value::encode_batch;
     use arrow::array::{ArrayRef, Int64Array};
@@ -304,7 +304,7 @@ mod tests {
         FeatureView {
             name: name.to_owned(),
             entities: vec![Entity::new("user_id", "user_id")],
-            source: FileSource::new("data/x.parquet"),
+            source: Source::file("data/x.parquet"),
             features: vec![Field::new("count", DType::Int64)],
             ttl_days,
             timestamp_field: None,

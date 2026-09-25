@@ -967,6 +967,17 @@ endpoint = "minio.internal.svc:9000"
 use_ssl = false
 url_style = "path"
 
+[connections.pg_prod]
+type = "postgres"
+host = "pg.internal.svc"
+port = 5432
+database = "warehouse"
+user = "fs_runner"
+password = "${POSTGRES_PASSWORD}"
+# Optional. Absent leaves libpq's own behaviour, which already prefers TLS when the
+# server offers it, so this is only for a deployment that will not settle for that.
+ssl_mode = "verify-full"
+
 [valkey]
 endpoint = "valkey-cluster.internal.svc:6379"
 tls = true
@@ -992,6 +1003,11 @@ invisible. The integration test in `crates/feather-core/tests/s3_integration.rs`
 RustFS, an S3-compatible server, and joins the same Parquet rows read from a local file and
 from `s3://` to check that the two agree.
 
+The example's `pg_prod` is a deployment's own database, on the port that server listens on.
+`docker-compose.yml` publishes the Postgres the integration test uses on 5433, because 5432 is
+the port a locally installed server already holds, so a `feather.toml` pointed at the compose
+server writes `host = "127.0.0.1"` and `port = 5433` instead.
+
 Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
@@ -1000,12 +1016,29 @@ Three absences are deliberate.
   non-goal. The table name carries the kind, so a key that could only hold one value is not
   written down.
 - **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
-  prefix, and a warehouse table differ only in their path scheme.
+  prefix, and a database table differ only in how the source is declared, not in what
+  executes it.
 
-`connections` is declared before its first consumer. No source kind in the wire model
-references a connection yet, because v1 declares a source as a path, so these entries are
-inert until a source kind needs credentials. They exist so that a credential has a home that
-is not a committed definition module.
+`connections` holds the credentials a source must not carry. A Postgres source names one with
+`connection`, and that name is checked where definitions and settings first meet, so a source
+naming a connection the project does not have, or one of the wrong kind, is a startup error
+rather than a surprise at the first read. The kinds with no consumer yet are declared for the
+same reason anyway: a credential belongs in this file rather than in a committed definition
+module.
+
+A view's source is tagged with its kind. A file source is
+`{"type": "file", "path": "data/user_stats.parquet"}`, and a Postgres source is
+`{"type": "postgres", "connection": "pg_prod", "schema": "public", "table": "user_stats"}`.
+The tag selects the variant, so a path is not read as a table because a key happened to be
+present, and a key belonging to the other kind is rejected rather than ignored. Python writes
+`FileSource(path=...)` and `PostgresSource(connection=...)`; the wire shape itself is the
+core's.
+
+Which kind a view declares changes nothing downstream. A Postgres table is read with
+`postgres_scan`, an object-storage prefix through `httpfs`, and a local file off the disk, and
+all three are then the same `ASOF` join. `crates/feather-core/tests/postgres_integration.rs`
+checks exactly that by joining the same rows once from a local Parquet file and once from a
+table.
 
 ### Secrets
 
@@ -1033,6 +1066,9 @@ libraries, and a build cannot turn them on:
 - `httpfs` is loaded on the first read of a URI path, and a configured object-store connection
   loads it at open, because the `s3` secret type comes from the extension itself. A project
   reading only local files never loads it.
+- `postgres` is loaded on the first read of a Postgres source. Nothing loads it at open, because
+  a Postgres connection travels in the relation as libpq's own connection string rather than as
+  a secret.
 - An image that cannot reach the extension repository bakes the files in and points
   `Limits::extension_directory` at them, so `INSTALL` is a no-op and `LOAD` finds them locally.
 
@@ -1042,10 +1078,13 @@ the engine fails to load rather than degrading.
 
 ### Backend coverage
 
-`[connections]` shows the two kinds with a settled schema, Snowflake and S3. Each declares
-`type` plus its own keys, and a kind is added when a source needs it. BigQuery, Azure Blob
-Storage, and a local SQLite database still need their keys specified before they can be
-documented.
+`[connections]` shows the three kinds with a settled schema: Snowflake, S3, and Postgres. Each
+declares `type` plus its own keys, and a kind is added when a source needs it. Every kind that
+has a reader is covered by an integration test against a real server, RustFS for the
+S3-compatible case and a Postgres container for the table, because a reader that only ever
+meets a mock is not known to work. Snowflake declares a connection but has no reader yet, so
+nothing reads through it and no test does. BigQuery, Azure Blob Storage, and a local SQLite
+database still need their keys specified before they can be documented.
 
 ---
 
