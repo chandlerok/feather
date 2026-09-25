@@ -23,7 +23,7 @@ fn the_python_payload_deserializes_field_for_field() {
 
     assert_eq!(definitions.project, "ads");
 
-    assert_eq!(definitions.views.len(), 1);
+    assert_eq!(definitions.views.len(), 2);
     let view = &definitions.views[0];
     assert_eq!(view.name, "user_clicks");
     assert_eq!(view.entities.len(), 1);
@@ -48,6 +48,21 @@ fn the_python_payload_deserializes_field_for_field() {
     // And a null timestamp_field means the core's default applies, not one the
     // Python layer invented.
     assert_eq!(view.timestamp_field(), "event_timestamp");
+
+    // The other kind, so a source's tag is compared across the boundary rather than
+    // asserted twice. A rename applied on one side alone would otherwise stay green.
+    let postgres = &definitions.views[1];
+    assert_eq!(postgres.name, "user_stats");
+    assert_eq!(
+        postgres.source,
+        Source::postgres("pg_prod", "public", "user_stats"),
+        "source is {}",
+        postgres.source.description()
+    );
+    assert_eq!(postgres.source.kind(), "postgres");
+    assert_eq!(postgres.features.len(), 1);
+    assert_eq!(postgres.features[0].name, "lifetime_value");
+    assert_eq!(postgres.features[0].dtype, DType::Float64);
 
     assert_eq!(definitions.services.len(), 1);
     assert_eq!(definitions.services[0].name, "ranking");
@@ -202,6 +217,34 @@ fn an_untagged_source_is_rejected() {
     assert!(
         error.to_string().contains("malformed definitions"),
         "{error}"
+    );
+}
+
+#[test]
+fn a_source_field_that_is_empty_is_rejected() {
+    // The Python mirror makes every source field non-empty, so this is the direction the
+    // stated authority has to hold: the core rejects what the binding would.
+    let json = serde_json::json!({
+        "project": "ads",
+        "views": [{
+            "name": "user_stats",
+            "entities": [{"name": "user_id", "join_key": "user_id"}],
+            "source": {
+                "type": "postgres",
+                "connection": "pg_prod",
+                "schema": "public",
+                "table": "",
+            },
+            "features": [{"name": "ltv", "dtype": "float64"}],
+        }],
+    })
+    .to_string();
+
+    let error = Definitions::from_json(&json).expect_err("must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "view `user_stats` declares an empty `table` in its source"
     );
 }
 

@@ -175,6 +175,19 @@ pub enum Error {
         source: duckdb::Error,
     },
 
+    /// A source that could not be read, attributed to the view that reads it.
+    ///
+    /// The scanner's own text is carried in the message rather than replaced, since it is
+    /// the only description of what went wrong; naming the view and the source around it is
+    /// what makes one failing Postgres view distinguishable from another.
+    #[cfg(feature = "offline")]
+    #[error("view `{view}` could not read {location}: {reason}")]
+    UnreadableSource {
+        view: String,
+        location: String,
+        reason: String,
+    },
+
     #[cfg(feature = "valkey")]
     #[error("valkey: {0}")]
     Valkey(#[from] redis::RedisError),

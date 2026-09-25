@@ -53,7 +53,7 @@ run = "uv run --no-sync pyrefly check"
 # ------------------------------------------------------------------- testing
 
 [tasks.test]
-description = "Unit tests. No external services required."
+description = "Cargo tests and the Python unit tests; the Rust integration tests need the services CI starts."
 run = [
   "cargo test --workspace --all-features",
   "uv run pytest -m 'not integration and not load'",

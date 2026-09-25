@@ -69,22 +69,26 @@ class PostgresConnection(pydantic.BaseModel):
     """A Postgres database a source can read from.
 
     ``host`` and ``port`` are libpq's rather than a URL's, which is why they are two
-    fields and not one. ``password`` is a secret and stays out of ``repr`` the way the
-    other credentials do.
+    fields and not one. ``port`` is bounded where the core's is a ``u16``, so a value
+    the core cannot carry is caught here rather than at the handoff. ``password`` is a
+    secret and stays out of ``repr`` the way the other credentials do.
 
-    ``ssl_mode`` has no default. libpq already prefers TLS when the server offers it,
-    and a security flag guessed wrong is worse than one an operator had to write down.
+    ``ssl_mode`` is any of libpq's ``sslmode`` values and has no default. libpq already
+    prefers TLS when the server offers it, and a security flag guessed wrong is worse
+    than one an operator had to write down.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
 
     type: Literal["postgres"]
     host: NonEmptyStr
-    port: int = 5432
+    port: Annotated[int, pydantic.Field(ge=1, le=65535)] = 5432
     database: NonEmptyStr
     user: NonEmptyStr
     password: pydantic.SecretStr
-    ssl_mode: NonEmptyStr | None = None
+    ssl_mode: (
+        Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"] | None
+    ) = None
 
 
 Connection = Annotated[

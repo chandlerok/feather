@@ -96,18 +96,19 @@ pub enum Connection {
         database: String,
         user: String,
         password: Secret,
-        /// `disable`, `require`, `verify-ca`, or `verify-full`. Absent leaves libpq's own
-        /// default, which already prefers TLS when the server offers it.
+        /// Any of libpq's `sslmode` values: `disable`, `allow`, `prefer`, `require`,
+        /// `verify-ca`, or `verify-full`. Absent leaves libpq's own default, which already
+        /// prefers TLS when the server offers it.
         #[serde(default)]
         ssl_mode: Option<String>,
     },
 }
 
 impl Connection {
-    /// Reject a credential set missing a value the engine needs.
+    /// Reject a credential set the engine cannot work from.
     ///
-    /// Serde cannot express a non-empty string, so the empty cases are checked
-    /// here rather than being left to fail at the first read.
+    /// Serde cannot express a non-empty string or a closed set of strings, so the empty and
+    /// unlisted cases are checked here rather than being left to fail at the first read.
     fn validate(&self, name: &str) -> Result<()> {
         match self {
             Self::Snowflake {
@@ -144,11 +145,27 @@ impl Connection {
                 host,
                 database,
                 user,
+                ssl_mode,
                 ..
             } => {
                 check_present(host, &format!("connections.{name}.host"))?;
                 check_present(database, &format!("connections.{name}.database"))?;
                 check_present(user, &format!("connections.{name}.user"))?;
+                if let Some(mode) = ssl_mode {
+                    // Checked here rather than at the connection, so a typo names the key it
+                    // is in instead of surfacing as a libpq error at the first read. The set
+                    // is libpq's own, not the `disable`/`require`/`verify-*` subset a locked
+                    // down deployment writes: `allow` and `prefer` are real values, and
+                    // refusing them would reject a working connection.
+                    if !POSTGRES_SSL_MODES.contains(&mode.as_str()) {
+                        return Err(Error::MalformedSettings {
+                            reason: format!(
+                                "connections.{name}.ssl_mode must be one of {}, not `{mode}`",
+                                POSTGRES_SSL_MODES.join(", ")
+                            ),
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -216,6 +233,19 @@ pub struct L1Cache {
 fn enabled_by_default() -> bool {
     true
 }
+
+/// The `sslmode` values libpq accepts.
+///
+/// The whole set, not the subset a locked down deployment writes: `allow` and `prefer` are
+/// real values, so a check against the subset would reject a connection that works.
+const POSTGRES_SSL_MODES: [&str; 6] = [
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
 
 /// The port a Postgres connection uses when it does not say.
 fn default_postgres_port() -> u16 {
@@ -364,14 +394,16 @@ pub fn parse_settings(text: &str) -> Result<Settings> {
 /// Args:
 ///     text: The file contents.
 ///     env: The variable lookup. Taken as an argument so resolution is testable
-///         without writing to the process environment.
+///         without writing to the process environment, which is unsafe in edition
+///         2024 and racy between tests. Public for the same reason: a caller that
+///         owns the environment parses through here rather than around the loader.
 ///
 /// Returns:
 ///     The validated settings.
 ///
 /// Raises:
 ///     As [`parse_settings`].
-fn parse_settings_with(text: &str, env: Lookup<'_>) -> Result<Settings> {
+pub fn parse_settings_with(text: &str, env: Lookup<'_>) -> Result<Settings> {
     let mut value: toml::Value =
         toml::from_str(text).map_err(|source| Error::MalformedSettings {
             reason: source.to_string(),
@@ -765,6 +797,38 @@ fallback_ttl_seconds = 30
         let error = parse_settings(&text).expect_err("must fail");
 
         assert_eq!(error.to_string(), "connections.pg.host must not be empty");
+    }
+
+    /// A Postgres connection entry whose `ssl_mode` is the given value.
+    fn postgres_with_ssl_mode(mode: &str) -> String {
+        format!(
+            "{LOCAL}\n[connections.pg]\ntype = \"postgres\"\nhost = \"h\"\ndatabase = \"d\"\n\
+             user = \"u\"\npassword = \"p\"\nssl_mode = \"{mode}\"\n"
+        )
+    }
+
+    #[test]
+    fn an_unknown_postgres_ssl_mode_is_rejected_naming_the_key() {
+        // Named here rather than at the connection, for the same reason `url_style` is:
+        // otherwise a typo reaches libpq and comes back as a connection failure.
+        let error = parse_settings(&postgres_with_ssl_mode("verfiy-full")).expect_err("must fail");
+
+        assert!(
+            error.to_string().contains("connections.pg.ssl_mode"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("verfiy-full"), "{error}");
+    }
+
+    #[test]
+    fn every_ssl_mode_libpq_accepts_is_accepted() {
+        // The comment above the set used to list only the strict subset, so this pins the
+        // whole set: `allow` and `prefer` are what a check copied from that list would
+        // wrongly refuse.
+        for mode in POSTGRES_SSL_MODES {
+            parse_settings(&postgres_with_ssl_mode(mode))
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+        }
     }
 
     #[test]

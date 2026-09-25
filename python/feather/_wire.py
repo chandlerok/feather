@@ -10,8 +10,8 @@ They are deliberately not the authoring surface: features are declared with
 reference to a feature has to be a checked object rather than a string, and only a
 class-body declaration can be checked.
 
-``Entity`` and ``FileSource`` are used directly when authoring as well, because
-each is a leaf value with no schema of its own.
+``Entity``, ``FileSource``, and ``PostgresSource`` are used directly when authoring as
+well, because each is a leaf value with no schema of its own.
 """
 
 import warnings

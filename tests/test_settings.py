@@ -199,6 +199,46 @@ def test_an_empty_postgres_host_is_rejected_in_the_model() -> None:
         PostgresConnection.model_validate(body)
 
 
+def test_a_postgres_port_outside_the_cores_range_is_rejected_in_the_model() -> None:
+    """The core's port is a ``u16``, so the binding rejects what the core cannot carry.
+
+    Without the bound this model would accept 65536 and the mismatch would only appear
+    when the value reached the core, which is what the mirror is here to prevent.
+    """
+    body: dict[str, object] = {
+        "type": "postgres",
+        "host": "h",
+        "database": "d",
+        "user": "u",
+        "password": "p",
+    }
+
+    for port in (0, 65536):
+        with pytest.raises(pydantic.ValidationError):
+            PostgresConnection.model_validate(body | {"port": port})
+
+
+def test_an_unknown_postgres_ssl_mode_is_rejected_in_the_model() -> None:
+    """The set is libpq's own, so a typo is named here instead of at the first read.
+
+    ``allow`` and ``prefer`` are in it, which the comment on this module's field used to
+    leave out; a set copied from that comment would refuse a working connection.
+    """
+    body: dict[str, object] = {
+        "type": "postgres",
+        "host": "h",
+        "database": "d",
+        "user": "u",
+        "password": "p",
+    }
+
+    with pytest.raises(pydantic.ValidationError):
+        PostgresConnection.model_validate(body | {"ssl_mode": "verfiy-full"})
+
+    for mode in ("disable", "allow", "prefer", "require", "verify-ca", "verify-full"):
+        assert PostgresConnection.model_validate(body | {"ssl_mode": mode}).ssl_mode == mode
+
+
 def test_the_connection_union_rejects_an_unknown_type() -> None:
     """The union is discriminated on `type`, so an unlisted kind has no variant."""
     with pytest.raises(pydantic.ValidationError):

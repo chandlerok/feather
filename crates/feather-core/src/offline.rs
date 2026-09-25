@@ -1,8 +1,9 @@
 //! Offline point-in-time joins, executed in the embedded DuckDB engine.
 //!
-//! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix,
-//! and a warehouse table differ only in their path scheme, so nothing here selects a
-//! compute backend.
+//! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix, and
+//! a warehouse table are read by different readers and joined the same way, so nothing here
+//! selects a compute backend: [`Engine::relation`] is the one place a source's kind decides
+//! which reader its rows come from.
 //!
 //! The rules are the ones specified under "Point-in-time join semantics" in the
 //! architecture document, and they live here rather than in the caller because getting them
@@ -374,6 +375,8 @@ impl Engine {
     ///         source names a connection the project cannot use.
     ///     [`Error::AmbiguousTimestamp`] if the source holds more than one row for a key and
     ///         timestamp and declares no `created_timestamp_field` to break the tie.
+    ///     [`Error::UnreadableSource`] if the source cannot be read at all, which names the
+    ///         view it was being read for.
     ///     [`Error::DuckDb`] if the query itself fails.
     pub fn point_in_time_join(
         &self,
@@ -477,16 +480,32 @@ impl Engine {
     }
 
     /// The source's column names and DuckDB types, read without scanning any data.
+    ///
+    /// Raises:
+    ///     [`Error::UnreadableSource`] if the source cannot be described, which is where a
+    ///         wrong host, password, or table name surfaces. The failure is attributed to
+    ///         the view here, because the scanner's own text holds neither the view nor the
+    ///         connection name.
     fn describe_source(&self, view: &FeatureView) -> Result<TypeMap> {
         let sql = format!("DESCRIBE SELECT * FROM {}", self.relation(view)?);
-        let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement.query([])?;
-        let mut types = TypeMap::default();
-        while let Some(row) = rows.next()? {
-            // DESCRIBE's first two columns are column_name and column_type.
-            types.insert(row.get(0)?, row.get(1)?);
-        }
-        Ok(types)
+        let describe = || -> duckdb::Result<TypeMap> {
+            let mut statement = self.connection.prepare(&sql)?;
+            let mut rows = statement.query([])?;
+            let mut types = TypeMap::default();
+            while let Some(row) = rows.next()? {
+                // DESCRIBE's first two columns are column_name and column_type.
+                types.insert(row.get(0)?, row.get(1)?);
+            }
+            Ok(types)
+        };
+        // The scanner's text is kept, because it is the only description of what went wrong
+        // and it may echo part of the conninfo. Wrapping rather than replacing it puts that
+        // text behind a message that says which view was reading.
+        describe().map_err(|error| Error::UnreadableSource {
+            view: view.name.clone(),
+            location: format!("source `{}`", view.source.description()),
+            reason: error.to_string(),
+        })
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -1473,6 +1492,29 @@ mod tests {
             .expect_err("must fail");
 
         assert!(error.to_string().contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn a_read_failure_names_the_view_and_its_source() {
+        // A source that does not exist, so the failure is the scanner's own. What is
+        // asserted is the attribution wrapped around the scanner's text, which is why the
+        // library's own wording is not asserted on.
+        let error = engine()
+            .point_in_time_join(
+                &labels(&[(Some(1), 100)]),
+                &view("no/such/source.parquet", None),
+                &JoinOptions::default(),
+            )
+            .expect_err("must fail");
+
+        assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
+        assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("source `no/such/source.parquet`"),
+            "{error}"
+        );
     }
 
     #[test]

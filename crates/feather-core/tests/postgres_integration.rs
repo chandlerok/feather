@@ -11,6 +11,10 @@
 //! the `postgres` extension provides, is the engine's own, because the join goes through
 //! `Engine::open` rather than re-implementing that wiring.
 //!
+//! The connection the engine resolves comes from a `feather.toml` parsed by the core, with
+//! its password interpolated, so the route a project actually takes is the one under test:
+//! `feather.toml` to `Settings`, to `Connection::conninfo`, to the `postgres_scan` relation.
+//!
 //! Seeding goes through DuckDB too, with `ATTACH ... (TYPE postgres)` and `CREATE TABLE`,
 //! so no `psql` step exists anywhere. One thing Postgres itself forces: the escaping test
 //! needs a login role whose password holds a space, and `postgres_execute` runs that DDL
@@ -27,7 +31,6 @@
 
 #![cfg(feature = "offline")]
 
-use std::collections::BTreeMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,7 +43,7 @@ use arrow::record_batch::RecordBatch;
 use duckdb::Connection as DuckDb;
 use feather_core::definitions::{DType, Entity, FeatureView, Field as FeatureField, Source};
 use feather_core::offline::{Engine, JoinOptions, Limits};
-use feather_core::settings::Connection;
+use feather_core::settings::{Connection, Settings, parse_settings_with};
 use parquet::arrow::ArrowWriter;
 
 /// The `[connections]` name the engine resolves for the ordinary read.
@@ -104,21 +107,38 @@ fn unique(tag: &str) -> String {
     )
 }
 
-/// A configured connection, built through the same wire shape the settings loader produces
-/// for a `[connections]` entry with `type = "postgres"`.
+/// A configured connection, built through the core's own settings loader.
 ///
-/// The connection string is assembled by the core rather than written out here, so the
-/// setup path and the read path use one spelling of it.
+/// The `feather.toml` text is the real route into a `Connection`, and the password is
+/// interpolated through the loader's environment closure rather than written into the file,
+/// so resolving `${POSTGRES_PASSWORD}` is part of what the read exercises. Everything else
+/// about the entry is what a project's file would say.
+fn settings(user: &str, password: &str) -> Settings {
+    let text = format!(
+        "project = \"feather_test\"\n\
+         definitions = [\"definitions/test.py\"]\n\
+         \n\
+         [connections.{CONNECTION}]\n\
+         type = \"postgres\"\n\
+         host = \"{host}\"\n\
+         port = {port}\n\
+         database = \"{database}\"\n\
+         user = \"{user}\"\n\
+         password = \"${{POSTGRES_PASSWORD}}\"\n",
+        host = host(),
+        port = port(),
+        database = database(),
+    );
+
+    parse_settings_with(&text, &|name| match name {
+        "POSTGRES_PASSWORD" => Ok(password.to_owned()),
+        _ => Err(std::env::VarError::NotPresent),
+    })
+    .expect("the settings parse")
+}
+
 fn connection(user: &str, password: &str) -> Connection {
-    serde_json::from_value(serde_json::json!({
-        "type": "postgres",
-        "host": host(),
-        "port": port(),
-        "database": database(),
-        "user": user,
-        "password": password,
-    }))
-    .expect("connection")
+    settings(user, password).connections[CONNECTION].clone()
 }
 
 fn conninfo(user: &str, password: &str) -> String {
@@ -425,7 +445,7 @@ fn a_join_over_postgres_matches_the_same_join_over_a_local_file() {
     fixture.admin.create_table(&fixture.table, &ROWS);
 
     let local = Parquet::write(&integer_source(&ROWS));
-    let connections = BTreeMap::from([(CONNECTION.to_owned(), connection(&user(), &password()))]);
+    let connections = settings(&user(), &password()).connections;
     let engine = Engine::open(&Limits::default(), &connections).expect("engine");
 
     let options = JoinOptions::default();
@@ -457,8 +477,7 @@ fn a_postgres_source_authenticates_with_a_password_that_needs_escaping() {
         .create_reader(&reader, AWKWARD_PASSWORD, &fixture.table);
 
     let local = Parquet::write(&integer_source(&ROWS));
-    let connections =
-        BTreeMap::from([(CONNECTION.to_owned(), connection(&reader, AWKWARD_PASSWORD))]);
+    let connections = settings(&reader, AWKWARD_PASSWORD).connections;
     let engine = Engine::open(&Limits::default(), &connections).expect("engine");
 
     let options = JoinOptions::default();

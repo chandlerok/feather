@@ -1003,6 +1003,11 @@ invisible. The integration test in `crates/feather-core/tests/s3_integration.rs`
 RustFS, an S3-compatible server, and joins the same Parquet rows read from a local file and
 from `s3://` to check that the two agree.
 
+The example's `pg_prod` is a deployment's own database, on the port that server listens on.
+`docker-compose.yml` publishes the Postgres the integration test uses on 5433, because 5432 is
+the port a locally installed server already holds, so a `feather.toml` pointed at the compose
+server writes `host = "127.0.0.1"` and `port = 5433` instead.
+
 Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
@@ -1074,11 +1079,12 @@ the engine fails to load rather than degrading.
 ### Backend coverage
 
 `[connections]` shows the three kinds with a settled schema: Snowflake, S3, and Postgres. Each
-declares `type` plus its own keys, and a kind is added when a source needs it. Every kind is
-covered by an integration test against a real server, RustFS for the S3-compatible case and a
-Postgres container for the table, because a reader that only ever meets a mock is not known to
-work. BigQuery, Azure Blob Storage, and a local SQLite database still need their keys specified
-before they can be documented.
+declares `type` plus its own keys, and a kind is added when a source needs it. Every kind that
+has a reader is covered by an integration test against a real server, RustFS for the
+S3-compatible case and a Postgres container for the table, because a reader that only ever
+meets a mock is not known to work. Snowflake declares a connection but has no reader yet, so
+nothing reads through it and no test does. BigQuery, Azure Blob Storage, and a local SQLite
+database still need their keys specified before they can be documented.
 
 ---
 

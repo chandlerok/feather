@@ -47,15 +47,31 @@ def a_view(**overrides: object) -> FeatureView:
     return FeatureView.model_validate(base)
 
 
+def a_postgres_view() -> FeatureView:
+    """A view over a Postgres table, in the same shape as :func:`a_view`.
+
+    Returns:
+        The view.
+    """
+    return a_view(
+        name="user_stats",
+        source=PostgresSource(connection="pg_prod", schema="public", table="user_stats"),
+        features=[Field(name="lifetime_value", dtype="float64")],
+    )
+
+
 def a_config() -> FeatureStoreConfig:
-    """The canonical project: one view with a TTL, and a service referencing it.
+    """The canonical project: one view per source kind, and a service referencing one.
+
+    Both kinds are in the shared fixture, so the tag is compared across the boundary
+    rather than asserted twice, once per language.
 
     Returns:
         The config whose serialized form is the shared fixture.
     """
     return FeatureStoreConfig(
         project="ads",
-        views=[a_view(ttl_days=30)],
+        views=[a_view(ttl_days=30), a_postgres_view()],
         services=[FeatureService(name="ranking", features=["user_clicks:click_count"])],
     )
 
@@ -118,6 +134,25 @@ def test_a_source_of_an_unknown_type_is_rejected() -> None:
                 "name": "v",
                 "entities": [{"name": "e", "join_key": "e"}],
                 "source": {"type": "bigquery", "table": "t"},
+                "features": [{"name": "f", "dtype": "int64"}],
+            }
+        )
+
+
+def test_a_source_without_a_type_is_rejected() -> None:
+    """No tag means no kind, and `FileSource` defaulting its own tag makes that a live risk.
+
+    The default exists so `FileSource(path=...)` stays the way a file source is written,
+    which means an untagged payload has to be refused by the union rather than falling
+    into the variant that happens to declare a default. The Rust half of this is
+    `an_untagged_source_is_rejected` in `wire_contract.rs`.
+    """
+    with pytest.raises(pydantic.ValidationError):
+        FeatureView.model_validate(
+            {
+                "name": "v",
+                "entities": [{"name": "e", "join_key": "e"}],
+                "source": {"path": "data/user_stats.parquet"},
                 "features": [{"name": "f", "dtype": "int64"}],
             }
         )

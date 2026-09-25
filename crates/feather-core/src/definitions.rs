@@ -5,9 +5,9 @@
 //! ingest, so a binding that skips its own checks still cannot hand over something
 //! the engines cannot represent, and a second binding has nothing new to implement.
 //!
-//! Validation covers what an engine depends on: exactly one entity per view, the
-//! field names a view declares, and every service reference resolving to a view and
-//! a field that both exist.
+//! Validation covers what an engine depends on: exactly one entity per view, a source
+//! that carries the values its own kind needs, the field names a view declares, and
+//! every service reference resolving to a view and a field that both exist.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -156,6 +156,25 @@ impl Source {
             } => format!("{connection}.{schema}.{table}"),
         }
     }
+
+    /// This kind's string fields, as `(key, value)` pairs.
+    ///
+    /// The keys are the wire names, so an error about one names the key the author
+    /// wrote rather than the variant it selects.
+    fn string_fields(&self) -> Vec<(&'static str, &str)> {
+        match self {
+            Self::File { path } => vec![("path", path)],
+            Self::Postgres {
+                connection,
+                schema,
+                table,
+            } => vec![
+                ("connection", connection),
+                ("schema", schema),
+                ("table", table),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +290,17 @@ impl Definitions {
             // Surfaces the multi-entity error at validation time rather than at
             // the first read.
             view.entity()?;
+            // Emptiness, not whitespace, because that is the rule the Python mirror states
+            // with its non-empty string type and this module is the authority. Left empty, a
+            // source field reaches the scanner as an opaque read failure.
+            for (key, value) in view.source.string_fields() {
+                if value.is_empty() {
+                    return Err(Error::MalformedView {
+                        view: view.name.clone(),
+                        reason: format!("declares an empty `{key}` in its source"),
+                    });
+                }
+            }
             if view.ttl_days == Some(0) {
                 return Err(Error::MalformedView {
                     view: view.name.clone(),
