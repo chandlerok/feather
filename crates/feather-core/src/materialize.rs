@@ -21,7 +21,7 @@
 //! - A value's expiry is the event timestamp plus the TTL, as an absolute instant. A TTL
 //!   measured from the write would give a 40-day-old value another 30 days of life.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array};
@@ -31,9 +31,10 @@ use crate::definitions::FeatureView;
 use crate::error::{Error, Result};
 use crate::key::{
     encode_entity_key_for, entity_hash_key, entity_key_component, freshness_field, value_field,
+    views_registry_key,
 };
 use crate::offline::{Engine, LatestBatchSink, SCAN_TS_COLUMN};
-use crate::online::{OnlineStore, WriteBatch, WrittenField, encode_freshness};
+use crate::online::{OnlineStore, ProjectScan, WriteBatch, WrittenField, encode_freshness};
 use crate::value::encode_batch;
 
 /// What one view's refresh did.
@@ -94,7 +95,7 @@ pub struct MaterializeReport {
 ///         filter already excludes.
 ///     [`Error::UnsupportedKeyType`] if a source's entity key is not an integer or a string.
 ///     Whatever the store reports for a failed write.
-pub async fn materialize<S: OnlineStore>(
+pub async fn materialize<S: OnlineStore + ProjectScan>(
     store: &mut S,
     engine: &Engine,
     project: &str,
@@ -102,6 +103,17 @@ pub async fn materialize<S: OnlineStore>(
     selected: &[String],
 ) -> Result<MaterializeReport> {
     let started = Instant::now();
+
+    // The registry is read before anything is written, because the previously declared view set
+    // is what identifies a view that has been renamed or removed. A project that has never been
+    // refreshed has no registry yet, which reads as an empty set.
+    let registry_key = views_registry_key(project);
+    let mut registry: BTreeMap<String, Vec<u8>> = store
+        .hash_fields(&registry_key)
+        .await?
+        .into_iter()
+        .collect();
+
     let chosen = select_views(declared, selected)?;
 
     let mut views = Vec::with_capacity(chosen.len());
@@ -116,6 +128,32 @@ pub async fn materialize<S: OnlineStore>(
             elapsed: view_started.elapsed(),
         });
     }
+
+    // The registry is written last, after every value write. The order is the whole argument
+    // for what a crashed run costs: a run that dies before this point leaves the retired views
+    // in the registry, so the next run computes the same `retired` set and walks the keyspace
+    // again, which changes nothing because removing a field that is already gone is a no-op.
+    // Writing the registry first would tell the next run those views were never declared, and
+    // their fields would stay in the store for good.
+    //
+    // A view whose refresh wrote nothing keeps the timestamp it already had: the registry
+    // records the newest event timestamp any refresh has seen, and a run that saw no rows did
+    // not see an older one. Views that were not selected are carried over unchanged, so
+    // refreshing a subset leaves the rest of the registry intact.
+    for view in &views {
+        if let Some(highest) = view.max_event_timestamp_micros {
+            registry.insert(view.name.clone(), encode_freshness(highest));
+        }
+    }
+    store
+        .write(&[WriteBatch {
+            key: registry_key,
+            fields: registry
+                .into_iter()
+                .map(|(name, value)| WrittenField::new(name, value, None))
+                .collect(),
+        }])
+        .await?;
 
     Ok(MaterializeReport {
         total_rows: views.iter().map(|view| view.rows).sum(),
@@ -435,10 +473,9 @@ mod tests {
 
         assert_eq!(stored_count(&store, &a_view("x", None), b"1"), Some(30));
         assert_eq!(stored_count(&store, &a_view("x", None), b"2"), Some(99));
-        assert_eq!(
-            store.hash_count(),
-            2,
-            "one hash per entity, and only per entity"
+        assert!(
+            store.fields(&key_of(b"3")).is_none(),
+            "an entity the source never mentions gets no hash"
         );
         assert_eq!(report.total_rows, 2);
         assert_eq!(report.views[0].rows, 2);
@@ -519,13 +556,49 @@ mod tests {
         .await
         .expect("materialize");
 
-        assert_eq!(
-            store.hash_count(),
-            1,
-            "only the row with both a key and a timestamp"
+        assert!(
+            store.fields(&key_of(b"1")).is_none(),
+            "a row with a null key has no key to be written under"
+        );
+        assert!(
+            store.fields(&key_of(b"2")).is_none(),
+            "a row with a null timestamp has no freshness to record"
         );
         assert_eq!(stored_count(&store, &view, b"3"), Some(3));
         assert_eq!(report.total_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn every_refresh_writes_the_registry_with_each_views_newest_event_timestamp() {
+        let (store, _) = refresh(&[(1, 300, 30), (1, 500, 50), (2, 900, 90)]).await;
+
+        let registry = store
+            .fields(&views_registry_key("ads"))
+            .expect("the refresh writes the registry");
+        assert_eq!(registry.get("clicks"), Some(&encode_freshness(900)));
+    }
+
+    #[tokio::test]
+    async fn refreshing_a_subset_leaves_the_other_views_in_the_registry() {
+        let source = Parquet::write(&source(&[(1, 100, 10)]));
+        let clicks = a_view(&source.string(), None);
+        let mut stats = a_view(&source.string(), None);
+        stats.name = "stats".to_owned();
+        let declared = vec![clicks, stats];
+
+        let mut store = MemoryStore::new();
+        let engine = an_engine();
+        materialize(&mut store, &engine, "ads", &declared, &[])
+            .await
+            .expect("first refresh");
+        materialize(&mut store, &engine, "ads", &declared, &["stats".to_owned()])
+            .await
+            .expect("subset refresh");
+
+        // Both views stay declared, so neither is an orphan and neither leaves the registry.
+        let registry = store.fields(&views_registry_key("ads")).expect("registry");
+        assert_eq!(registry.get("clicks"), Some(&encode_freshness(100)));
+        assert_eq!(registry.get("stats"), Some(&encode_freshness(100)));
     }
 
     #[tokio::test]
@@ -577,7 +650,11 @@ mod tests {
         .await;
 
         assert!(matches!(refused, Err(Error::UnknownView(name)) if name == "absent"));
-        assert_eq!(store.hash_count(), 0, "a rejected refresh writes nothing");
+        assert_eq!(
+            store.hash_count(),
+            0,
+            "a rejected refresh writes nothing, not even the registry"
+        );
     }
 
     /// The batches one scan produced, so the streaming contract is asserted rather than

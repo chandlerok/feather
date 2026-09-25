@@ -101,6 +101,29 @@ pub trait OnlineStore {
     async fn delete_fields(&mut self, keys_and_fields: &[(Vec<u8>, Vec<String>)]) -> Result<()>;
 }
 
+/// The reads that look at a project's whole keyspace rather than at one hash in it.
+///
+/// Deliberately separate from [`OnlineStore`] rather than a method on it. `read_entities` bounds
+/// its store by that trait, and the serving path has no business reaching for a keyspace walk:
+/// the narrowness of that trait is what keeps the cost of a read explicable. A refresh is the
+/// only caller.
+#[allow(async_fn_in_trait)]
+pub trait ProjectScan {
+    /// Every field of one hash, as `(name, value)` pairs, and empty when there is no such key.
+    ///
+    /// A whole hash rather than named fields, which is what [`OnlineStore::read`] takes, because
+    /// the project registry is read to learn which fields it holds. Asking for them one at a
+    /// time would mean knowing the answer in advance.
+    ///
+    /// Args:
+    ///     key: The hash key.
+    ///
+    /// Returns:
+    ///     Each field with its value. An absent key yields an empty list rather than an error,
+    ///     which is the first refresh of a project.
+    async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>>;
+}
+
 /// Why a view's values are not usable for an entity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Missing {

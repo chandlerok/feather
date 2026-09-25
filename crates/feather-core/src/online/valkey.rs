@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use redis::RedisResult;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 
-use super::{OnlineStore, ReadRequest, WriteBatch, WrittenField};
+use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, WrittenField};
 use crate::error::Result;
 
 /// Commands per pipeline flush. Large enough to amortise the round trip, small
@@ -279,4 +279,19 @@ fn queue_hset(pipeline: &mut redis::Pipeline, key: &[u8], fields: &[&WrittenFiel
         command.arg(&field.name).arg(&field.value);
     }
     pipeline.add_command(command);
+}
+
+impl ProjectScan for ValkeyStore {
+    async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut connection = self.connection.clone();
+        // Typed as a map so the reply is read as field-value pairs whether the connection is
+        // RESP2 or RESP3; the store asks for RESP3, where `HGETALL` is a map, and a RESP2 reply
+        // is a flat array that converts to the same thing. An absent key answers nil, which
+        // converts to an empty map.
+        let fields: BTreeMap<String, Vec<u8>> = redis::cmd("HGETALL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(fields.into_iter().collect())
+    }
 }

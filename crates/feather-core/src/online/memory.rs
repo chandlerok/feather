@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use super::{OnlineStore, ReadRequest, WriteBatch};
+use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch};
 use crate::error::Result;
 
 #[derive(Debug, Default, Clone)]
@@ -99,5 +99,19 @@ impl OnlineStore for MemoryStore {
             }
         }
         Ok(())
+    }
+}
+
+impl ProjectScan for MemoryStore {
+    async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .hashes
+            .get(key)
+            .map(|hash| {
+                hash.iter()
+                    .map(|(field, value)| (field.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
