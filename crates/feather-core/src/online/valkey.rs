@@ -269,12 +269,16 @@ fn queue_write(pipeline: &mut redis::Pipeline, batch: &WriteBatch, expiry: Field
             }
             // Either the field never expires or the server cannot expire a field. Without
             // server support the value is still correct; it is reclaimed when its hash is
-            // rewritten, and the read-time TTL check is what decides whether it is served. A
-            // plain `HSET` also leaves any TTL the server already holds for that field, and
-            // that is deliberate rather than overlooked: a view that drops its `ttl_days` stops
-            // asking for an expiry, and this path is not asked to clear one that an earlier
-            // definition set. `MemoryStore` records an expiry and leaves it in place for the
-            // same reason, so a test sees what the server would.
+            // rewritten, and the read-time TTL check is what decides whether it is served.
+            //
+            // A plain `HSET` also clears any TTL the server holds for that field, the same way
+            // `SET` clears a key's TTL without `KEEPTTL`, which is why `HSETEX` has that option
+            // and `HSET` does not. That is the behaviour to match rather than a detail to work
+            // around: a view that drops its `ttl_days` stops asking for an expiry, this rewrite
+            // clears the old one, and its values stop expiring server-side. `MemoryStore` drops
+            // its recorded expiry here for the same reason, so a test sees what the server
+            // would, and `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in
+            // `tests/valkey_integration.rs` pins it against a real server.
             (None, _) | (Some(_), FieldExpiry::None) => {
                 queue_hset(pipeline, &batch.key, &fields);
             }
