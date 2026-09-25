@@ -22,12 +22,12 @@
 //!   error rather than a cast, because an implicit cast is how an off-by-hours bug enters a
 //!   training set.
 
-use std::cell::{Ref, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::compute::concat_batches;
@@ -147,7 +147,12 @@ impl Default for JoinOptions {
 pub struct Engine {
     /// The connection this engine reads through, or `None` after a failure that left its
     /// state unknown. Opening it lazily is what lets the next use reopen instead of reuse.
-    connection: RefCell<Option<Connection>>,
+    ///
+    /// A mutex rather than a `RefCell` so that `Engine` is `Sync`. The binding releases the GIL
+    /// around a refresh, and PyO3 only allows that for a closure whose captures are all `Sync`,
+    /// which a `RefCell` is not. The lock is uncontended: one DuckDB connection is one session,
+    /// and the engine is used from the store's own mutex.
+    connection: Mutex<Option<Connection>>,
     /// Retained so a discarded connection is rebuilt with the settings it had.
     limits: Limits,
     /// This engine's private spill directory. DuckDB removes the files inside it when the
@@ -191,7 +196,7 @@ impl Engine {
         })?;
 
         let engine = Self {
-            connection: RefCell::new(None),
+            connection: Mutex::new(None),
             limits: limits.clone(),
             spill,
             connections: connections.clone(),
@@ -210,7 +215,7 @@ impl Engine {
     ///     [`Error::DuckDb`] if the connection cannot be opened, a setting is rejected, or a
     ///         configured secret is malformed.
     fn reopen(&self) -> Result<()> {
-        *self.connection.borrow_mut() = Some(self.connect()?);
+        *lock(&self.connection) = Some(self.connect()?);
         Ok(())
     }
 
@@ -221,23 +226,22 @@ impl Engine {
     ///
     /// Raises:
     ///     [`Error::DuckDb`] if a discarded connection cannot be reopened.
-    fn connection(&self) -> Result<Ref<'_, Connection>> {
-        if self.connection.borrow().is_none() {
+    fn connection(&self) -> Result<ConnectionRef<'_>> {
+        if lock(&self.connection).is_none() {
             self.reopen()?;
         }
-        Ok(Ref::map(self.connection.borrow(), |held| {
-            held.as_ref().expect("reopen leaves a connection in place")
-        }))
+        Ok(ConnectionRef(lock(&self.connection)))
     }
 
     /// Discard the connection, so the next use opens a fresh one.
     ///
-    /// Called only where a failure left the connection's state unknown, which is a caught
-    /// panic inside a streamed scan. The caller must have dropped the borrow that scan held,
-    /// or this panics on the `RefCell`: [`Engine::scan_latest_per_entity`] is the only caller
-    /// and awaits the scan's future to completion first.
+    /// Called where a failure left the connection's state unknown, which is a caught panic
+    /// inside a streamed scan. A scan that is still holding the connection makes this wait for
+    /// it rather than panicking, which is what the mutex buys: two scans over one engine on one
+    /// thread, which nothing does today, would serialise instead of one of them aborting the
+    /// process.
     fn discard_connection(&self) {
-        *self.connection.borrow_mut() = None;
+        *lock(&self.connection) = None;
     }
 
     /// Build a connection with this engine's settings, secrets, and spill directory.
@@ -374,6 +378,33 @@ impl Drop for Engine {
         // dropped engine leaves nothing behind for the next one to find.
         let _ = std::fs::remove_dir_all(&self.spill);
     }
+}
+
+/// A live connection, held for as long as the caller that borrows it.
+///
+/// The guard is what makes an engine `Sync` without an `unsafe impl`, and the `Deref` is what
+/// keeps the `Option` out of every reader: `connection` opens one before handing this out, so
+/// the only way to hold a `ConnectionRef` is to hold a connection.
+struct ConnectionRef<'a>(MutexGuard<'a, Option<Connection>>);
+
+impl std::ops::Deref for ConnectionRef<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("connection opens one before returning a reference to it")
+    }
+}
+
+/// Take a mutex, ignoring poisoning.
+///
+/// A panic inside a scan poisons the connection's mutex while the connection is being thrown
+/// away anyway, so treating it as fatal would replace one caught failure with a permanent one.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Distinguishes one engine's spill directory from another's.
@@ -713,12 +744,12 @@ impl Engine {
 
     /// Run the reduced scan, handing each batch to `sink` before fetching the next.
     ///
-    /// The connection is borrowed for the whole scan, which is what the lint below notices.
-    /// The borrow is safe because nothing can take it mutably while it is held: the engine is
-    /// not `Sync`, so one scan runs at a time, `reopen` runs inside `connection` before the
-    /// borrow that call returns, and `discard_connection` is called by
-    /// [`Engine::scan_latest_per_entity`] only after this future has been dropped.
-    #[allow(clippy::await_holding_refcell_ref)]
+    /// The connection is held for the whole scan, which is what the lint below notices. Holding
+    /// it is safe rather than merely convenient: the lock is uncontended by construction, since
+    /// every caller reaches the engine through the store's own mutex, and the one place that
+    /// takes it exclusively, [`Engine::scan_latest_per_entity`], does so after this future has
+    /// been dropped.
+    #[allow(clippy::await_holding_lock)]
     async fn run_scan<S: LatestBatchSink>(
         &self,
         view: &str,

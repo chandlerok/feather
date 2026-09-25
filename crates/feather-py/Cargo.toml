@@ -27,6 +27,10 @@ pyo3 = { workspace = true, features = ["abi3-py311"] }
 pyo3-arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The online store's I/O is asynchronous, so the binding owns a runtime and blocks on it from
+# the Python thread. `rt-multi-thread` because the Valkey client's connection manager drives a
+# reactor on its workers; `net` and `time` because that reactor needs them.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 
 [features]
 default = ["offline"]
