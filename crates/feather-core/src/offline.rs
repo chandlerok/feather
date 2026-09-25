@@ -822,13 +822,35 @@ fn s3_secret_sql(name: &str, configured: &SettingsConnection) -> Option<String> 
             region,
             key_id,
             secret,
-        } => Some(format!(
-            "CREATE OR REPLACE SECRET {} (TYPE s3, KEY_ID {}, SECRET {}, REGION {})",
-            quote_ident(name),
-            quote_literal(key_id),
-            quote_literal(secret.expose()),
-            quote_literal(region),
-        )),
+            endpoint,
+            use_ssl,
+            url_style,
+        } => {
+            let mut options = vec![
+                "TYPE s3".to_owned(),
+                format!("KEY_ID {}", quote_literal(key_id)),
+                format!("SECRET {}", quote_literal(secret.expose())),
+                format!("REGION {}", quote_literal(region)),
+            ];
+            if let Some(endpoint) = endpoint {
+                options.push(format!("ENDPOINT {}", quote_literal(endpoint)));
+                options.push(format!("USE_SSL {use_ssl}"));
+                // DuckDB's own default for S3 is vhost, and an S3-compatible server reached at
+                // a host and port is addressed path style, so an endpoint implies path unless
+                // the connection overrides it.
+                options.push(format!(
+                    "URL_STYLE {}",
+                    quote_literal(url_style.as_deref().unwrap_or("path"))
+                ));
+            } else if let Some(style) = url_style {
+                options.push(format!("URL_STYLE {}", quote_literal(style)));
+            }
+            Some(format!(
+                "CREATE OR REPLACE SECRET {} ({})",
+                quote_ident(name),
+                options.join(", ")
+            ))
+        }
         // DuckDB's snowflake extension authenticates its own way, and no reader uses this kind
         // yet.
         SettingsConnection::Snowflake { .. } => None,
@@ -1369,6 +1391,23 @@ mod tests {
         assert!(sql.contains("CREATE OR REPLACE SECRET"), "{sql}");
         assert!(sql.contains("KEY_ID 'AKIAEXAMPLE'"), "{sql}");
         assert!(sql.contains("REGION 'us-east-1'"), "{sql}");
+        // Nothing about the endpoint, so this is AWS and DuckDB's own defaults apply.
+        assert!(!sql.contains("ENDPOINT"), "{sql}");
+        assert!(!sql.contains("URL_STYLE"), "{sql}");
+    }
+
+    #[test]
+    fn a_compatible_endpoint_gets_path_style_and_no_tls() {
+        // What a local S3-compatible server needs: DuckDB defaults to vhost addressing and
+        // HTTPS, neither of which a host-and-port endpoint answers.
+        let configured = connection(
+            r#"{"type":"s3","region":"us-east-1","key_id":"feathertest","secret":"feathertest","endpoint":"localhost:9000","use_ssl":false}"#,
+        );
+        let sql = s3_secret_sql("s3_local", &configured).expect("a secret");
+
+        assert!(sql.contains("ENDPOINT 'localhost:9000'"), "{sql}");
+        assert!(sql.contains("USE_SSL false"), "{sql}");
+        assert!(sql.contains("URL_STYLE 'path'"), "{sql}");
     }
 
     #[test]

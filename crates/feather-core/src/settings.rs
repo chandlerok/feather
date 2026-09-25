@@ -71,6 +71,19 @@ pub enum Connection {
         region: String,
         key_id: String,
         secret: Secret,
+        /// A non-AWS endpoint, such as `localhost:9000` for a local S3-compatible server.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Whether the endpoint speaks HTTPS. DuckDB's own default is true.
+        #[serde(default = "enabled_by_default")]
+        use_ssl: bool,
+        /// `path`, `vhost`, or absent to let the engine decide.
+        ///
+        /// Absent means path style when an `endpoint` is set, because an S3-compatible
+        /// server reached at a host and port is addressed path-style, and DuckDB's own
+        /// default for S3 is vhost.
+        #[serde(default)]
+        url_style: Option<String>,
     },
 }
 
@@ -91,9 +104,25 @@ impl Connection {
                 check_present(warehouse, &format!("connections.{name}.warehouse"))?;
                 check_present(username, &format!("connections.{name}.username"))?;
             }
-            Self::S3 { region, key_id, .. } => {
+            Self::S3 {
+                region,
+                key_id,
+                url_style,
+                ..
+            } => {
                 check_present(region, &format!("connections.{name}.region"))?;
                 check_present(key_id, &format!("connections.{name}.key_id"))?;
+                if let Some(style) = url_style {
+                    // Checked here rather than at the secret, so a typo names the key it is in
+                    // instead of surfacing as a DuckDB parser error.
+                    if style != "path" && style != "vhost" {
+                        return Err(Error::MalformedSettings {
+                            reason: format!(
+                                "connections.{name}.url_style must be `path` or `vhost`, not `{style}`"
+                            ),
+                        });
+                    }
+                }
             }
         }
         Ok(())

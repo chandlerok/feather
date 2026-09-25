@@ -34,3 +34,31 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+
+  # An S3-compatible object store, so the remote-read path meets a real
+  # server rather than a mock. Single-node single-disk, which is what RustFS
+  # recommends for local testing. No healthcheck: the image's tooling is not
+  # guaranteed, and the test waits for readiness itself rather than the
+  # compose file guessing at a health endpoint.
+  rustfs:
+    image: rustfs/rustfs:latest
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      # Loopback only, and not the documented defaults: the RustFS entrypoint
+      # warns that the public default pair is unsafe.
+      RUSTFS_ACCESS_KEY: feathertest
+      RUSTFS_SECRET_KEY: feathertest
+      # So a test can write without creating a bucket first. A server that
+      # predates this variable ignores it, which is why the test creates the
+      # bucket when it is missing.
+      RUSTFS_DEFAULT_BUCKETS: feather-test
+    ports:
+      - "127.0.0.1:9000:9000"
+    cpus: 2
+    mem_limit: 512m
+    volumes:
+      - rustfs-data:/data
+
+volumes:
+  rustfs-data:
