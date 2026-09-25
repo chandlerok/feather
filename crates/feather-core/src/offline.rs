@@ -662,8 +662,16 @@ impl Engine {
             }
             AmbiguityScope::WholeSource => String::new(),
         };
+        // Rows the scan itself excludes are excluded here too. A null key or a null timestamp is
+        // dropped before any value is written, so two such rows are not an ambiguity the refresh
+        // has to resolve. Without this the check would group them and then read a null key back
+        // as a string, which is an error rather than a value, so a source the scan handles fine
+        // would fail the whole refresh with a message naming neither the source nor the rows.
         let sql = format!(
-            "WITH source AS (SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation})
+            "WITH source AS (
+                 SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation}
+                 WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
+             )
              SELECT CAST(k AS VARCHAR), t, count(*) AS n
              FROM source{restriction}
              GROUP BY k, t
