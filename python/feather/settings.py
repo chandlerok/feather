@@ -69,20 +69,25 @@ class PostgresConnection(pydantic.BaseModel):
     """A Postgres database a source can read from.
 
     ``host`` and ``port`` are libpq's rather than a URL's, which is why they are two
-    fields and not one. ``port`` is bounded where the core's is a ``u16``, so a value
-    the core cannot carry is caught here rather than at the handoff. ``password`` is a
-    secret and stays out of ``repr`` the way the other credentials do.
+    fields and not one. ``port`` is bounded to what the core can carry, which is a
+    ``u16``, so 0 is allowed: libpq reads it as "use the default port" and a bound that
+    refused it would reject a connection the core would have used. A bound here is for
+    catching a value the core cannot represent, not for being a second, stricter
+    contract. ``password`` is a secret and stays out of ``repr`` the way the other
+    credentials do.
 
-    ``ssl_mode`` is any of libpq's ``sslmode`` values and has no default. libpq already
-    prefers TLS when the server offers it, and a security flag guessed wrong is worse
-    than one an operator had to write down.
+    ``ssl_mode`` is any of libpq's ``sslmode`` values, lower case, and has no default.
+    libpq already prefers TLS when the server offers it, and a security flag guessed
+    wrong is worse than one an operator had to write down. The values are lower case
+    because libpq compares them that way: `sslmode=REQUIRE` is refused with "invalid
+    sslmode value", so accepting upper case here would only move the failure later.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
 
     type: Literal["postgres"]
     host: NonEmptyStr
-    port: Annotated[int, pydantic.Field(ge=1, le=65535)] = 5432
+    port: Annotated[int, pydantic.Field(ge=0, le=65535)] = 5432
     database: NonEmptyStr
     user: NonEmptyStr
     password: pydantic.SecretStr

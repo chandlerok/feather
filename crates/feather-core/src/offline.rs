@@ -27,12 +27,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use duckdb::Connection;
+use duckdb::{Arrow, Connection};
 
 use crate::definitions::{DType, FeatureView, Source};
 use crate::error::{Error, Result};
@@ -49,6 +50,13 @@ const RESULT_TABLE: &str = "feather_result";
 const LABEL_KEY: &str = "feather_key";
 const LABEL_TS: &str = "feather_ts";
 const MATCHED_TS: &str = "feather_matched_ts";
+
+/// The columns a materialization scan lays its batches out under.
+///
+/// Public because the write path names them when it reports a malformed batch, and one
+/// spelling of a name is cheaper than two.
+pub const SCAN_KEY_COLUMN: &str = "feather_entity_key";
+pub const SCAN_TS_COLUMN: &str = "feather_event_ts";
 
 /// The default ceiling on what the spill directory may hold.
 ///
@@ -137,7 +145,16 @@ impl Default for JoinOptions {
 
 /// An in-memory DuckDB engine.
 pub struct Engine {
-    connection: Connection,
+    /// The connection this engine reads through, or `None` after a failure that left its
+    /// state unknown. Opening it lazily is what lets the next use reopen instead of reuse.
+    ///
+    /// A mutex rather than a `RefCell` so that `Engine` is `Sync`. The binding releases the GIL
+    /// around a refresh, and PyO3 only allows that for a closure whose captures are all `Sync`,
+    /// which a `RefCell` is not. The lock is uncontended: one DuckDB connection is one session,
+    /// and the engine is used from the store's own mutex.
+    connection: Mutex<Option<Connection>>,
+    /// Retained so a discarded connection is rebuilt with the settings it had.
+    limits: Limits,
     /// This engine's private spill directory. DuckDB removes the files inside it when the
     /// instance shuts down; the directory itself is removed when the engine is dropped.
     spill: PathBuf,
@@ -178,24 +195,88 @@ impl Engine {
             source,
         })?;
 
+        let engine = Self {
+            connection: Mutex::new(None),
+            limits: limits.clone(),
+            spill,
+            connections: connections.clone(),
+        };
+        engine.reopen()?;
+        Ok(engine)
+    }
+
+    /// Open the connection this engine reads through, replacing a discarded one.
+    ///
+    /// Returns:
+    ///     `Ok(())` once a connection with the engine's settings, secrets, and spill
+    ///     directory is in place.
+    ///
+    /// Raises:
+    ///     [`Error::DuckDb`] if the connection cannot be opened, a setting is rejected, or a
+    ///         configured secret is malformed.
+    fn reopen(&self) -> Result<()> {
+        *lock(&self.connection) = Some(self.connect()?);
+        Ok(())
+    }
+
+    /// The connection this engine reads through, opening one if the last was discarded.
+    ///
+    /// Returns:
+    ///     A borrow of the live connection.
+    ///
+    /// Raises:
+    ///     [`Error::DuckDb`] if a discarded connection cannot be reopened.
+    fn connection(&self) -> Result<ConnectionRef<'_>> {
+        if lock(&self.connection).is_none() {
+            self.reopen()?;
+        }
+        Ok(ConnectionRef(lock(&self.connection)))
+    }
+
+    /// Discard the connection, so the next use opens a fresh one.
+    ///
+    /// Called where a failure left the connection's state unknown, which is a caught panic
+    /// inside a streamed scan. A scan that is still holding the connection makes this wait for
+    /// it rather than panicking, which is what the mutex buys: two scans over one engine on one
+    /// thread, which nothing does today, would serialise instead of one of them aborting the
+    /// process.
+    fn discard_connection(&self) {
+        *lock(&self.connection) = None;
+    }
+
+    /// Build a connection with this engine's settings, secrets, and spill directory.
+    ///
+    /// Split out of [`Engine::open`] so a connection discarded after a failure is rebuilt
+    /// identically rather than approximately.
+    ///
+    /// Raises:
+    ///     [`Error::SpillDirectory`] if the extension directory cannot be created.
+    ///     [`Error::DuckDb`] if the connection cannot be opened, a setting is rejected, or a
+    ///         configured secret is malformed.
+    fn connect(&self) -> Result<Connection> {
         let connection = Connection::open_in_memory()?;
 
         let mut settings = vec![format!(
             "SET temp_directory = {}",
-            quote_literal(&spill.display().to_string())
+            quote_literal(&self.spill.display().to_string())
         )];
         // An explicit limit wins; otherwise take the container's, and otherwise leave
         // DuckDB's own default of 80% of RAM alone.
-        if let Some(memory) = limits.memory_limit.clone().or_else(cgroup_memory_limit) {
+        if let Some(memory) = self
+            .limits
+            .memory_limit
+            .clone()
+            .or_else(cgroup_memory_limit)
+        {
             settings.push(format!("SET memory_limit = {}", quote_literal(&memory)));
         }
-        if let Some(cap) = &limits.max_temp_directory_size {
+        if let Some(cap) = &self.limits.max_temp_directory_size {
             settings.push(format!(
                 "SET max_temp_directory_size = {}",
                 quote_literal(cap)
             ));
         }
-        if let Some(directory) = &limits.extension_directory {
+        if let Some(directory) = &self.limits.extension_directory {
             std::fs::create_dir_all(directory).map_err(|source| Error::SpillDirectory {
                 path: directory.display().to_string(),
                 source,
@@ -214,7 +295,8 @@ impl Engine {
         // The secret *type* comes from httpfs, so the extension has to be loaded before the
         // secret can be created. That is the only reason a configured connection loads it at
         // open; a remote path loads it on first read instead.
-        let secrets: Vec<String> = connections
+        let secrets: Vec<String> = self
+            .connections
             .iter()
             .filter_map(|(name, configured)| s3_secret_sql(name, configured))
             .collect();
@@ -225,11 +307,7 @@ impl Engine {
             }
         }
 
-        Ok(Self {
-            connection,
-            spill,
-            connections: connections.clone(),
-        })
+        Ok(connection)
     }
 
     /// The directory this engine spills into.
@@ -258,13 +336,13 @@ impl Engine {
     fn ensure_source_loaded(&self, view: &FeatureView) -> Result<()> {
         match &view.source {
             Source::File { path } if path_needs_filesystem(path) => {
-                self.connection
+                self.connection()?
                     .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
             }
             Source::File { .. } => {}
             Source::Postgres { connection, .. } => {
                 self.postgres_conninfo(view, connection)?;
-                self.connection
+                self.connection()?
                     .execute_batch("INSTALL postgres; LOAD postgres;")?;
             }
         }
@@ -300,6 +378,33 @@ impl Drop for Engine {
         // dropped engine leaves nothing behind for the next one to find.
         let _ = std::fs::remove_dir_all(&self.spill);
     }
+}
+
+/// A live connection, held for as long as the caller that borrows it.
+///
+/// The guard is what makes an engine `Sync` without an `unsafe impl`, and the `Deref` is what
+/// keeps the `Option` out of every reader: `connection` opens one before handing this out, so
+/// the only way to hold a `ConnectionRef` is to hold a connection.
+struct ConnectionRef<'a>(MutexGuard<'a, Option<Connection>>);
+
+impl std::ops::Deref for ConnectionRef<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0
+            .as_ref()
+            .expect("connection opens one before returning a reference to it")
+    }
+}
+
+/// Take a mutex, ignoring poisoning.
+///
+/// A panic inside a scan poisons the connection's mutex while the connection is being thrown
+/// away anyway, so treating it as fatal would replace one caught failure with a permanent one.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Distinguishes one engine's spill directory from another's.
@@ -459,7 +564,13 @@ impl Engine {
         let source_ts_value = source_ts_kind.to_micros(&quote_ident(source_ts_column));
 
         if view.created_timestamp_field.is_none() {
-            self.reject_ambiguous_timestamps(view, &relation, &key_expr, &source_ts_value)?;
+            self.reject_ambiguous_timestamps(
+                view,
+                &relation,
+                &key_expr,
+                &source_ts_value,
+                AmbiguityScope::LabelKeys,
+            )?;
         }
 
         let sql = join_sql(
@@ -488,8 +599,9 @@ impl Engine {
     ///         connection name.
     fn describe_source(&self, view: &FeatureView) -> Result<TypeMap> {
         let sql = format!("DESCRIBE SELECT * FROM {}", self.relation(view)?);
+        let connection = self.connection()?;
         let describe = || -> duckdb::Result<TypeMap> {
-            let mut statement = self.connection.prepare(&sql)?;
+            let mut statement = connection.prepare(&sql)?;
             let mut rows = statement.query([])?;
             let mut types = TypeMap::default();
             while let Some(row) = rows.next()? {
@@ -516,16 +628,16 @@ impl Engine {
         key_index: usize,
         label_index: usize,
     ) -> Result<()> {
-        self.connection
-            .execute_batch(&format!("DROP TABLE IF EXISTS {LABELS_TABLE}"))?;
-        self.connection.execute_batch(&format!(
+        let connection = self.connection()?;
+        connection.execute_batch(&format!("DROP TABLE IF EXISTS {LABELS_TABLE}"))?;
+        connection.execute_batch(&format!(
             "CREATE TEMPORARY TABLE {LABELS_TABLE} (feather_row BIGINT, {LABEL_KEY} {}, {LABEL_TS} {})",
             arrow_duckdb_type(frame_schema.field(key_index).data_type())?,
             arrow_duckdb_type(frame_schema.field(label_index).data_type())?,
         ))?;
 
         let batch = label_batch(entity_frame, frame_schema, key_index, label_index)?;
-        let mut appender = self.connection.appender(LABELS_TABLE)?;
+        let mut appender = connection.appender(LABELS_TABLE)?;
         appender.append_record_batch(batch)?;
         appender.flush()?;
         Ok(())
@@ -538,19 +650,36 @@ impl Engine {
         relation: &str,
         key_expr: &str,
         source_ts_value: &str,
+        scope: AmbiguityScope,
     ) -> Result<()> {
-        // Restricted to the keys in the label frame: a duplicate among keys nobody asked
-        // about cannot affect this join, and the restriction keeps the scan bounded.
+        // A join only cares about the keys its frame names, and restricting the check to them is
+        // what keeps it bounded by the request rather than by the source. A refresh has no such
+        // frame, so it looks at every key: which row wins has to be decided the same way for
+        // every entity a source holds, not only the ones some label row happened to name.
+        let restriction = match scope {
+            AmbiguityScope::LabelKeys => {
+                format!(" WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
+            }
+            AmbiguityScope::WholeSource => String::new(),
+        };
+        // Rows the scan itself excludes are excluded here too. A null key or a null timestamp is
+        // dropped before any value is written, so two such rows are not an ambiguity the refresh
+        // has to resolve. Without this the check would group them and then read a null key back
+        // as a string, which is an error rather than a value, so a source the scan handles fine
+        // would fail the whole refresh with a message naming neither the source nor the rows.
         let sql = format!(
-            "WITH source AS (SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation})
+            "WITH source AS (
+                 SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation}
+                 WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
+             )
              SELECT CAST(k AS VARCHAR), t, count(*) AS n
-             FROM source
-             WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})
+             FROM source{restriction}
              GROUP BY k, t
              HAVING count(*) > 1
              LIMIT 1"
         );
-        let mut statement = self.connection.prepare(&sql)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&sql)?;
         let mut rows = statement.query([])?;
         if let Some(row) = rows.next()? {
             return Err(Error::AmbiguousTimestamp {
@@ -573,18 +702,292 @@ impl Engine {
     /// plain scan. The `ORDER BY` is on the scan, not on the table, because a sort at
     /// materialization time would not order a later scan.
     fn materialize_and_scan(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        self.connection
-            .execute_batch(&format!("DROP TABLE IF EXISTS {RESULT_TABLE}"))?;
-        self.connection
-            .execute_batch(&format!("CREATE TEMPORARY TABLE {RESULT_TABLE} AS {sql}"))?;
+        let connection = self.connection()?;
+        connection.execute_batch(&format!("DROP TABLE IF EXISTS {RESULT_TABLE}"))?;
+        connection.execute_batch(&format!("CREATE TEMPORARY TABLE {RESULT_TABLE} AS {sql}"))?;
 
         let scan = format!("SELECT * FROM {RESULT_TABLE} ORDER BY {ROW_COLUMN}");
-        let mut statement = self.connection.prepare(&scan)?;
+        let mut statement = connection.prepare(&scan)?;
         let mut batches = Vec::new();
         for batch in statement.query_arrow([])? {
             batches.push(batch);
         }
         Ok(batches)
+    }
+
+    /// Stream the newest row per entity for a view, calling `sink` once per record batch.
+    ///
+    /// This is the materialization read. A full refresh of current values needs one row per
+    /// entity and not the history, so the reduction happens inside DuckDB
+    /// (`QUALIFY row_number() OVER (PARTITION BY ... ORDER BY ... DESC) = 1`) rather than in
+    /// a caller that has already fetched everything. See "Latest-per-entity pushdown" in the
+    /// architecture document.
+    ///
+    /// Each batch carries the view's feature columns in declaration order, then the entity
+    /// join key, then the winning row's event timestamp as microseconds in an `Int64`. Every
+    /// one of those columns is checked against the source's own types first, so a source
+    /// schema change fails here with a named column rather than during the write.
+    ///
+    /// `sink` is awaited before the next batch is pulled, so a refresh holds one batch rather
+    /// than a whole scan.
+    ///
+    /// Args:
+    ///     view: The view whose source is scanned.
+    ///     sink: Receives each batch, in the order DuckDB produces them.
+    ///
+    /// Returns:
+    ///     `Ok(())` once the scan is exhausted and every batch has been accepted.
+    ///
+    /// Raises:
+    ///     [`Error::MissingColumn`] if the source lacks a column the scan needs.
+    ///     [`Error::UnsupportedOfflineType`] for a key or timestamp type the scan cannot
+    ///         carry.
+    ///     [`Error::ColumnTypeMismatch`] if a source column does not have the declared dtype.
+    ///     [`Error::UnknownConnection`], [`Error::SourceConnectionKind`] or
+    ///         [`Error::UnreadableSource`] exactly as in [`Engine::point_in_time_join`].
+    ///     [`Error::StreamInterrupted`] if the scan failed after it had started, which is
+    ///         where the connection is discarded and the next use reopens it.
+    ///     [`Error::DuckDb`] if the query cannot be prepared.
+    pub async fn scan_latest_per_entity<S: LatestBatchSink>(
+        &self,
+        view: &FeatureView,
+        sink: &mut S,
+    ) -> Result<()> {
+        let sql = self.latest_per_entity_sql(view)?;
+        let result = self.run_scan(&view.name, &sql, sink).await;
+        // A caught panic leaves the connection's state unknown, so it is dropped and the
+        // next use opens a fresh one. Every other failure arrived as a value from a call that
+        // returned, which leaves the connection usable.
+        if matches!(&result, Err(Error::StreamInterrupted { .. })) {
+            self.discard_connection();
+        }
+        result
+    }
+
+    /// Run the reduced scan, handing each batch to `sink` before fetching the next.
+    ///
+    /// The connection is held for the whole scan, which is what the lint below notices. Holding
+    /// it is safe rather than merely convenient: the lock is uncontended by construction, since
+    /// every caller reaches the engine through the store's own mutex, and the one place that
+    /// takes it exclusively, [`Engine::scan_latest_per_entity`], does so after this future has
+    /// been dropped.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_scan<S: LatestBatchSink>(
+        &self,
+        view: &str,
+        sql: &str,
+        sink: &mut S,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(sql)?;
+        // `stream_arrow`, not `query_arrow`: the latter materializes the whole result on the
+        // client before the first batch is yielded, which is what a refresh of a full
+        // keyspace cannot do.
+        let mut rows = statement.stream_arrow([])?;
+        while let Some(batch) = next_batch(&mut rows, view)? {
+            sink.accept(batch).await?;
+        }
+        Ok(())
+    }
+
+    /// The reduced scan for a view, after checking that its source can answer it.
+    ///
+    /// The type checks are the join's, for the same reason: a source schema change should
+    /// fail with a named column rather than arrive as a column of nulls. The entity key is
+    /// checked against the families [`crate::key::entity_key_component`] can encode, since
+    /// that is what the write path converts it with.
+    ///
+    /// Raises:
+    ///     [`Error::MissingColumn`], [`Error::UnsupportedOfflineType`] and
+    ///         [`Error::ColumnTypeMismatch`] as described on
+    ///         [`Engine::scan_latest_per_entity`].
+    fn latest_per_entity_sql(&self, view: &FeatureView) -> Result<String> {
+        let entity = view.entity()?;
+        let key_column = entity.join_key.as_str();
+
+        self.ensure_source_loaded(view)?;
+
+        let location = format!("source `{}`", view.source.description());
+        let described = self.describe_source(view)?;
+
+        let source_key = described
+            .get(key_column)
+            .ok_or_else(|| Error::MissingColumn {
+                location: location.clone(),
+                column: key_column.to_owned(),
+            })?;
+        // The exact types whose Arrow counterparts the key encoder carries: DuckDB exports
+        // INTEGER as Int32, BIGINT as Int64 and VARCHAR as Utf8, and those three are what
+        // `entity_key_component` reads. `KeyFamily::of_duckdb` is wider on purpose, because the
+        // join only ever compares keys, so a check in terms of the family would admit a
+        // SMALLINT key and fail later in the sink instead of here.
+        match normalize_type(source_key).as_str() {
+            "INTEGER" | "BIGINT" | "VARCHAR" | "TEXT" | "STRING" => {}
+            other => {
+                return Err(Error::UnsupportedOfflineType {
+                    role: "entity key".to_owned(),
+                    dtype: other.to_owned(),
+                });
+            }
+        }
+
+        let source_ts_column = view.timestamp_field();
+        let source_ts = described
+            .get(source_ts_column)
+            .ok_or_else(|| Error::MissingColumn {
+                location: location.clone(),
+                column: source_ts_column.to_owned(),
+            })?;
+        let source_ts_kind = TimestampKind::of_duckdb(source_ts)?;
+        // The timestamp reaches the write path as an `Int64` of microseconds, so the types that
+        // could not survive that are refused here. An integer column is cast rather than trusted:
+        // DuckDB will export an `INTEGER` as Arrow `Int32`, which the sink cannot read, and the
+        // catch-all for a family would let it through to fail there.
+        let source_ts_expr = match normalize_type(source_ts).as_str() {
+            "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIME" => {
+                source_ts_kind.to_micros(&quote_ident(source_ts_column))
+            }
+            "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" => {
+                format!("CAST({} AS BIGINT)", quote_ident(source_ts_column))
+            }
+            other => {
+                return Err(Error::UnsupportedOfflineType {
+                    role: "timestamp".to_owned(),
+                    dtype: other.to_owned(),
+                });
+            }
+        };
+
+        for field in &view.features {
+            let actual = described
+                .get(&field.name)
+                .ok_or_else(|| Error::MissingColumn {
+                    location: location.clone(),
+                    column: field.name.clone(),
+                })?;
+            let expected = duckdb_type_of(field.dtype);
+            if normalize_type(actual) != expected {
+                return Err(Error::ColumnTypeMismatch {
+                    name: field.name.clone(),
+                    declared: expected.to_owned(),
+                    actual: actual.clone(),
+                });
+            }
+        }
+
+        let relation = self.relation(view)?;
+
+        // The same refusal the join makes, for the same reason: without a created timestamp to
+        // break a tie, which of two rows sharing a key and an event timestamp wins would depend
+        // on the query plan. A refresh has no label frame to restrict the check to, so it looks at
+        // the whole source, and it looks before writing anything, so a source that training
+        // refuses to read is not one serving quietly answers from.
+        if view.created_timestamp_field.is_none() {
+            self.reject_ambiguous_timestamps(
+                view,
+                &relation,
+                &quote_ident(key_column),
+                &source_ts_expr,
+                AmbiguityScope::WholeSource,
+            )?;
+        }
+
+        Ok(latest_per_entity_sql(
+            view,
+            &relation,
+            &quote_ident(key_column),
+            &source_ts_expr,
+        ))
+    }
+}
+
+/// A consumer of a materialization scan, one record batch at a time.
+///
+/// A trait rather than a closure because the sink is asynchronous: each batch is encoded and
+/// written to the online store before the next one is pulled off the scan, and a closure that
+/// returns a future borrowing its own captured state cannot be written as an `FnMut`.
+#[allow(async_fn_in_trait)]
+pub trait LatestBatchSink {
+    /// Consume one batch of [`Engine::scan_latest_per_entity`]'s stream.
+    ///
+    /// Args:
+    ///     batch: The view's feature columns, then the entity join key, then the winning
+    ///         row's event timestamp in microseconds.
+    ///
+    /// Returns:
+    ///     `Ok(())` once the batch is stored. An error stops the scan at this batch.
+    async fn accept(&mut self, batch: RecordBatch) -> Result<()>;
+}
+
+/// The SQL that reduces a view's source to one row per entity.
+///
+/// The tie-break is the join's: a `created_timestamp_field`, when the view declares one,
+/// decides between rows sharing a key and an event timestamp.
+fn latest_per_entity_sql(
+    view: &FeatureView,
+    relation: &str,
+    key_expr: &str,
+    source_ts_value: &str,
+) -> String {
+    let mut selected: Vec<String> = view
+        .features
+        .iter()
+        .map(|field| quote_ident(&field.name))
+        .collect();
+    selected.push(format!("{key_expr} AS {SCAN_KEY_COLUMN}"));
+    selected.push(format!("{source_ts_value} AS {SCAN_TS_COLUMN}"));
+
+    let tie_break = match &view.created_timestamp_field {
+        Some(created) => format!(", {} DESC", quote_ident(created)),
+        None => String::new(),
+    };
+
+    // A row with a null entity key has no key to be written under, and one with a null event
+    // timestamp has no freshness to record. Both are excluded here rather than streamed and
+    // then dropped, so the decision stays where the scan already is.
+    format!(
+        "SELECT {}
+         FROM {relation}
+         WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
+         QUALIFY row_number() OVER (PARTITION BY {key_expr} ORDER BY {source_ts_value} DESC{tie_break}) = 1",
+        selected.join(", ")
+    )
+}
+
+/// Pull the next batch of a streamed scan, turning the iterator's panic into a value.
+///
+/// `duckdb`'s `Arrow::next` panics when a chunk fetch or the Arrow conversion fails, rather
+/// than yielding an error, and no lazy iterator in the version we depend on yields one. This
+/// library is called across FFI, where a panic aborts the host process instead of returning a
+/// bad result, so the panic is caught here.
+///
+/// The catch depends on unwinding being enabled. Nothing in this workspace sets
+/// `panic = "abort"`; if a profile ever does, this degrades into the abort it exists to
+/// prevent and has to be revisited. The default panic hook still prints the message to
+/// stderr, because suppressing it would mean replacing a global hook.
+fn next_batch(rows: &mut Arrow<'_>, view: &str) -> Result<Option<RecordBatch>> {
+    catching_panics(|| rows.next()).map_err(|reason| Error::StreamInterrupted {
+        view: view.to_owned(),
+        reason,
+    })
+}
+
+/// Call `fetch`, returning a panic's message instead of unwinding.
+fn catching_panics<T>(fetch: impl FnOnce() -> T) -> std::result::Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch)) {
+        Ok(value) => Ok(value),
+        Err(payload) => Err(panic_message(payload.as_ref())),
+    }
+}
+
+/// A panic payload as text, which is a `String` for any `panic!` with a formatted message.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no message".to_owned()
     }
 }
 
@@ -676,6 +1079,20 @@ fn join_sql(
          )
          SELECT m.feather_row{output} FROM matched m{filter}"
     )
+}
+
+/// How much of a source the ambiguity check looks at.
+///
+/// A view that declares no `created_timestamp_field` has no rule for two rows sharing a key and
+/// an event timestamp, so which one wins would depend on the query plan. Both paths refuse that,
+/// and this says how far each has to look to find it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguityScope {
+    /// Only the keys an entity frame names, which bounds the check by the request.
+    LabelKeys,
+    /// Every key the source holds, which is what a refresh needs: it writes one row per entity
+    /// for all of them.
+    WholeSource,
 }
 
 /// A source's columns and their DuckDB type names.
@@ -1704,7 +2121,8 @@ mod tests {
             .expect("a local file needs nothing loaded");
 
         let loaded: i64 = engine
-            .connection
+            .connection()
+            .expect("connection")
             .query_row(
                 "SELECT count(*) FROM duckdb_extensions() \
                  WHERE loaded AND extension_name IN ('httpfs', 'postgres')",
@@ -1739,7 +2157,8 @@ mod tests {
 
         let engine = Engine::open(&Limits::default(), &connections).expect("engine");
         let names: String = engine
-            .connection
+            .connection()
+            .expect("connection")
             .query_row(
                 "SELECT string_agg(name, ',') FROM duckdb_secrets()",
                 [],
@@ -1763,7 +2182,8 @@ mod tests {
 
         assert!(directory.is_dir());
         let resolved: String = engine
-            .connection
+            .connection()
+            .expect("connection")
             .query_row("SELECT current_setting('extension_directory')", [], |row| {
                 row.get(0)
             })
@@ -1880,7 +2300,8 @@ mod tests {
         })
         .expect("engine");
         constrained
-            .connection
+            .connection()
+            .expect("connection")
             .execute_batch("SET threads = 2")
             .expect("threads");
         let result = constrained
@@ -1890,5 +2311,100 @@ mod tests {
         assert_eq!(result.num_rows(), unconstrained.num_rows());
         assert_eq!(rows(&result), rows(&unconstrained));
         assert_eq!(counts(&result), counts(&unconstrained));
+    }
+
+    /// A sink that counts what it was handed, for tests that only need the scan to run.
+    #[derive(Default)]
+    struct Counted(usize);
+
+    impl LatestBatchSink for Counted {
+        async fn accept(&mut self, batch: RecordBatch) -> Result<()> {
+            self.0 += batch.num_rows();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panic_inside_a_scan_becomes_an_error_rather_than_unwinding() {
+        // `duckdb`'s Arrow iterator panics when a chunk fetch or the Arrow conversion fails, and
+        // there is no lazy iterator that yields an error instead. This is the shim that puts the
+        // failure back into the return type, and it is exercised directly because a genuine
+        // mid-scan fetch failure cannot be forced from a test. The two payload shapes are the two
+        // `panic!` produces, plus one with no message at all.
+        let borrowed = catching_panics(|| -> Option<RecordBatch> { panic!("boom") })
+            .expect_err("a panic is an error");
+        assert_eq!(borrowed, "boom");
+
+        let owned = catching_panics(|| -> Option<RecordBatch> {
+            std::panic::panic_any(String::from("owned"))
+        })
+        .expect_err("a panic is an error");
+        assert_eq!(owned, "owned");
+
+        let bare = catching_panics(|| -> Option<RecordBatch> { std::panic::panic_any(7u8) })
+            .expect_err("a panic is an error");
+        assert_eq!(bare, "a panic with no message");
+
+        // And a scan that does not panic is unaffected.
+        let kept = catching_panics(|| 7u8).expect("no panic");
+        assert_eq!(kept, 7);
+    }
+
+    #[tokio::test]
+    async fn a_scan_over_a_source_that_disappeared_returns_an_error_and_the_engine_answers() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+        let declared = view(&source.string(), None);
+        let engine = engine();
+
+        // The fixture removes its file when it is dropped, so the source a view names is gone by
+        // the time anything reads it. The failure comes back as a value, which is the property
+        // that matters for a library called across FFI: a panic here would abort the host.
+        drop(source);
+
+        let mut sink = Counted::default();
+        let failed = engine.scan_latest_per_entity(&declared, &mut sink).await;
+        assert!(
+            failed.is_err(),
+            "a source that cannot be read has to be an error, not a panic"
+        );
+        assert_eq!(sink.0, 0);
+
+        // The engine is usable afterwards, which is what a caller does next.
+        let other = Parquet::write(&integer_source(&[(1, 300, 30)]));
+        let mut again = Counted::default();
+        engine
+            .scan_latest_per_entity(&view(&other.string(), None), &mut again)
+            .await
+            .expect("the engine still answers");
+        assert_eq!(again.0, 1);
+    }
+
+    #[test]
+    fn a_discarded_connection_is_opened_again_by_the_next_query() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+        let engine = engine();
+        let options = JoinOptions::default();
+        let joined = engine
+            .point_in_time_join(
+                &labels(&[(Some(1), 150)]),
+                &view(&source.string(), None),
+                &options,
+            )
+            .expect("join");
+        assert_eq!(counts(&joined), [Some(10)]);
+
+        // What a caught panic inside a scan does to the connection: it is dropped, because a
+        // panic during a fetch leaves DuckDB's session state unknown and reusing it would be
+        // worse than the failure that was just caught.
+        engine.discard_connection();
+
+        let reopened = engine
+            .point_in_time_join(
+                &labels(&[(Some(1), 150)]),
+                &view(&source.string(), None),
+                &options,
+            )
+            .expect("join through a fresh connection");
+        assert_eq!(counts(&reopened), [Some(10)]);
     }
 }

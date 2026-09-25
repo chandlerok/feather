@@ -17,6 +17,9 @@
 //! colocated by construction. A project-level tag would force every entity in the
 //! project into a single slot, which is the opposite of what a cluster is for.
 
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::{DataType, Int32Type, Int64Type};
+
 use crate::error::{Error, Result};
 
 /// Cap on a single entity key component, so one pathological key cannot produce
@@ -175,6 +178,99 @@ pub fn parse_entity_hash_key(key: &[u8]) -> Result<(&str, &str, &[u8])> {
     ))
 }
 
+/// The bytes of one entity join-key value, as the key encoder carries them.
+///
+/// An integer key is its decimal form and a string key is its UTF-8 bytes, which is the shape
+/// the encoder's own doctests use.
+///
+/// Two callers share this conversion, and they are the two sides of one key: the write path
+/// reads a source's join key column and encodes it, and the serving read path reads the join key
+/// column of a caller's entity frame and encodes it. Both go through here so that a value written
+/// under a key and later looked up by the same value cannot disagree about what that key is. A
+/// serving caller that built its own key bytes would be the way that agreement breaks, which is
+/// why the binding encodes from the frame rather than exposing [`encode_entity_key`] upward.
+///
+/// Args:
+///     column: The column holding the join key.
+///     row: The row to read.
+///
+/// Returns:
+///     The component's bytes, ready for [`encode_entity_key`].
+///
+/// Raises:
+///     [`Error::NullEntityKey`] if the value is null. A null cannot address an entity, and
+///         encoding it as an empty component would name a different one.
+///     [`Error::UnsupportedKeyType`] if the column is neither an integer nor a string. The two
+///         types are what the write path can read out of a source and the read path out of a
+///         frame, and they are exactly the set
+///         [`crate::offline::Engine::scan_latest_per_entity`] admits, so a key that reaches a
+///         write or a read is one this function carries.
+pub fn entity_key_component(column: &dyn Array, row: usize) -> Result<Vec<u8>> {
+    if column.is_null(row) {
+        return Err(Error::NullEntityKey);
+    }
+    match column.data_type() {
+        DataType::Int32 => Ok(column
+            .as_primitive::<Int32Type>()
+            .value(row)
+            .to_string()
+            .into_bytes()),
+        DataType::Int64 => Ok(column
+            .as_primitive::<Int64Type>()
+            .value(row)
+            .to_string()
+            .into_bytes()),
+        DataType::Utf8 => Ok(column.as_string::<i32>().value(row).as_bytes().to_vec()),
+        other => Err(Error::UnsupportedKeyType {
+            dtype: other.to_string(),
+        }),
+    }
+}
+
+/// Whether a key has the shape of an entity hash, `project:{entity}:{len}:{value}`.
+///
+/// Garbage collection walks a project's keyspace and must not send `HDEL` to a key that is
+/// not a hash, where the server answers `WRONGTYPE` and a refresh fails over a key that has
+/// nothing to do with the view being retired. The encoded tail has to decode, which is the
+/// `{len}:` suffix that also keeps `{project}:views` from looking like an entity named
+/// `views`.
+///
+/// Args:
+///     key: The key as it exists in the store.
+///     project: The project the key is expected to belong to.
+///
+/// Returns:
+///     `true` when the key parses as this project's entity hash.
+pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
+    match parse_entity_hash_key(key) {
+        Ok((found, _, encoded)) => found == project && decode_entity_key(encoded).is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// The project registry key, `{project}:views`.
+///
+/// A hash whose fields are the declared view names and whose values are each view's newest
+/// event timestamp in microseconds, encoded the way [`crate::online::encode_freshness`]
+/// encodes a freshness field. One key serves three purposes: the declared view set garbage
+/// collection diffs against, a per-view freshness source for metrics, and a signal that a
+/// refresh happened.
+///
+/// The project name is not escaped, because a key is not a pattern. A caller that turns it
+/// into one has to escape it itself; [`crate::online::ProjectScan`] is where that happens.
+///
+/// Args:
+///     project: The project name.
+///
+/// Returns:
+///     The registry key.
+pub fn views_registry_key(project: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(project.len() + b":views".len());
+    out.extend_from_slice(project.as_bytes());
+    out.extend_from_slice(b":views");
+    out
+}
+
 /// The field name holding a view's freshness timestamp.
 pub fn freshness_field(view: &str) -> String {
     format!("f:{view}")
@@ -289,5 +385,66 @@ mod tests {
     fn field_names_are_namespaced() {
         assert_eq!(value_field("clicks"), "v:clicks");
         assert_eq!(freshness_field("clicks"), "f:clicks");
+    }
+
+    #[test]
+    fn a_registry_key_is_not_an_entity_hash() {
+        assert_eq!(views_registry_key("ads"), b"ads:views");
+        assert!(!is_entity_hash_key(&views_registry_key("ads"), "ads"));
+    }
+
+    #[test]
+    fn an_entity_hash_is_recognised_for_its_own_project_only() {
+        let encoded = encode_entity_key(&[b"u1"]).unwrap();
+        let key = entity_hash_key("ads", "user", &encoded);
+        assert!(is_entity_hash_key(&key, "ads"));
+        assert!(!is_entity_hash_key(&key, "other"));
+    }
+
+    #[test]
+    fn a_key_that_only_looks_like_one_is_left_alone() {
+        for bad in [
+            &b"ads:views:x:y"[..],
+            b"ads",
+            b"ads:user",
+            b"ads:user:2:u1|",
+        ] {
+            assert!(
+                !is_entity_hash_key(bad, "ads"),
+                "expected {bad:?} to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_integer_key_component_is_its_decimal_form() {
+        use arrow::array::{Int32Array, Int64Array};
+        let wide = Int64Array::from(vec![Some(123), None]);
+        assert_eq!(entity_key_component(&wide, 0).unwrap(), b"123");
+        assert!(matches!(
+            entity_key_component(&wide, 1),
+            Err(Error::NullEntityKey)
+        ));
+
+        let narrow = Int32Array::from(vec![7]);
+        assert_eq!(entity_key_component(&narrow, 0).unwrap(), b"7");
+    }
+
+    #[test]
+    fn a_string_key_component_is_its_own_bytes() {
+        use arrow::array::StringArray;
+        let text = StringArray::from(vec!["a|b", ""]);
+        assert_eq!(entity_key_component(&text, 0).unwrap(), b"a|b");
+        assert_eq!(entity_key_component(&text, 1).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_key_type_the_encoder_cannot_carry_is_refused_by_name() {
+        use arrow::array::Float64Array;
+        let floats = Float64Array::from(vec![1.5]);
+        match entity_key_component(&floats, 0) {
+            Err(Error::UnsupportedKeyType { dtype }) => assert_eq!(dtype, "Float64"),
+            other => panic!("expected an unsupported key type, got {other:?}"),
+        }
     }
 }

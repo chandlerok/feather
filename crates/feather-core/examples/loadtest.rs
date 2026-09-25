@@ -29,7 +29,7 @@ use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray
 use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
 use feather_core::online::{
-    EntityRequest, OnlineStore, ViewRequest, ViewValues, WriteBatch, read_entities,
+    EntityRequest, OnlineStore, ViewRequest, ViewValues, WriteBatch, WrittenField, read_entities,
 };
 use feather_core::value::encode_batch;
 use feather_core::{Result, ValkeyStore};
@@ -169,8 +169,8 @@ async fn run() -> Result<()> {
                 batches.push(WriteBatch {
                     key: key.clone(),
                     fields: vec![
-                        (value_field(name), encode_vector(v, e)),
-                        (freshness_field(name), now.to_le_bytes().to_vec()),
+                        WrittenField::new(value_field(name), encode_vector(v, e), None),
+                        WrittenField::new(freshness_field(name), now.to_le_bytes().to_vec(), None),
                     ],
                 });
             }

@@ -18,6 +18,12 @@ pub enum Error {
     #[error("malformed encoded entity key: {reason}")]
     MalformedEntityKey { reason: String },
 
+    #[error("an entity key value is null, and a null addresses no entity")]
+    NullEntityKey,
+
+    #[error("an entity key of type {dtype} cannot be encoded; a key is an integer or a string")]
+    UnsupportedKeyType { dtype: String },
+
     #[error("value is truncated: need {need} bytes, have {have}")]
     TruncatedValue { need: usize, have: usize },
 
@@ -174,6 +180,10 @@ pub enum Error {
         #[source]
         source: duckdb::Error,
     },
+
+    #[cfg(feature = "offline")]
+    #[error("view `{view}` failed while its source was scanned: {reason}")]
+    StreamInterrupted { view: String, reason: String },
 
     /// A source that could not be read, attributed to the view that reads it.
     ///

@@ -22,11 +22,53 @@ use crate::error::{Error, Result};
 use crate::key::{freshness_field, value_field};
 use crate::value::{SchemaTag, decode_batch};
 
-/// One `HSET`: a hash key and the fields to write into it.
+/// One field of a write: its value, and when it stops being readable.
+///
+/// The expiry rides with the value rather than in a call of its own because the two belong
+/// together: a field written without the expiry that is meant to reclaim it is a field the
+/// server keeps until its hash is rewritten or deleted. The unit is named in the field rather
+/// than left to the reader, because a bare `i64` expiry inside a codec that otherwise counts
+/// microseconds is a bug waiting to happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenField {
+    pub name: String,
+    pub value: Vec<u8>,
+    /// Absolute expiry as seconds since the Unix epoch, or `None` for a field that never
+    /// expires.
+    ///
+    /// Absolute rather than a TTL: a value that is already older than its TTL has to expire at
+    /// once, and a relative TTL measured from the write would give it a second lease on life.
+    pub expires_at_unix_secs: Option<i64>,
+}
+
+impl WrittenField {
+    /// A field, with an absolute expiry when it has one.
+    ///
+    /// Args:
+    ///     name: The field name.
+    ///     value: The encoded value.
+    ///     expires_at_unix_secs: When the field stops being readable, or `None` to leave it to
+    ///         the read-time check alone.
+    ///
+    /// Returns:
+    ///     The field.
+    pub fn new(name: impl Into<String>, value: Vec<u8>, expires_at_unix_secs: Option<i64>) -> Self {
+        Self {
+            name: name.into(),
+            value,
+            expires_at_unix_secs,
+        }
+    }
+}
+
+/// One write: a hash key and the fields to set in it.
+///
+/// "Set" rather than "insert", because a field already in the hash is overwritten. That is
+/// what makes a full refresh safe to re-run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBatch {
     pub key: Vec<u8>,
-    pub fields: Vec<(String, Vec<u8>)>,
+    pub fields: Vec<WrittenField>,
 }
 
 /// One `HMGET`: a hash key and the fields to read from it.
@@ -42,6 +84,10 @@ pub struct ReadRequest {
 pub trait OnlineStore {
     /// Write fields into hashes. Fields not mentioned are left alone, which is
     /// what makes a full refresh safe to re-run.
+    ///
+    /// A field may carry an absolute expiry. A store that cannot honour one writes the value
+    /// anyway: the read-time TTL check in [`read_entities`] is what decides whether a value is
+    /// served, so an unexpired leftover costs reclamation and never correctness.
     async fn write(&mut self, batches: &[WriteBatch]) -> Result<()>;
 
     /// Read fields from hashes, one `HMGET` per request, in request order.
@@ -53,6 +99,72 @@ pub trait OnlineStore {
 
     /// Remove fields, used when a view is retired.
     async fn delete_fields(&mut self, keys_and_fields: &[(Vec<u8>, Vec<String>)]) -> Result<()>;
+}
+
+/// The reads that look at a project's whole keyspace rather than at one hash in it.
+///
+/// Deliberately separate from [`OnlineStore`] rather than a method on it. `read_entities` bounds
+/// its store by that trait, and the serving path has no business reaching for a keyspace walk:
+/// the narrowness of that trait is what keeps the cost of a read explicable. A refresh is the
+/// only caller.
+#[allow(async_fn_in_trait)]
+pub trait ProjectScan {
+    /// Every field of one hash, as `(name, value)` pairs, and empty when there is no such key.
+    ///
+    /// A whole hash rather than named fields, which is what [`OnlineStore::read`] takes, because
+    /// the project registry is read to learn which fields it holds. Asking for them one at a
+    /// time would mean knowing the answer in advance.
+    ///
+    /// Args:
+    ///     key: The hash key.
+    ///
+    /// Returns:
+    ///     Each field with its value. An absent key yields an empty list rather than an error,
+    ///     which is the first refresh of a project.
+    async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>>;
+
+    /// Every key in a project's namespace except `exclude`, which is compared exactly.
+    ///
+    /// Used to find the entity hashes a retired view's fields may still sit in. An entity that
+    /// the retired view used to cover does not have to appear in the source any more, so there
+    /// is no way to enumerate them from the declarations: the keyspace itself is the only
+    /// complete list.
+    ///
+    /// Args:
+    ///     project: The project whose keys are wanted.
+    ///     exclude: A key to leave out. The caller names the project registry, which lives
+    ///         under the same prefix and is not an entity hash.
+    ///
+    /// Returns:
+    ///     The keys, in no particular order. The caller filters them further; this is a key
+    ///     listing, not a promise that every key in it is an entity hash.
+    async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>>;
+}
+
+/// The key prefix every key of a project shares.
+///
+/// One spelling of the prefix, so a walk and a filter cannot disagree about where a project's
+/// keys start.
+pub fn project_key_prefix(project: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(project.len() + 1);
+    prefix.extend_from_slice(project.as_bytes());
+    prefix.push(b':');
+    prefix
+}
+
+/// A project name escaped for a `SCAN` pattern.
+///
+/// `MATCH` reads `*`, `?`, `[` and `\` as pattern syntax, so a project named `ads*` would
+/// otherwise walk another project's keys. Backslash is the escape for all four.
+pub fn glob_escape(project: &str) -> String {
+    let mut escaped = String::with_capacity(project.len());
+    for character in project.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Why a view's values are not usable for an entity.
@@ -341,8 +453,12 @@ mod tests {
             .write(&[WriteBatch {
                 key,
                 fields: vec![
-                    (value_field(&view.name), encoded_vector(view, value)),
-                    (freshness_field(&view.name), encode_freshness(freshness)),
+                    WrittenField::new(value_field(&view.name), encoded_vector(view, value), None),
+                    WrittenField::new(
+                        freshness_field(&view.name),
+                        encode_freshness(freshness),
+                        None,
+                    ),
                 ],
             }])
             .await
@@ -520,6 +636,54 @@ mod tests {
             read_entities(&store, "ads", &many, &[entity], NOW).await,
             Err(Error::MixedEntities { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_keyspace_scan_returns_the_entity_hashes_and_not_the_registry() {
+        use crate::key::views_registry_key;
+        let mut store = MemoryStore::new();
+        let registry = views_registry_key("ads");
+        let mut keys = vec![registry.clone()];
+        for entity in [b"u1".as_slice(), b"u2".as_slice()] {
+            let key = crate::key::entity_hash_key("ads", "user_id", entity);
+            store
+                .write(&[WriteBatch {
+                    key: key.clone(),
+                    fields: vec![WrittenField::new(
+                        crate::key::value_field("clicks"),
+                        vec![1],
+                        None,
+                    )],
+                }])
+                .await
+                .unwrap();
+            keys.push(key);
+        }
+        store
+            .write(&[WriteBatch {
+                key: registry.clone(),
+                fields: vec![WrittenField::new("clicks", vec![2], None)],
+            }])
+            .await
+            .unwrap();
+
+        let mut scanned = store.scan_entity_keys("ads", &registry).await.unwrap();
+        scanned.sort();
+        keys.remove(0);
+        keys.sort();
+        assert_eq!(scanned, keys);
+
+        // Another project shares no prefix with this one.
+        assert!(
+            store
+                .scan_entity_keys("other", b"other:views")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let fields = store.hash_fields(&registry).await.unwrap();
+        assert_eq!(fields, vec![("clicks".to_owned(), vec![2])]);
     }
 
     #[tokio::test]

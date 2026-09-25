@@ -5,27 +5,76 @@
 //! [`crate::online::read_entities`], a request for N entities over M views costs
 //! one round trip and N commands, not N x M.
 //!
-//! > `ponytail:` fields are written with plain `HSET`, so an expired value is
-//! > reclaimed only when its hash is rewritten. The read-time TTL check in
-//! > `read_entities` is the authoritative path and is unaffected, so this is a
-//! > reclamation gap rather than a correctness one. The upgrade is `HSETEX` with
-//! > an absolute `PXAT` derived from the event timestamp plus the TTL, which
-//! > needs the write batch to carry a per-view expiry. Verified available on
-//! > Valkey 9.1.2; see "TTL and reclamation" in the architecture document.
+//! A field that carries an absolute expiry is written with a server-side expiry, so the server
+//! reclaims it without waiting for its hash to be rewritten. Which command does that is decided
+//! once per connection from what the server answers, because the family is younger than the
+//! servers in the field: `HEXPIREAT` is a Redis 7.4 addition and `HSETEX` is a Redis 8.0 one.
+//! The read-time TTL check in `read_entities` remains the authoritative path, so a server
+//! without either command stores the same bytes and only reclaims them later. See "TTL and
+//! reclamation" in the architecture document.
+
+use std::collections::BTreeMap;
 
 use redis::RedisResult;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 
-use super::{OnlineStore, ReadRequest, WriteBatch};
+use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, WrittenField};
 use crate::error::Result;
 
 /// Commands per pipeline flush. Large enough to amortise the round trip, small
 /// enough that one flush does not hold a multi-megabyte request buffer.
 const DEFAULT_CHUNK: usize = 1024;
 
+/// How many keys one `SCAN` step is asked to return. A hint to the server, not a bound on the
+/// reply, and large enough that a project of any size takes few steps.
+const SCAN_COUNT: usize = 1024;
+
+/// How a server sets an absolute expiry on a hash field, decided once per connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldExpiry {
+    /// `HSETEX`, which sets a value and its expiry in one command. A Redis 8.0 addition.
+    Setex,
+    /// `HSET` followed by `HEXPIREAT`. Redis 7.4 and later, so it is the wider floor.
+    Expireat,
+    /// Neither, so a field is reclaimed only when its hash is rewritten or deleted.
+    None,
+}
+
+/// Detect how a server expires a hash field by asking it about the commands.
+///
+/// A capability probe rather than a version comparison, because the versions do not line up:
+/// Valkey and Redis number their releases differently, and the two commands arrived in
+/// different ones. `COMMAND INFO` answers with a one-element array holding nil for a command
+/// the server does not know.
+async fn detect_field_expiry(connection: &mut ConnectionManager) -> FieldExpiry {
+    if server_knows(connection, "HSETEX").await {
+        FieldExpiry::Setex
+    } else if server_knows(connection, "HEXPIREAT").await {
+        FieldExpiry::Expireat
+    } else {
+        FieldExpiry::None
+    }
+}
+
+/// Whether a server knows a command, asked once when a connection is opened.
+async fn server_knows(connection: &mut ConnectionManager, command: &str) -> bool {
+    let reply: RedisResult<redis::Value> = redis::cmd("COMMAND")
+        .arg("INFO")
+        .arg(command)
+        .query_async(connection)
+        .await;
+    match reply {
+        Ok(redis::Value::Array(entries)) => entries
+            .first()
+            .is_some_and(|entry| !matches!(entry, redis::Value::Nil)),
+        _ => false,
+    }
+}
+
 pub struct ValkeyStore {
     connection: ConnectionManager,
     chunk: usize,
+    field_expiry: FieldExpiry,
 }
 
 impl ValkeyStore {
@@ -44,10 +93,12 @@ impl ValkeyStore {
         };
 
         let client = redis::Client::open(url)?;
-        let connection = client.get_connection_manager().await?;
+        let mut connection = client.get_connection_manager().await?;
+        let field_expiry = detect_field_expiry(&mut connection).await;
         Ok(Self {
             connection,
             chunk: DEFAULT_CHUNK,
+            field_expiry,
         })
     }
 
@@ -55,6 +106,23 @@ impl ValkeyStore {
     pub fn with_chunk(mut self, chunk: usize) -> Self {
         self.chunk = chunk.max(1);
         self
+    }
+
+    /// Turn server-side field expiry off, whatever this server supports.
+    ///
+    /// The settings default it off (`valkey.field_expiration`), because what gets written to
+    /// the store should not change with a server's version unless an operator said so. The
+    /// commands themselves are still chosen by what the server answers.
+    pub fn with_field_expiration(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.field_expiry = FieldExpiry::None;
+        }
+        self
+    }
+
+    /// How this store expires a hash field on the server it is connected to.
+    pub fn field_expiry(&self) -> FieldExpiry {
+        self.field_expiry
     }
 
     /// Connect with a push sender for invalidation messages, and register a
@@ -90,9 +158,11 @@ impl ValkeyStore {
             .arg(prefix);
         let _: RedisResult<()> = command.query_async(&mut connection).await?;
 
+        let field_expiry = detect_field_expiry(&mut connection).await;
         Ok(Self {
             connection,
             chunk: DEFAULT_CHUNK,
+            field_expiry,
         })
     }
 }
@@ -102,12 +172,7 @@ impl OnlineStore for ValkeyStore {
         for group in batches.chunks(self.chunk) {
             let mut pipeline = redis::pipe();
             for batch in group {
-                let mut command = redis::cmd("HSET");
-                command.arg(&batch.key);
-                for (field, value) in &batch.fields {
-                    command.arg(field).arg(value);
-                }
-                pipeline.add_command(command);
+                queue_write(&mut pipeline, batch, self.field_expiry);
             }
             let _: redis::Value = pipeline.query_async(&mut self.connection).await?;
         }
@@ -149,5 +214,118 @@ impl OnlineStore for ValkeyStore {
             let _: redis::Value = pipeline.query_async(&mut self.connection).await?;
         }
         Ok(())
+    }
+}
+
+/// Queue the commands that write one batch.
+///
+/// The fields are grouped by their expiry, because `HSETEX` and `HEXPIREAT` each take one
+/// time for every field they list. A batch normally holds one expiring field, the view's
+/// value, and one field that never expires, its freshness, so a view with a TTL costs one more
+/// command than one without. Both commands are queued before the pipeline is flushed, so no
+/// reader ever sees the value without its expiry, and the extra command is not an extra round
+/// trip.
+fn queue_write(pipeline: &mut redis::Pipeline, batch: &WriteBatch, expiry: FieldExpiry) {
+    let mut groups: BTreeMap<Option<i64>, Vec<&WrittenField>> = BTreeMap::new();
+    for field in &batch.fields {
+        groups
+            .entry(field.expires_at_unix_secs)
+            .or_default()
+            .push(field);
+    }
+
+    for (expires_at, fields) in groups {
+        match (expires_at, expiry) {
+            (Some(at), FieldExpiry::Setex) => {
+                let mut command = redis::cmd("HSETEX");
+                command
+                    .arg(&batch.key)
+                    .arg("EXAT")
+                    .arg(at)
+                    .arg("FIELDS")
+                    .arg(fields.len());
+                for field in fields {
+                    command.arg(&field.name).arg(&field.value);
+                }
+                pipeline.add_command(command);
+            }
+            (Some(at), FieldExpiry::Expireat) => {
+                queue_hset(pipeline, &batch.key, &fields);
+                let mut command = redis::cmd("HEXPIREAT");
+                command
+                    .arg(&batch.key)
+                    .arg(at)
+                    .arg("FIELDS")
+                    .arg(fields.len());
+                for field in fields {
+                    command.arg(&field.name);
+                }
+                pipeline.add_command(command);
+            }
+            // Either the field never expires or the server cannot expire a field. Without
+            // server support the value is still correct; it is reclaimed when its hash is
+            // rewritten, and the read-time TTL check is what decides whether it is served.
+            (None, _) | (Some(_), FieldExpiry::None) => {
+                queue_hset(pipeline, &batch.key, &fields);
+            }
+        }
+    }
+}
+
+/// Queue one `HSET` for a set of fields.
+fn queue_hset(pipeline: &mut redis::Pipeline, key: &[u8], fields: &[&WrittenField]) {
+    if fields.is_empty() {
+        return;
+    }
+    let mut command = redis::cmd("HSET");
+    command.arg(key);
+    for field in fields {
+        command.arg(&field.name).arg(&field.value);
+    }
+    pipeline.add_command(command);
+}
+
+impl ProjectScan for ValkeyStore {
+    async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut connection = self.connection.clone();
+        // Typed as a map so the reply is read as field-value pairs whether the connection is
+        // RESP2 or RESP3; the store asks for RESP3, where `HGETALL` is a map, and a RESP2 reply
+        // is a flat array that converts to the same thing. An absent key answers nil, which
+        // converts to an empty map.
+        let fields: BTreeMap<String, Vec<u8>> = redis::cmd("HGETALL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await?;
+        Ok(fields.into_iter().collect())
+    }
+
+    async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut connection = self.connection.clone();
+        let pattern = format!("{}*", crate::online::glob_escape(project));
+        let mut keys = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            // `SCAN` with a bounded `COUNT`, never `KEYS`: a walk that blocks the server for its
+            // whole duration is not something a refresh may do to a serving instance. The count
+            // is a hint, so the reply's length is not the bound; the loop ends when the server
+            // returns cursor 0.
+            let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query_async(&mut connection)
+                .await?;
+            for key in batch {
+                if key.as_slice() != exclude {
+                    keys.push(key);
+                }
+            }
+            cursor = next;
+            if cursor == 0 {
+                return Ok(keys);
+            }
+        }
     }
 }

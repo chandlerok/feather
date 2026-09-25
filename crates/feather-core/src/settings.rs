@@ -152,11 +152,12 @@ impl Connection {
                 check_present(database, &format!("connections.{name}.database"))?;
                 check_present(user, &format!("connections.{name}.user"))?;
                 if let Some(mode) = ssl_mode {
-                    // Checked here rather than at the connection, so a typo names the key it
-                    // is in instead of surfacing as a libpq error at the first read. The set
-                    // is libpq's own, not the `disable`/`require`/`verify-*` subset a locked
+                    // Checked here rather than at the connection, so a typo names the key it is
+                    // in instead of surfacing as a libpq error at the first read. The set is
+                    // libpq's own, not the `disable`/`require`/`verify-*` subset a locked
                     // down deployment writes: `allow` and `prefer` are real values, and
-                    // refusing them would reject a working connection.
+                    // refusing them would reject a working connection. The comparison is exact
+                    // because libpq's is; see `POSTGRES_SSL_MODES`.
                     if !POSTGRES_SSL_MODES.contains(&mode.as_str()) {
                         return Err(Error::MalformedSettings {
                             reason: format!(
@@ -234,10 +235,23 @@ fn enabled_by_default() -> bool {
     true
 }
 
-/// The `sslmode` values libpq accepts.
+/// The `sslmode` values libpq accepts, in the one case it accepts them in.
 ///
 /// The whole set, not the subset a locked down deployment writes: `allow` and `prefer` are
-/// real values, so a check against the subset would reject a connection that works.
+/// real values, so a check against the subset would reject a connection that works. Lower case
+/// is not a convention here, it is the only spelling that works: libpq compares the value
+/// exactly, so `sslmode=REQUIRE` is refused while `require` reaches the TLS negotiation.
+/// Verified against the compose server rather than read out of libpq's documentation, because
+/// the question was what this libpq accepts:
+///
+/// ```text
+/// $ psql "host=127.0.0.1 port=5433 dbname=feathertest user=feathertest sslmode=REQUIRE" -c 'select 1'
+/// psql: error: invalid sslmode value: "REQUIRE"
+/// ```
+///
+/// So the check below stays exact. Accepting upper case and normalising it would make Feather
+/// more permissive than the client it hands the value to, which is the same defect in the other
+/// direction as a check that refuses a value the client would have taken.
 const POSTGRES_SSL_MODES: [&str; 6] = [
     "disable",
     "allow",
@@ -274,8 +288,10 @@ fn conninfo_value(value: &str) -> String {
 pub struct Valkey {
     pub endpoint: String,
     pub tls: bool,
-    /// Needs Valkey 9.0+ or Redis 8.0+ for native field expiration. `false` is the
-    /// conservative default, since older servers fall back to read-time TTL checks.
+    /// Needs a server that can expire a hash field: `HEXPIREAT` landed in Redis 7.4 and
+    /// `HSETEX` in Redis 8.0, and Valkey carries the family from 9.0. `false` is the
+    /// conservative default, since a server without either falls back to the read-time TTL
+    /// check, which is authoritative either way.
     #[serde(default)]
     pub field_expiration: bool,
 }
