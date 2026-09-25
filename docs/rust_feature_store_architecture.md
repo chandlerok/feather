@@ -264,12 +264,18 @@ separator: the parser reads the length, consumes exactly that many bytes, then e
 separator. That leaves no escaping rule to get wrong and no restriction on key contents,
 while staying readable in `valkey-cli`.
 
-Three consequences:
+Four consequences:
 
 - **All of a view's entities must be supplied.** Partial-key lookups are rejected at
   validation time rather than producing a key that can never match.
 - **Component length is capped** at 512 bytes, so one pathological key cannot produce an
   unbounded Valkey key.
+- **A colon is refused in the project name and in every entity name.** Reading a project back
+  out of a key means splitting on the first two colons, so a colon inside either name is
+  ambiguous rather than escapable: garbage collection would fail to recognise those keys and
+  skip them, leaking the fields it was meant to reclaim. The loader refuses such a name instead
+  of writing keys it cannot read back. That is a breaking change for a `project` value that
+  previously loaded.
 - **No cluster hash tag, permanently.** One hash is already one slot, so every field of an
   entity is colocated by construction. A project-level hash tag would force every entity in
   the project into a single slot, which is the opposite of what a cluster is for. Reading N
