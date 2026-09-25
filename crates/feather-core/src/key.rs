@@ -181,9 +181,14 @@ pub fn parse_entity_hash_key(key: &[u8]) -> Result<(&str, &str, &[u8])> {
 /// The bytes of one entity join-key value, as the key encoder carries them.
 ///
 /// An integer key is its decimal form and a string key is its UTF-8 bytes, which is the shape
-/// the encoder's own doctests use. The write path and the online read path both convert
-/// through here, so a value written under a key and looked up by the same value cannot
-/// disagree about what that key is.
+/// the encoder's own doctests use.
+///
+/// Two callers share this conversion, and they are the two sides of one key: the write path
+/// reads a source's join key column and encodes it, and the serving read path reads the join key
+/// column of a caller's entity frame and encodes it. Both go through here so that a value written
+/// under a key and later looked up by the same value cannot disagree about what that key is. A
+/// serving caller that built its own key bytes would be the way that agreement breaks, which is
+/// why the binding encodes from the frame rather than exposing [`encode_entity_key`] upward.
 ///
 /// Args:
 ///     column: The column holding the join key.
@@ -195,8 +200,11 @@ pub fn parse_entity_hash_key(key: &[u8]) -> Result<(&str, &str, &[u8])> {
 /// Raises:
 ///     [`Error::NullEntityKey`] if the value is null. A null cannot address an entity, and
 ///         encoding it as an empty component would name a different one.
-///     [`Error::UnsupportedKeyType`] if the column is neither an integer nor a string, which
-///         is the set [`crate::offline`] accepts for a source key.
+///     [`Error::UnsupportedKeyType`] if the column is neither an integer nor a string. The two
+///         types are what the write path can read out of a source and the read path out of a
+///         frame, and they are exactly the set
+///         [`crate::offline::Engine::scan_latest_per_entity`] admits, so a key that reaches a
+///         write or a read is one this function carries.
 pub fn entity_key_component(column: &dyn Array, row: usize) -> Result<Vec<u8>> {
     if column.is_null(row) {
         return Err(Error::NullEntityKey);

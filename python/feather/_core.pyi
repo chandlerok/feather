@@ -25,10 +25,72 @@ class ArrowStreamExportable(Protocol):
         """Export the data as an Arrow C stream capsule."""
         ...
 
+class ViewRefresh:
+    """One view's refresh, as :meth:`FeatureStore.materialize` reports it."""
+
+    name: str
+    rows: int
+    max_event_timestamp_micros: int | None
+    """The newest event timestamp any written row carried, in microseconds since the epoch, or
+    ``None`` when the refresh wrote no rows."""
+    elapsed_seconds: float
+
+class MaterializeReport:
+    """What one call to :meth:`FeatureStore.materialize` did."""
+
+    views: list[ViewRefresh]
+    retired: list[str]
+    """The views a previous refresh declared and this one does not, whose fields were removed.
+    Empty on every run but the one that follows a rename or a removal."""
+    total_rows: int
+    elapsed_seconds: float
+
 class FeatureStore:
-    """A project's definitions, and the DuckDB engine that joins them."""
+    """A project's definitions, the engine that joins them, and the store they are served from."""
 
     def __init__(self, settings_path: str, definitions_json: str) -> None: ...
+    def materialize(self, views: list[str] | None = None) -> MaterializeReport:
+        """Refresh feature values from their sources into the online store.
+
+        Args:
+            views: The views to refresh, by name, or ``None`` for every view the project
+                declares.
+
+        Returns:
+            What each refreshed view wrote, and the views this run retired.
+
+        Raises:
+            ValueError: If a named view is not declared, or a source cannot be read as its view
+                declares it.
+            ConnectionError: If the settings declare a Valkey that cannot be reached.
+        """
+        ...
+    def get_online_features(
+        self,
+        entity_frame: ArrowStreamExportable,
+        features: list[str],
+    ) -> ArrowStreamExportable:
+        """Read feature values for a frame of entities from the online store.
+
+        Args:
+            entity_frame: The entities to read, exporting Arrow buffers through
+                ``__arrow_c_stream__``. Its join key column is named after the views' entity.
+            features: ``view:feature`` references, in the order the caller wants the columns
+                back.
+
+        Returns:
+            The entity frame's own columns in input order, then one column per requested feature
+            in request order. A value that is missing, expired, or stored under a schema the
+            definition no longer matches is a null.
+
+        Raises:
+            ValueError: If a reference is malformed, names an unknown view or feature, or is
+                requested twice; if the requested views are keyed on different join keys; if
+                ``entity_frame`` lacks the join key column or holds a null in it; or if a
+                requested feature name collides with a column of the frame.
+            ConnectionError: If the settings declare a Valkey that cannot be reached.
+        """
+        ...
     def get_historical_features(
         self,
         entity_frame: ArrowStreamExportable,

@@ -33,7 +33,12 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 
 [features]
-default = ["offline"]
+# `valkey` is a default here, unlike in feather-core, because the Python surface is the one a
+# project's `feather.toml` is read by: a settings file may declare a Valkey, and a wheel that
+# could not use one would fail at the first online call with "this build has no Valkey support".
+# Local mode still needs nothing, and the extra dependency is redis plus the tokio the store
+# already runs on.
+default = ["offline", "valkey"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
 # tests the engines, and so a build can drop DuckDB with --no-default-features.
 offline = ["feather-core/offline"]

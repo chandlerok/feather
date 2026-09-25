@@ -1,4 +1,4 @@
-"""The project read path: declared definitions in, a training set out.
+"""The project paths: declared definitions in, a training set or an online read out.
 
 Definitions are imported rather than compiled, so there is no registry and no
 generated artifact. What this module adds is the resolution the core cannot do
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     import os
     from collections.abc import Sequence
 
-    from feather._core import ArrowStreamExportable
+    from feather._core import ArrowStreamExportable, MaterializeReport
 
 MissingPolicy = Literal["null", "drop"]
 """What to do with a label row whose features are missing or expired."""
@@ -133,6 +133,75 @@ class FeatureStore:
             strict,
             on_missing,
         )
+
+    def materialize(self, views: Sequence[str] | None = None) -> MaterializeReport:
+        """Refresh feature values from their sources into the online store.
+
+        A full refresh: every selected view is recomputed from its source and every value is
+        overwritten in place. There is no watermark and no partial state, so a run that fails
+        leaves the previous run's values where they were and the call can be repeated without
+        reconciling anything. A view that a previous refresh declared and this one does not is
+        retired: its fields are removed from every entity that still carries them, and it leaves
+        the project's view registry.
+
+        Args:
+            views: The views to refresh, by name, or ``None`` for every view the project
+                declares. Refreshing a subset leaves the other views' values and their registry
+                entries alone.
+
+        Returns:
+            A report naming each refreshed view, the rows it wrote, the newest event timestamp
+            those rows carried, and how long each took, plus the views this run retired and the
+            totals across the run. The timestamp is in microseconds since the epoch, matching
+            every other timestamp in this library.
+
+        Raises:
+            ValueError: If a named view is not declared, or a source cannot be read as its view
+                declares it.
+            ConnectionError: If ``feather.toml`` declares a Valkey that cannot be reached.
+        """
+        return self._store.materialize(None if views is None else list(views))
+
+    def get_online_features(
+        self,
+        entity_df: ArrowStreamExportable,
+        features: Sequence[Field[Any]],
+    ) -> ArrowStreamExportable:
+        """Read feature values for a frame of entities from the online store.
+
+        This is the serving read, so a value's freshness is what decides whether it is returned:
+        a value older than its view's ``ttl_days`` reads as null, exactly as a value that was
+        never written does. One store read is issued per entity however many views are
+        requested, which is the rule the storage layout exists to make possible.
+
+        Args:
+            entity_df: The entities to read, as an object exporting Arrow buffers through
+                ``__arrow_c_stream__``. A Polars DataFrame does. Its join key column is named
+                after the views' entity, and one call reads one entity type.
+            features: The declared fields to read, as ``View.field``. The order given here is
+                the order of the returned columns, and each field's own view decides which
+                stored vector it comes from.
+
+        Returns:
+            An Arrow table: the entity frame's own columns in input order, then one column per
+            requested feature in request order, one row per input row. A feature whose value is
+            missing, expired, or stored under a schema the current definition no longer matches
+            is a null. The three causes are deliberately not distinguished here; the online
+            contract is nulls.
+
+        Raises:
+            TypeError: If ``entity_df`` does not export Arrow buffers. A pandas DataFrame is the
+                common case, and the message names the conversion.
+            ValueError: If a feature is not bound to a view, is requested twice, names a view or
+                feature the project does not declare, or collides with a column of
+                ``entity_df``; if the requested views are keyed on different join keys; if
+                ``entity_df`` lacks the join key column or holds a null in it; or if the read
+                fails.
+            ConnectionError: If ``feather.toml`` declares a Valkey that cannot be reached.
+        """
+        if not hasattr(entity_df, "__arrow_c_stream__"):
+            raise TypeError(_why_not_arrow(entity_df))
+        return self._store.get_online_features(entity_df, _references(features))
 
 
 def _references(features: Sequence[Field[Any]]) -> list[str]:
