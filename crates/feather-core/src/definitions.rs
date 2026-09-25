@@ -9,11 +9,12 @@
 //! field names a view declares, and every service reference resolving to a view and
 //! a field that both exist.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::settings::Connection;
 
 /// The storage type of a feature.
 ///
@@ -87,18 +88,73 @@ impl Entity {
     }
 }
 
-/// A file-backed offline source.
+/// Where a view's features are read from.
 ///
-/// v1 has exactly one source kind. The object-storage and warehouse tiers are
-/// the same type with a different path scheme, so no enum is needed yet.
+/// Discriminated on `type` in the wire form, so each kind carries only its own keys
+/// and a key lifted from another kind is rejected rather than ignored. A new kind is
+/// added here when a reader exists for it, which is why there are two rather than a
+/// path with a scheme.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FileSource {
-    pub path: String,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Source {
+    /// A Parquet file, local or reached through a URI scheme such as `s3://`.
+    File { path: String },
+    /// A table in a Postgres database.
+    ///
+    /// The connection is named rather than carried, because credentials belong in
+    /// `feather.toml` and a definition module is committed.
+    Postgres {
+        connection: String,
+        schema: String,
+        table: String,
+    },
 }
 
-impl FileSource {
-    pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
+impl Source {
+    /// A local or remote Parquet file.
+    pub fn file(path: impl Into<String>) -> Self {
+        Self::File { path: path.into() }
+    }
+
+    /// A table read from the named Postgres connection.
+    pub fn postgres(
+        connection: impl Into<String>,
+        schema: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Self {
+        Self::Postgres {
+            connection: connection.into(),
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// This kind's wire name, which is what `type` holds.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
+            Self::Postgres { .. } => "postgres",
+        }
+    }
+
+    /// The `[connections]` entry this source reads through, if it names one.
+    pub fn connection_name(&self) -> Option<&str> {
+        match self {
+            Self::File { .. } => None,
+            Self::Postgres { connection, .. } => Some(connection),
+        }
+    }
+
+    /// How this source is named in an error about it.
+    pub fn description(&self) -> String {
+        match self {
+            Self::File { path } => path.clone(),
+            Self::Postgres {
+                connection,
+                schema,
+                table,
+            } => format!("{connection}.{schema}.{table}"),
+        }
     }
 }
 
@@ -106,7 +162,7 @@ impl FileSource {
 pub struct FeatureView {
     pub name: String,
     pub entities: Vec<Entity>,
-    pub source: FileSource,
+    pub source: Source,
     pub features: Vec<Field>,
     /// Retention. `None` means no expiry.
     #[serde(default)]
@@ -262,6 +318,44 @@ impl Definitions {
         Ok(())
     }
 
+    /// Reject a view whose source names a connection the project cannot use.
+    ///
+    /// This is where definitions and settings first meet, so an unknown connection
+    /// name or a connection of the wrong kind fails here, at startup, rather than at
+    /// the first read. The join resolves the same source again as a backstop.
+    ///
+    /// Args:
+    ///     connections: The project's `[connections]`, keyed by the name a source refers to.
+    ///
+    /// Returns:
+    ///     `Ok(())` when every view's source resolves.
+    ///
+    /// Raises:
+    ///     [`Error::UnknownConnection`] if a source names a name that is not configured.
+    ///     [`Error::SourceConnectionKind`] if the named connection is another kind.
+    pub fn validate_sources(&self, connections: &BTreeMap<String, Connection>) -> Result<()> {
+        for view in &self.views {
+            let Some(name) = view.source.connection_name() else {
+                continue;
+            };
+            let configured = connections
+                .get(name)
+                .ok_or_else(|| Error::UnknownConnection {
+                    view: view.name.clone(),
+                    connection: name.to_owned(),
+                })?;
+            if configured.kind() != view.source.kind() {
+                return Err(Error::SourceConnectionKind {
+                    view: view.name.clone(),
+                    source_kind: view.source.kind().to_owned(),
+                    connection: name.to_owned(),
+                    connection_kind: configured.kind().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Deserialize and validate in one step.
     ///
     /// A binding hands over JSON and cannot get a `Definitions` back without it
@@ -286,7 +380,7 @@ mod tests {
         let mut view = FeatureView {
             name: "user_clicks".to_owned(),
             entities: vec![Entity::new("user_id", "user_id")],
-            source: FileSource::new("data/user_stats.parquet"),
+            source: Source::file("data/user_stats.parquet"),
             features: vec![
                 Field::new("click_count", DType::Int64),
                 Field::new("purchase_count", DType::Int64),

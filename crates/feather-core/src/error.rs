@@ -78,6 +78,20 @@ pub enum Error {
     #[error("no feature view named `{0}`")]
     UnknownView(String),
 
+    #[error("view `{view}` names connection `{connection}`, which is not configured")]
+    UnknownConnection { view: String, connection: String },
+
+    #[error(
+        "view `{view}` reads a `{source_kind}` source through connection `{connection}`, \
+         which is a `{connection_kind}` connection"
+    )]
+    SourceConnectionKind {
+        view: String,
+        source_kind: String,
+        connection: String,
+        connection_kind: String,
+    },
+
     #[error("no feature service named `{0}`")]
     UnknownService(String),
 

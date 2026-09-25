@@ -21,7 +21,7 @@ use std::time::Instant;
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
-use feather_core::definitions::{DType, Entity, FeatureView, Field, FileSource};
+use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::value::{SchemaTag, decode_batch, encode_batch};
 
 /// Measured p50 of a single-entity read across four views, in nanoseconds.
@@ -46,7 +46,7 @@ fn build_view(width: usize) -> FeatureView {
     FeatureView {
         name: "wide".to_owned(),
         entities: vec![Entity::new("user_id", "user_id")],
-        source: FileSource::new("data/x.parquet"),
+        source: Source::file("data/x.parquet"),
         features,
         ttl_days: None,
         timestamp_field: None,
