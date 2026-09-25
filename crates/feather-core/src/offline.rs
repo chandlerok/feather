@@ -921,8 +921,11 @@ pub trait LatestBatchSink {
 
 /// The SQL that reduces a view's source to one row per entity.
 ///
-/// The tie-break is the join's: a `created_timestamp_field`, when the view declares one,
-/// decides between rows sharing a key and an event timestamp.
+/// The partition is the entity key alone, deliberately: materialization wants one row per
+/// entity, so collapsing a key's whole history to its newest row is the result it is after.
+/// The join must not copy this reduction, where the same collapse makes every label older than
+/// the newest row match nothing. The tie-break is the join's: a `created_timestamp_field`, when
+/// the view declares one, decides between rows sharing a key and an event timestamp.
 fn latest_per_entity_sql(
     view: &FeatureView,
     relation: &str,
@@ -1009,12 +1012,16 @@ fn join_sql(
     }
 
     // Deduplicated only when a created timestamp can break the tie, and only among the rows
-    // that actually tie: the partition is the entity key **and** the timestamp, so the sort
-    // decides which of several rows sharing one instant wins and nothing else. Partitioning by
-    // the key alone instead collapses a key's whole history to its newest row before the join,
-    // so every label older than that row matches nothing and comes back null under the default
-    // policy. The document scopes this rule to rows sharing "the same entity key and the same
-    // maximal timestamp", which is what the timestamp in the partition expresses.
+    // that actually tie: the partition is the entity key and the timestamp, so the sort decides
+    // which of several rows sharing one instant wins and nothing else. Partitioning by the key
+    // alone, as the materialization reducer deliberately does, would collapse a key's whole
+    // history to its newest row before the join, and every label older than that row would then
+    // match nothing and come back null under the default policy. The document scopes this rule
+    // to rows sharing "the same entity key and the same maximal timestamp": the partition
+    // expresses one instant per group, and the maximality in that phrase is the match rule's.
+    // With no created timestamp there is no column to break a tie with, and two rows sharing a
+    // key and an instant were already refused by the ambiguity check, so the `None` arm has no
+    // tie to break.
     let dedup = match &view.created_timestamp_field {
         Some(created) => format!(
             " QUALIFY row_number() OVER (PARTITION BY {key_expr}, {source_ts_value} ORDER BY {} DESC) = 1",
@@ -1717,31 +1724,81 @@ mod tests {
 
     #[test]
     fn a_created_column_breaks_ties_without_collapsing_a_keys_history() {
-        // Two rows share an instant, and a third sits later. The tie-break must choose between
-        // the first two and leave the earlier instant in place for the join to find: a label
-        // between the two timestamps has to take the older row, not nothing.
+        // Two rows share an instant under one key and a third sits later; a second key has a row
+        // at that same instant. The tie-break must choose between the first two and leave the
+        // earlier instant in place for the join to find, and the keys must stay apart: a
+        // partition without the key reduces both keys' `ts = 100` rows to one and takes the
+        // second key's label with it. The tied rows cross `created_at` with `count`, so ordering
+        // on `count` instead picks the other row and changes the answer.
         let source = Parquet::write(&tie_breakable_source(&[
-            (1, 100, 5, 10),
-            (1, 100, 9, 20),
+            (1, 100, 5, 20),
+            (1, 100, 9, 10),
             (1, 200, 7, 30),
+            (2, 100, 3, 40),
         ]));
         let mut view = view(&source.string(), None);
         view.created_timestamp_field = Some("created_at".to_owned());
 
         let joined = engine()
             .point_in_time_join(
-                &labels(&[(Some(1), 100), (Some(1), 150), (Some(1), 200)]),
+                &labels(&[
+                    (Some(1), 100),
+                    (Some(1), 150),
+                    (Some(1), 200),
+                    (Some(2), 100),
+                ]),
                 &view,
                 &JoinOptions::default(),
             )
             .expect("join");
 
+        // The tied instant (1, 100) is won by `created_at` 9, whose `count` is 10, so both
+        // labels at or after it take 10: the label at 150 has only that instant to match.
         assert_eq!(
             counts(&joined),
-            [Some(20), Some(20), Some(30)],
-            "at 100 the greatest created_at wins, at 150 the older row is still there, and at \
-             200 the newer one is"
+            [Some(10), Some(10), Some(30), Some(40)],
+            "at 100 the greater created_at wins the tie, so the value is 10 and not 20; at \
+             150 the older instant still matches, tie-broken the same way; at 200 the later \
+             instant's 30 wins; and (2, 100) shows the second key keeping its own row"
         );
+    }
+
+    #[test]
+    fn a_created_column_keeps_every_label_when_missing_rows_are_dropped() {
+        // The same fixture under the other policy, because both read the same reduced source
+        // and the pre-fix clause loses rows here as well: the labels at 100 and 150 would find
+        // nothing to match and be removed, leaving two rows for four labels.
+        let source = Parquet::write(&tie_breakable_source(&[
+            (1, 100, 5, 20),
+            (1, 100, 9, 10),
+            (1, 200, 7, 30),
+            (2, 100, 3, 40),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let joined = engine()
+            .point_in_time_join(
+                &labels(&[
+                    (Some(1), 100),
+                    (Some(1), 150),
+                    (Some(1), 200),
+                    (Some(2), 100),
+                ]),
+                &view,
+                &JoinOptions {
+                    on_missing: OnMissing::Drop,
+                    ..JoinOptions::default()
+                },
+            )
+            .expect("join");
+
+        assert_eq!(
+            rows(&joined),
+            [0, 1, 2, 3],
+            "one row per label, in label order"
+        );
+        assert_eq!(counts(&joined), [Some(10), Some(10), Some(30), Some(40)]);
     }
 
     #[test]

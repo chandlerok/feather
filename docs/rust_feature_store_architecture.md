@@ -678,7 +678,10 @@ If two feature rows share the same entity key and the same maximal timestamp, `A
 picks one without a documented rule. Feather resolves this deterministically before the
 join: if `created_timestamp_field` is declared, the row with the greatest
 `created_timestamp` wins; if it is not declared, the join fails with an error rather than
-returning a planner-dependent value.
+returning a planner-dependent value. Rows that are also tied on `created_timestamp` are the
+one case left unresolved: the ambiguity check is skipped once the field is declared, so the
+winner there is whatever the plan returns, and a source that can repeat a
+`created_timestamp` within one key and instant is not refused.
 
 ### Null keys
 
