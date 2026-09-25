@@ -59,16 +59,23 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features \
             -- -D warnings
-      # The suite includes the Valkey integration tests, which connect eagerly
-      # and have no skip guard: with nothing listening they fail rather than
-      # skip. docker-compose.yml is reused rather than a bare container so the
-      # tests meet the same maxmemory and eviction constraints they are written
-      # against, rather than passing on a roomier server than they target.
-      - name: valkey
-        run: docker compose up -d --wait
+      # The suite includes the Valkey and RustFS integration tests, which
+      # connect eagerly and have no skip guard: with nothing listening they fail
+      # rather than skip. docker-compose.yml is reused rather than a bare
+      # container so the tests meet the same maxmemory and eviction constraints
+      # they are written against, rather than passing on a roomier server than
+      # they target. RustFS comes up through the same task a developer runs,
+      # because the bucket these tests read from is created there: the image
+      # ignores RUSTFS_DEFAULT_BUCKETS and has no bucket-create subcommand. The
+      # first remote read installs the httpfs extension from the DuckDB
+      # extension repository, so the job needs network beyond those containers.
+      - name: valkey and rustfs
+        run: |
+          mise run valkey:up
+          mise run s3:up
       - name: test
         run: cargo test --workspace --all-features
-      - name: valkey down
+      - name: services down
         if: always()
         run: docker compose down -v
       - name: data files

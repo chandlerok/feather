@@ -49,10 +49,11 @@ services:
       # warns that the public default pair is unsafe.
       RUSTFS_ACCESS_KEY: feathertest
       RUSTFS_SECRET_KEY: feathertest
-      # So a test can write without creating a bucket first. A server that
-      # predates this variable ignores it, which is why the test creates the
-      # bucket when it is missing.
-      RUSTFS_DEFAULT_BUCKETS: feather-test
+      # No bucket is declared here. This image ignores RUSTFS_DEFAULT_BUCKETS:
+      # the variable reaches the container and no bucket appears, and rustfs
+      # 1.0.0 has no bucket-create subcommand either. `mise run s3:up` creates
+      # the bucket with a signed request instead, and the S3 integration test
+      # fails rather than skips when it is missing.
     ports:
       - "127.0.0.1:9000:9000"
     cpus: 2
