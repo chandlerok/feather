@@ -285,9 +285,17 @@ fn select_views<'a>(
 /// 40-day-old value under a 30-day TTL has already expired, and an expiry measured from the
 /// write would give it another 30 days of life; the read-time check would then disagree with
 /// what the server holds. `None` for a view that declares no TTL.
+///
+/// Rounded up, so the server can never reclaim a field while the read-time check would still
+/// call it fresh. Rounding down opens a window just under a second wide where a value the read
+/// path would have served is already gone, which reports it as never written instead.
 fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
     let ttl_days = view.ttl_days?;
-    Some(event_micros.div_euclid(1_000_000) + i64::from(ttl_days) * 86_400)
+    // Rounded up rather than down. `i64::div_ceil` is still unstable in this toolchain, so the
+    // half second of arithmetic is spelled out rather than imported behind a feature gate.
+    let remainder = event_micros.rem_euclid(1_000_000) != 0;
+    let seconds = event_micros.div_euclid(1_000_000) + i64::from(remainder);
+    Some(seconds + i64::from(ttl_days) * 86_400)
 }
 
 /// The sink that turns one view's scan into one store write per entity.
@@ -589,14 +597,30 @@ mod tests {
         // from now, so it lands 30 days after the event rather than 30 days after this run.
         let (store, _) = refresh_ttl(&[(1, 100, 10)], Some(30)).await;
 
+        // Rounded up to a whole second, because the server's absolute expiry is in seconds: 100
+        // microseconds past the epoch is second 1. Rounding down would let the server reclaim
+        // the field while the read-time check still calls it fresh, which turns a served value
+        // into a missing one.
         assert_eq!(
             store.field_expiry(&key_of(b"1"), &value_field("clicks")),
-            Some(30 * 86_400)
+            Some(1 + 30 * 86_400)
         );
         assert_eq!(
             store.field_expiry(&key_of(b"1"), &freshness_field("clicks")),
             None,
             "the freshness field must stay readable, or Expired and NeverWritten collapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_second_event_timestamp_expires_exactly() {
+        // The rounding is up and never further: an event timestamp already on a second boundary
+        // must not gain an extra second, or the expiry drifts away from the declared TTL.
+        let (store, _) = refresh_ttl(&[(1, 2_000_000, 10)], Some(30)).await;
+
+        assert_eq!(
+            store.field_expiry(&key_of(b"1"), &value_field("clicks")),
+            Some(2 + 30 * 86_400)
         );
     }
 
