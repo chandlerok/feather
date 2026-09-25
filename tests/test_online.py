@@ -13,6 +13,7 @@ integers, and the read has to find exactly what the refresh wrote for those inte
 
 import dataclasses
 import importlib.util
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +38,16 @@ clicks_source = FileSource(path="{clicks}")
 @feature_view(name="clicks", entity=user_entity, source=clicks_source, ttl_days={ttl_days})
 class Clicks(FeatureView):
     click_count = Field(Int64)
+    purchase_count = Field(Int64)
+"""
+
+# A second view, appended to that module by the subset test, so that refreshing one view is
+# distinguishable from refreshing all of them.
+PURCHASES = """
+
+
+@feature_view(name="purchases", entity=user_entity, source=clicks_source, ttl_days=30)
+class Purchases(FeatureView):
     purchase_count = Field(Int64)
 """
 
@@ -194,7 +205,12 @@ def test_a_value_older_than_its_ttl_reads_as_null(tmp_path: Path) -> None:
     # The newest source row is 40 days old and the view declares a 30 day TTL, so the value is
     # written and then refuses to be served.
     project = make_project(tmp_path, ttl_days=30, age_days=40)
-    project.store.materialize()
+    report = project.store.materialize()
+
+    # The write happened. Without this the test passes just as well when the refresh stores
+    # nothing at all, which is the other way a read comes back null. The fixture holds three
+    # entities, so a refresh writes three rows.
+    assert report.views[0].rows == 3
 
     frame = pl.DataFrame(
         project.store.get_online_features(
@@ -217,10 +233,18 @@ def test_the_report_names_the_view_and_its_newest_timestamp(project: Project) ->
     assert report.elapsed_seconds >= 0.0
 
 
-def test_a_subset_refresh_names_only_the_views_it_refreshed(project: Project) -> None:
-    report = project.store.materialize(views=["clicks"])
+def test_a_subset_refresh_names_only_the_views_it_refreshed(tmp_path: Path) -> None:
+    make_project(tmp_path)
+    module = tmp_path / "definitions/clicks.py"
+    module.write_text(module.read_text(encoding="utf-8") + PURCHASES, encoding="utf-8")
 
-    assert [view.name for view in report.views] == ["clicks"]
+    # Two declared views, so naming one of them is distinguishable from naming all of them. On
+    # the one-view project `views=["clicks"]` and `views=None` are the same request, and this
+    # test would pass even if the argument were ignored.
+    store = FeatureStore(tmp_path / "feather.toml")
+
+    assert [view.name for view in store.materialize().views] == ["clicks", "purchases"]
+    assert [view.name for view in store.materialize(views=["clicks"]).views] == ["clicks"]
 
 
 def test_a_view_the_project_does_not_declare_is_refused(project: Project) -> None:
@@ -302,3 +326,48 @@ def test_a_refresh_and_a_read_round_trip_through_valkey(tmp_path: Path) -> None:
 
     # Everything is already in the registry, so nothing is retired and no keyspace walk runs.
     assert project.store.materialize().retired == []
+
+
+@pytest.mark.integration
+def test_two_threads_sharing_one_store_do_not_deadlock(tmp_path: Path) -> None:
+    """A second thread waits for the store's lock, rather than deadlocking on it.
+
+    The lock is taken with the GIL released. Taking it first deadlocks: the refresh holds the
+    lock and cannot reacquire the GIL so that it can return, while the second thread holds the
+    GIL and cannot take the lock. Neither can move, so the join deadline is what turns a hang
+    into a failure rather than into a stuck test run.
+
+    The source is large enough that the refresh outlasts the second thread starting, so the two
+    really do contend for the lock instead of the test relying on luck to overlap them.
+    """
+    rows = 100_000
+    make_project(tmp_path, project=f"feathertest_threads_{uuid.uuid4().hex}", valkey=True)
+    base = now_micros() - DAY
+    pl.DataFrame(
+        {
+            "user_id": list(range(rows)),
+            "event_timestamp": micros([base] * rows),
+            "click_count": [1] * rows,
+            "purchase_count": [2] * rows,
+        }
+    ).write_parquet(tmp_path / "clicks.parquet")
+    store = FeatureStore(tmp_path / "feather.toml")
+
+    finished: list[str] = []
+
+    def refresh(tag: str) -> None:
+        store.materialize()
+        finished.append(tag)
+
+    first = threading.Thread(target=refresh, args=("first",), daemon=True)
+    second = threading.Thread(target=refresh, args=("second",), daemon=True)
+    first.start()
+    time.sleep(0.05)
+    second.start()
+    first.join(timeout=120)
+    second.join(timeout=120)
+
+    assert sorted(finished) == ["first", "second"], (
+        "both refreshes finished; a hang here means the store's lock is taken while the GIL is "
+        "held, which deadlocks the interpreter"
+    )
