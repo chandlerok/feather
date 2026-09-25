@@ -3,7 +3,11 @@
 # delegates to rustup, whose default profile includes both, but a cache hit can
 # skip the install entirely and leave them missing. The explicit component step
 # in CI is the one that actually holds; this declaration is for a fresh machine.
-rust = { version = "latest", components = ["rustfmt", "clippy"] }
+# Pinned, not floating. rust-cache puts the resolved rustc version in its cache
+# key, so `latest` invalidates the whole 2.3GB cargo entry the day a new release
+# lands and quietly turns the next run into a from-source DuckDB build. The
+# version is the one CI already resolved; bumping it is a deliberate cache reset.
+rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
 uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
 # from the schema it loads.
