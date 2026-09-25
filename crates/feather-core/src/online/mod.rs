@@ -22,11 +22,53 @@ use crate::error::{Error, Result};
 use crate::key::{freshness_field, value_field};
 use crate::value::{SchemaTag, decode_batch};
 
-/// One `HSET`: a hash key and the fields to write into it.
+/// One field of a write: its value, and when it stops being readable.
+///
+/// The expiry rides with the value rather than in a call of its own because the two belong
+/// together: a field written without the expiry that is meant to reclaim it is a field the
+/// server keeps until its hash is rewritten or deleted. The unit is named in the field rather
+/// than left to the reader, because a bare `i64` expiry inside a codec that otherwise counts
+/// microseconds is a bug waiting to happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrittenField {
+    pub name: String,
+    pub value: Vec<u8>,
+    /// Absolute expiry as seconds since the Unix epoch, or `None` for a field that never
+    /// expires.
+    ///
+    /// Absolute rather than a TTL: a value that is already older than its TTL has to expire at
+    /// once, and a relative TTL measured from the write would give it a second lease on life.
+    pub expires_at_unix_secs: Option<i64>,
+}
+
+impl WrittenField {
+    /// A field, with an absolute expiry when it has one.
+    ///
+    /// Args:
+    ///     name: The field name.
+    ///     value: The encoded value.
+    ///     expires_at_unix_secs: When the field stops being readable, or `None` to leave it to
+    ///         the read-time check alone.
+    ///
+    /// Returns:
+    ///     The field.
+    pub fn new(name: impl Into<String>, value: Vec<u8>, expires_at_unix_secs: Option<i64>) -> Self {
+        Self {
+            name: name.into(),
+            value,
+            expires_at_unix_secs,
+        }
+    }
+}
+
+/// One write: a hash key and the fields to set in it.
+///
+/// "Set" rather than "insert", because a field already in the hash is overwritten. That is
+/// what makes a full refresh safe to re-run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBatch {
     pub key: Vec<u8>,
-    pub fields: Vec<(String, Vec<u8>)>,
+    pub fields: Vec<WrittenField>,
 }
 
 /// One `HMGET`: a hash key and the fields to read from it.
@@ -42,6 +84,10 @@ pub struct ReadRequest {
 pub trait OnlineStore {
     /// Write fields into hashes. Fields not mentioned are left alone, which is
     /// what makes a full refresh safe to re-run.
+    ///
+    /// A field may carry an absolute expiry. A store that cannot honour one writes the value
+    /// anyway: the read-time TTL check in [`read_entities`] is what decides whether a value is
+    /// served, so an unexpired leftover costs reclamation and never correctness.
     async fn write(&mut self, batches: &[WriteBatch]) -> Result<()>;
 
     /// Read fields from hashes, one `HMGET` per request, in request order.
@@ -341,8 +387,12 @@ mod tests {
             .write(&[WriteBatch {
                 key,
                 fields: vec![
-                    (value_field(&view.name), encoded_vector(view, value)),
-                    (freshness_field(&view.name), encode_freshness(freshness)),
+                    WrittenField::new(value_field(&view.name), encoded_vector(view, value), None),
+                    WrittenField::new(
+                        freshness_field(&view.name),
+                        encode_freshness(freshness),
+                        None,
+                    ),
                 ],
             }])
             .await

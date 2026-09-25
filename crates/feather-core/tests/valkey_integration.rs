@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::array::{ArrayRef, Int64Array};
 use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
+use feather_core::online::valkey::FieldExpiry;
 use feather_core::online::{
     EntityRequest, Missing, OnlineStore, ReadRequest, ViewRequest, ViewValues, WriteBatch,
-    read_entities,
+    WrittenField, read_entities,
 };
 use feather_core::value::{SchemaTag, encode_batch};
 use feather_core::{Error, Result, ValkeyStore};
@@ -79,11 +80,18 @@ fn encode_vector(view: &FeatureView, count: i64, label: &str) -> Vec<u8> {
         .to_vec()
 }
 
+/// A write from `(name, value)` pairs, none of which expire.
+///
+/// These tests exercise the read path, so what they write carries no expiry; the write path's
+/// own expiry is asserted against the in-memory store and in `materialize.rs`.
 fn write_batch(project: &str, entity: &[u8], fields: Vec<(String, Vec<u8>)>) -> WriteBatch {
     let encoded = encode_entity_key(&[entity]).expect("encode key");
     WriteBatch {
         key: entity_hash_key(project, "user_id", &encoded),
-        fields,
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| WrittenField::new(name, value, None))
+            .collect(),
     }
 }
 
@@ -405,6 +413,66 @@ async fn the_stored_bytes_match_what_was_written() -> Result<()> {
     // And the tag decodes back to the definition's tag.
     let tag = SchemaTag::of(&clicks.features);
     assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), tag.0);
+
+    cleanup(&mut store, &project, clicks, &[b"u1"]).await?;
+    Ok(())
+}
+
+/// A field written with an absolute expiry is reclaimed by the server, and its freshness
+/// field is not.
+///
+/// The observable is deliberate: the expiry is set in the past, so the server deletes the
+/// value field at once. The freshness field carries no expiry, so it survives, and the read
+/// path therefore reports `NeverWritten` (a present freshness with an absent value) rather
+/// than `Expired` (an old freshness with a value that may still be there). That is exactly the
+/// pair the read path keeps distinct, checked against a real server rather than a fake.
+#[tokio::test]
+async fn the_server_reclaims_an_expired_value_and_keeps_its_freshness() -> Result<()> {
+    let project = project("fieldexpiry");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+    assert_ne!(
+        store.field_expiry(),
+        FieldExpiry::None,
+        "this integration suite needs a server with hash field expiration"
+    );
+
+    let now = now_micros();
+    let yesterday = now / 1_000_000 - 86_400;
+    store
+        .write(&[WriteBatch {
+            key: entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?),
+            fields: vec![
+                WrittenField::new(
+                    value_field("clicks"),
+                    encode_vector(clicks, 42, "gold"),
+                    Some(yesterday),
+                ),
+                WrittenField::new(freshness_field("clicks"), now.to_le_bytes().to_vec(), None),
+            ],
+        }])
+        .await?;
+
+    let out = read_entities(
+        &store,
+        &project,
+        &views,
+        &[EntityRequest {
+            encoded_key: encode_entity_key(&[b"u1"])?,
+            views: vec![ViewRequest {
+                view: "clicks".to_owned(),
+                fields: vec!["count".to_owned()],
+            }],
+        }],
+        now,
+    )
+    .await?;
+    assert!(
+        matches!(out[0][0], ViewValues::Missing(Missing::NeverWritten)),
+        "expected the value field to be gone and the freshness field to remain, got {:?}",
+        out[0][0]
+    );
 
     cleanup(&mut store, &project, clicks, &[b"u1"]).await?;
     Ok(())

@@ -274,8 +274,10 @@ fn conninfo_value(value: &str) -> String {
 pub struct Valkey {
     pub endpoint: String,
     pub tls: bool,
-    /// Needs Valkey 9.0+ or Redis 8.0+ for native field expiration. `false` is the
-    /// conservative default, since older servers fall back to read-time TTL checks.
+    /// Needs a server that can expire a hash field: `HEXPIREAT` landed in Redis 7.4 and
+    /// `HSETEX` in Redis 8.0, and Valkey carries the family from 9.0. `false` is the
+    /// conservative default, since a server without either falls back to the read-time TTL
+    /// check, which is authoritative either way.
     #[serde(default)]
     pub field_expiration: bool,
 }

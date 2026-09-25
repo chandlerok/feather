@@ -2,6 +2,10 @@
 //!
 //! The default for tests, so unit tests need no container. It is not a cache and
 //! makes no attempt to be fast; it exists to make the read path exercisable.
+//!
+//! A field's expiry is remembered and never acted on: this store has no clock and reclaims
+//! nothing, and the read-time TTL check is the authoritative path in any case. Keeping the
+//! expiry visible is what lets a test assert what the write path asked for without a server.
 
 use std::collections::HashMap;
 
@@ -11,6 +15,7 @@ use crate::error::Result;
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
     hashes: HashMap<Vec<u8>, HashMap<String, Vec<u8>>>,
+    expiries: HashMap<Vec<u8>, HashMap<String, i64>>,
 }
 
 impl MemoryStore {
@@ -27,14 +32,34 @@ impl MemoryStore {
     pub fn fields(&self, key: &[u8]) -> Option<&HashMap<String, Vec<u8>>> {
         self.hashes.get(key)
     }
+
+    /// When one field was asked to expire, as Unix seconds, or `None` when nothing asked.
+    ///
+    /// For assertions. Nothing in the store consults it.
+    pub fn field_expiry(&self, key: &[u8], field: &str) -> Option<i64> {
+        self.expiries.get(key)?.get(field).copied()
+    }
 }
 
 impl OnlineStore for MemoryStore {
     async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
         for batch in batches {
             let hash = self.hashes.entry(batch.key.clone()).or_default();
-            for (field, value) in &batch.fields {
-                hash.insert(field.clone(), value.clone());
+            for field in &batch.fields {
+                hash.insert(field.name.clone(), field.value.clone());
+                match field.expires_at_unix_secs {
+                    Some(at) => {
+                        self.expiries
+                            .entry(batch.key.clone())
+                            .or_default()
+                            .insert(field.name.clone(), at);
+                    }
+                    None => {
+                        if let Some(expiries) = self.expiries.get_mut(&batch.key) {
+                            expiries.remove(&field.name);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -62,6 +87,14 @@ impl OnlineStore for MemoryStore {
                 }
                 if hash.is_empty() {
                     self.hashes.remove(key);
+                }
+            }
+            if let Some(expiries) = self.expiries.get_mut(key) {
+                for field in fields {
+                    expiries.remove(field);
+                }
+                if expiries.is_empty() {
+                    self.expiries.remove(key);
                 }
             }
         }

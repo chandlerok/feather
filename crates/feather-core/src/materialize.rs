@@ -33,7 +33,7 @@ use crate::key::{
     encode_entity_key_for, entity_hash_key, entity_key_component, freshness_field, value_field,
 };
 use crate::offline::{Engine, LatestBatchSink, SCAN_TS_COLUMN};
-use crate::online::{OnlineStore, WriteBatch, encode_freshness};
+use crate::online::{OnlineStore, WriteBatch, WrittenField, encode_freshness};
 use crate::value::encode_batch;
 
 /// What one view's refresh did.
@@ -154,6 +154,17 @@ fn select_views<'a>(
         .collect())
 }
 
+/// The instant a value stops being readable, in Unix seconds.
+///
+/// Measured from the winning row's event timestamp rather than from the time of the write. A
+/// 40-day-old value under a 30-day TTL has already expired, and an expiry measured from the
+/// write would give it another 30 days of life; the read-time check would then disagree with
+/// what the server holds. `None` for a view that declares no TTL.
+fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
+    let ttl_days = view.ttl_days?;
+    Some(event_micros.div_euclid(1_000_000) + i64::from(ttl_days) * 86_400)
+}
+
 /// The sink that turns one view's scan into one store write per entity.
 struct StoreSink<'a, S> {
     project: &'a str,
@@ -226,13 +237,19 @@ impl<S: OnlineStore> LatestBatchSink for StoreSink<'_, S> {
             writes.push(WriteBatch {
                 key,
                 fields: vec![
-                    (
+                    WrittenField::new(
                         value_field(&self.view.name),
                         encoded.buf[range.clone()].to_vec(),
+                        value_expiry_unix_secs(self.view, event_micros),
                     ),
-                    (
+                    // The freshness field is deliberately left unexpired. The read path tells
+                    // `Expired` from `NeverWritten` by comparing this field against the view's
+                    // TTL, and reclaiming it would collapse two states the contract keeps
+                    // apart.
+                    WrittenField::new(
                         freshness_field(&self.view.name),
                         encode_freshness(event_micros),
+                        None,
                     ),
                 ],
             });
@@ -378,8 +395,16 @@ mod tests {
 
     /// Refreshes one view against a fixture and returns the store and the report.
     async fn refresh(rows: &[(i64, i64, i64)]) -> (MemoryStore, MaterializeReport) {
+        refresh_ttl(rows, None).await
+    }
+
+    /// The same, for a view that declares a TTL.
+    async fn refresh_ttl(
+        rows: &[(i64, i64, i64)],
+        ttl_days: Option<u32>,
+    ) -> (MemoryStore, MaterializeReport) {
         let source = Parquet::write(&source(rows));
-        let view = a_view(&source.string(), None);
+        let view = a_view(&source.string(), ttl_days);
         let mut store = MemoryStore::new();
         let report = materialize(
             &mut store,
@@ -391,6 +416,14 @@ mod tests {
         .await
         .expect("materialize");
         (store, report)
+    }
+
+    /// The current time, in microseconds since the epoch.
+    fn now_micros() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_micros() as i64
     }
 
     #[tokio::test]
@@ -422,6 +455,48 @@ mod tests {
         assert!(
             report.views[0].max_event_timestamp_micros.unwrap() < 1_600_000_000_000_000,
             "a wall-clock write time would be far larger than the event timestamps here"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_values_expiry_is_its_event_timestamp_plus_the_ttl() {
+        // 100 microseconds is just past the epoch. The expiry is counted from there and not
+        // from now, so it lands 30 days after the event rather than 30 days after this run.
+        let (store, _) = refresh_ttl(&[(1, 100, 10)], Some(30)).await;
+
+        assert_eq!(
+            store.field_expiry(&key_of(b"1"), &value_field("clicks")),
+            Some(30 * 86_400)
+        );
+        assert_eq!(
+            store.field_expiry(&key_of(b"1"), &freshness_field("clicks")),
+            None,
+            "the freshness field must stay readable, or Expired and NeverWritten collapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_already_older_than_its_ttl_expires_at_once() {
+        // 2020-09-13, which is years older than a 30-day TTL.
+        let long_ago = 1_600_000_000_000_000;
+        let (store, _) = refresh_ttl(&[(1, long_ago, 10)], Some(30)).await;
+
+        let expiry = store
+            .field_expiry(&key_of(b"1"), &value_field("clicks"))
+            .expect("a TTL sets an expiry");
+        assert!(
+            expiry < now_micros() / 1_000_000,
+            "an expiry measured from the write would have handed this value another 30 days"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_view_without_a_ttl_sets_no_expiry() {
+        let (store, _) = refresh(&[(1, 100, 10)]).await;
+
+        assert_eq!(
+            store.field_expiry(&key_of(b"1"), &value_field("clicks")),
+            None
         );
     }
 

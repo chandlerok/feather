@@ -233,7 +233,9 @@ impl Engine {
     /// Discard the connection, so the next use opens a fresh one.
     ///
     /// Called only where a failure left the connection's state unknown, which is a caught
-    /// panic inside a streamed scan. See [`Engine::scan_latest_per_entity`].
+    /// panic inside a streamed scan. The caller must have dropped the borrow that scan held,
+    /// or this panics on the `RefCell`: [`Engine::scan_latest_per_entity`] is the only caller
+    /// and awaits the scan's future to completion first.
     fn discard_connection(&self) {
         *self.connection.borrow_mut() = None;
     }
@@ -710,6 +712,13 @@ impl Engine {
     }
 
     /// Run the reduced scan, handing each batch to `sink` before fetching the next.
+    ///
+    /// The connection is borrowed for the whole scan, which is what the lint below notices.
+    /// The borrow is safe because nothing can take it mutably while it is held: the engine is
+    /// not `Sync`, so one scan runs at a time, `reopen` runs inside `connection` before the
+    /// borrow that call returns, and `discard_connection` is called by
+    /// [`Engine::scan_latest_per_entity`] only after this future has been dropped.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn run_scan<S: LatestBatchSink>(
         &self,
         view: &str,
