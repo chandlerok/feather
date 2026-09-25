@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
@@ -472,6 +473,88 @@ async fn the_server_reclaims_an_expired_value_and_keeps_its_freshness() -> Resul
         matches!(out[0][0], ViewValues::Missing(Missing::NeverWritten)),
         "expected the value field to be gone and the freshness field to remain, got {:?}",
         out[0][0]
+    );
+
+    cleanup(&mut store, &project, clicks, &[b"u1"]).await?;
+    Ok(())
+}
+
+/// A field rewritten with no expiry keeps the expiry the server already holds for it.
+///
+/// The write path relies on this: a view that drops its `ttl_days` stops asking for an expiry,
+/// and the plain `HSET` it then issues must not clear an expiry an earlier definition set. The
+/// observable is the server's own reclamation, which is all the promise affects: the field is
+/// written with an expiry a few seconds out and rewritten with none immediately afterwards, and
+/// its bytes are asserted present before that deadline and gone after it. A server that cleared
+/// the TTL on `HSET` would leave the field in place through both reads.
+#[tokio::test]
+async fn rewriting_a_field_without_an_expiry_keeps_the_servers_expiry() -> Result<()> {
+    // Slack between the two writes, and the point past which the field must be gone. Both
+    // client and server read the same clock: the expiry is absolute, and this host is the one
+    // running the container.
+    const TTL_SECS: i64 = 3;
+
+    let project = project("hsetexpiry");
+    let views = views(&[("clicks", None)]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+    assert_ne!(
+        store.field_expiry(),
+        FieldExpiry::None,
+        "this test needs a server with hash field expiration"
+    );
+
+    let key = entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?);
+    let deadline = now_micros() / 1_000_000 + TTL_SECS;
+    store
+        .write(&[WriteBatch {
+            key: key.clone(),
+            fields: vec![WrittenField::new(
+                value_field("clicks"),
+                encode_vector(clicks, 1, "x"),
+                Some(deadline),
+            )],
+        }])
+        .await?;
+
+    // The same field, this time with no expiry, which the write path queues as a plain `HSET`.
+    let rewritten = encode_vector(clicks, 2, "y");
+    store
+        .write(&[WriteBatch {
+            key: key.clone(),
+            fields: vec![WrittenField::new(
+                value_field("clicks"),
+                rewritten.clone(),
+                None,
+            )],
+        }])
+        .await?;
+
+    let live = store
+        .read(&[ReadRequest {
+            key: key.clone(),
+            fields: vec![value_field("clicks")],
+        }])
+        .await?;
+    assert_eq!(
+        live[0][0].as_deref(),
+        Some(rewritten.as_slice()),
+        "the rewrite lands while the field is still inside its expiry"
+    );
+
+    let remaining = deadline - now_micros() / 1_000_000;
+    std::thread::sleep(Duration::from_secs(remaining.max(0) as u64 + 1));
+
+    let after = store
+        .read(&[ReadRequest {
+            key,
+            fields: vec![value_field("clicks")],
+        }])
+        .await?;
+    assert!(
+        after[0][0].is_none(),
+        "the expiry the first write set should still reclaim the field, got {:?}",
+        after[0][0]
     );
 
     cleanup(&mut store, &project, clicks, &[b"u1"]).await?;

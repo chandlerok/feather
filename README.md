@@ -24,10 +24,10 @@ is design only. Historical point-in-time joins run in an embedded DuckDB engine 
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a table in a configured database. No separate compute
   cluster is required for local or medium-scale workloads.
-- **Two-tier online reads.** An in-process `moka` cache (L1) absorbs hot keys, invalidated
+- **Two-tier online reads.** An in-process `moka` cache (L1) will absorb hot keys, invalidated
   by Valkey client-side caching rather than a fixed TTL; Valkey (L2) serves the rest over
-  async `tokio` I/O. Performance targets are stated in the architecture document and are not
-  yet benchmarked.
+  async `tokio` I/O. The L1 has no measurements behind it, because it is not built; the
+  serving figures in the architecture document are measured, on a stated container.
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.

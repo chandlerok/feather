@@ -138,11 +138,12 @@ class FeatureStore:
         """Refresh feature values from their sources into the online store.
 
         A full refresh: every selected view is recomputed from its source and every value is
-        overwritten in place. There is no watermark and no partial state, so a run that fails
-        leaves the previous run's values where they were and the call can be repeated without
-        reconciling anything. A view that a previous refresh declared and this one does not is
-        retired: its fields are removed from every entity that still carries them, and it leaves
-        the project's view registry.
+        overwritten in place. There is no watermark and nothing partial to reconcile, so a run
+        that fails leaves the values it had not yet overwritten as they were and the call can
+        simply be repeated. A run that is still going serves a mix of the values it has written
+        and the ones it has not reached yet. A view that a previous refresh declared and this one
+        does not is retired: its fields are removed from every entity that still carries them,
+        and it leaves the project's view registry.
 
         Args:
             views: The views to refresh, by name, or ``None`` for every view the project

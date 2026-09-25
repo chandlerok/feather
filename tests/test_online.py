@@ -13,6 +13,7 @@ integers, and the read has to find exactly what the refresh wrote for those inte
 
 import dataclasses
 import importlib.util
+import sys
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ from typing import Any
 import polars as pl
 import pytest
 
+import feather
 from feather import FeatureStore, MaterializeReport, ViewRefresh  # noqa: F401
 
 DAY = 86_400_000_000
@@ -171,6 +173,27 @@ def project(tmp_path: Path) -> Project:
         The project.
     """
     return make_project(tmp_path)
+
+
+def test_the_compiled_names_are_absent_without_the_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compiled names read as absent when there is no extension to resolve them from.
+
+    They are re-exported lazily, so this is the path a caller takes on a machine where the
+    extension was never built: `hasattr` answers false rather than raising `ImportError`, and a
+    completion list does not offer a name that would raise. The extension is unavailable here by
+    making its import fail, which is what the absence of a build does.
+    """
+    monkeypatch.setitem(sys.modules, "feather._core", None)
+    # A lookup of either name sets it on the package, so the attribute can be in place from the
+    # module-level import above and has to go for the patch to mean anything.
+    monkeypatch.delattr(feather, "_core", raising=False)
+
+    assert hasattr(feather, "MaterializeReport") is False
+    assert hasattr(feather, "ViewRefresh") is False
+    assert "MaterializeReport" not in dir(feather)
+    assert "ViewRefresh" not in dir(feather)
 
 
 def test_a_refresh_then_a_serving_read_round_trips(project: Project) -> None:

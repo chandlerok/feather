@@ -801,10 +801,12 @@ unchanged declared set, so a duplicate run wastes work and produces the same sta
 with _different_ declared sets are the exception: each computes its retired set from the
 registry it read, and the two write the same fields, so interleaving them can leave the
 registry holding a timestamp from the older read while each report counts the same rows. A
-serialized run is what removes that case, and it belongs to the deployment rather than to the
-refresh: the refresh takes no lock of its own. Feather therefore takes a
-non-blocking lock (`SET NX PX`, TTL set to the expected maximum runtime) and exits 0 when it
-is already held. No job-state table, and no already-running detection.
+serialized run is what removes that case, and serialization belongs to the deployment rather
+than to the refresh, which takes no lock of its own. Two deployment mechanisms do it, both
+design only, since nothing in this repository schedules a refresh or issues a lock: the
+`concurrencyPolicy: Forbid` above, or, for a scheduler without it, a non-blocking lock around
+the run (`SET NX PX`, TTL set to the expected maximum runtime) that exits 0 when the lock is
+already held. No job-state table, and no already-running detection.
 
 Freshness is surfaced from `f:{view}`, which the write path already maintains. The maximum
 lag across views is the metric to alert on, exported as a gauge rather than discovered by a
