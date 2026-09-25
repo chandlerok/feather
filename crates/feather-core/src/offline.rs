@@ -21,6 +21,7 @@
 //!   error rather than a cast, because an implicit cast is how an off-by-hours bug enters a
 //!   training set.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use duckdb::Connection;
 
 use crate::definitions::{DType, FeatureView};
 use crate::error::{Error, Result};
+use crate::settings::Connection as SettingsConnection;
 use crate::value::arrow_type;
 
 /// The column the join attaches to the entity frame, so output order is input order.
@@ -75,6 +77,12 @@ pub struct Limits {
     ///
     /// `None` leaves DuckDB's default of 90% of free disk.
     pub max_temp_directory_size: Option<String>,
+    /// Where DuckDB looks for loadable extensions.
+    ///
+    /// `None` uses DuckDB's default, `~/.duckdb/extensions/<version>/<platform>`. Setting it
+    /// is what lets an image bake the extension files in and read remote sources with no
+    /// network at runtime.
+    pub extension_directory: Option<PathBuf>,
 }
 
 impl Default for Limits {
@@ -83,6 +91,7 @@ impl Default for Limits {
             memory_limit: None,
             temp_directory: std::env::temp_dir().join("feather-spill"),
             max_temp_directory_size: Some(DEFAULT_SPILL_CAP.to_owned()),
+            extension_directory: None,
         }
     }
 }
@@ -137,18 +146,24 @@ impl Engine {
     /// Open an engine that spills into a private directory under `limits.temp_directory`.
     ///
     /// Args:
-    ///     limits: The memory ceiling, the spill parent directory, and the spill cap.
+    ///     limits: The memory ceiling, the spill parent directory, the spill cap, and where
+    ///         loadable extensions live.
+    ///     connections: The project's named connections, keyed by the name a source refers to.
     ///
     /// Returns:
     ///     The engine.
     ///
     /// Raises:
-    ///     [`Error::SpillDirectory`] if the spill directory cannot be created. Checked here
-    ///         because DuckDB creates the directory it spills into but not its parents, so
-    ///         a missing parent otherwise fails at the first spill, under load, rather than
-    ///         at startup.
-    ///     [`Error::DuckDb`] if the connection cannot be opened or a setting is rejected.
-    pub fn open(limits: &Limits) -> Result<Self> {
+    ///     [`Error::SpillDirectory`] if the spill or extension directory cannot be created.
+    ///         Checked here because DuckDB creates the directory it spills into but not its
+    ///         parents, so a missing parent otherwise fails at the first spill, under load,
+    ///         rather than at startup.
+    ///     [`Error::DuckDb`] if the connection cannot be opened, a setting is rejected, or a
+    ///         configured secret is malformed.
+    pub fn open(
+        limits: &Limits,
+        connections: &BTreeMap<String, SettingsConnection>,
+    ) -> Result<Self> {
         // Private to this engine: DuckDB removes its spill directory when the instance shuts
         // down, so a directory shared between engines means one engine's shutdown can delete
         // another's live spill files.
@@ -175,7 +190,35 @@ impl Engine {
                 quote_literal(cap)
             ));
         }
+        if let Some(directory) = &limits.extension_directory {
+            std::fs::create_dir_all(directory).map_err(|source| Error::SpillDirectory {
+                path: directory.display().to_string(),
+                source,
+            })?;
+            settings.push(format!(
+                "SET extension_directory = {}",
+                quote_literal(&directory.display().to_string())
+            ));
+        }
         connection.execute_batch(&settings.join("; "))?;
+
+        // A configured object-store credential becomes a secret. Without one, DuckDB's
+        // credential chain finds the instance role or the standard environment variables,
+        // which is the normal case in the cloud and needs no configuration at all.
+        //
+        // The secret *type* comes from httpfs, so the extension has to be loaded before the
+        // secret can be created. That is the only reason a configured connection loads it at
+        // open; a remote path loads it on first read instead.
+        let secrets: Vec<String> = connections
+            .iter()
+            .filter_map(|(name, configured)| s3_secret_sql(name, configured))
+            .collect();
+        if !secrets.is_empty() {
+            connection.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+            for sql in &secrets {
+                connection.execute_batch(sql)?;
+            }
+        }
 
         Ok(Self { connection, spill })
     }
@@ -183,6 +226,19 @@ impl Engine {
     /// The directory this engine spills into.
     pub fn spill_directory(&self) -> &Path {
         &self.spill
+    }
+
+    /// Load the filesystem a remote source needs, the first time one is read.
+    ///
+    /// Deferred rather than done at open, so a project reading local files pays nothing, and
+    /// done here rather than left to DuckDB's autoload so that a machine which cannot obtain
+    /// the extension says so, instead of failing later with an opaque read error.
+    fn ensure_remote_filesystem(&self, path: &str) -> Result<()> {
+        if path_needs_filesystem(path) {
+            self.connection
+                .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+        }
+        Ok(())
     }
 }
 
@@ -283,6 +339,8 @@ impl Engine {
         let label_type = frame_schema.field(label_index).data_type().clone();
         let key_family = KeyFamily::of_arrow(&key_type)?;
         let label_kind = TimestampKind::of_arrow(&label_type)?;
+
+        self.ensure_remote_filesystem(&view.source.path)?;
 
         let location = format!("source `{}`", view.source.path);
         let described = self.describe_source(&view.source.path)?;
@@ -753,6 +811,39 @@ fn output_fields(view: &FeatureView) -> Vec<Field> {
     fields
 }
 
+/// The `CREATE SECRET` statement for a configured object-store connection, if it is one
+/// DuckDB needs telling about.
+///
+/// The key id is not a secret and is written as is; the secret itself came from the
+/// environment, since the config loader turns an unset variable into a load error.
+fn s3_secret_sql(name: &str, configured: &SettingsConnection) -> Option<String> {
+    match configured {
+        SettingsConnection::S3 {
+            region,
+            key_id,
+            secret,
+        } => Some(format!(
+            "CREATE OR REPLACE SECRET {} (TYPE s3, KEY_ID {}, SECRET {}, REGION {})",
+            quote_ident(name),
+            quote_literal(key_id),
+            quote_literal(secret.expose()),
+            quote_literal(region),
+        )),
+        // DuckDB's snowflake extension authenticates its own way, and no reader uses this kind
+        // yet.
+        SettingsConnection::Snowflake { .. } => None,
+    }
+}
+
+/// Whether a source path goes through a filesystem DuckDB loads rather than one it has
+/// compiled in.
+///
+/// A URI scheme means a loadable filesystem, and `httpfs` covers S3, GCS, Azure Blob and
+/// plain HTTP. A bare path is the local filesystem, which needs nothing loaded.
+fn path_needs_filesystem(path: &str) -> bool {
+    path.contains("://")
+}
+
 /// Quote an identifier, doubling any embedded quote.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -875,8 +966,13 @@ mod tests {
         }
     }
 
+    /// Open an engine with no configured connections, which is what a local project has.
+    fn open(limits: &Limits) -> Result<Engine> {
+        Engine::open(limits, &BTreeMap::new())
+    }
+
     fn engine() -> Engine {
-        Engine::open(&Limits::default()).expect("engine")
+        open(&Limits::default()).expect("engine")
     }
 
     /// The `count` column of a result, as nullable values.
@@ -1251,6 +1347,89 @@ mod tests {
     }
 
     #[test]
+    fn only_a_uri_path_needs_a_loaded_filesystem() {
+        assert!(path_needs_filesystem("s3://bucket/data.parquet"));
+        assert!(path_needs_filesystem("https://example.com/data.parquet"));
+        assert!(!path_needs_filesystem("data/stats.parquet"));
+        assert!(!path_needs_filesystem("/abs/path/stats.parquet"));
+    }
+
+    /// A configured connection, built through the same wire shape the config loader produces.
+    fn connection(json: &str) -> SettingsConnection {
+        serde_json::from_str(json).expect("connection")
+    }
+
+    #[test]
+    fn an_object_store_connection_becomes_a_secret() {
+        let configured = connection(
+            r#"{"type":"s3","region":"us-east-1","key_id":"AKIAEXAMPLE","secret":"shhh"}"#,
+        );
+        let sql = s3_secret_sql("s3_lake", &configured).expect("a secret");
+
+        assert!(sql.contains("CREATE OR REPLACE SECRET"), "{sql}");
+        assert!(sql.contains("KEY_ID 'AKIAEXAMPLE'"), "{sql}");
+        assert!(sql.contains("REGION 'us-east-1'"), "{sql}");
+    }
+
+    #[test]
+    fn a_snowflake_connection_becomes_no_secret() {
+        // Nothing reads that kind yet, and DuckDB's snowflake extension authenticates its own
+        // way, so inventing a secret for it would be a guess.
+        let configured = connection(
+            r#"{"type":"snowflake","account":"a","warehouse":"w","username":"u","password":"p"}"#,
+        );
+
+        assert!(s3_secret_sql("snowflake_prod", &configured).is_none());
+    }
+
+    #[test]
+    fn a_configured_connection_is_installed_as_a_secret() {
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "s3_lake".to_owned(),
+            connection(
+                r#"{"type":"s3","region":"us-east-1","key_id":"AKIAEXAMPLE","secret":"shhh"}"#,
+            ),
+        );
+
+        let engine = Engine::open(&Limits::default(), &connections).expect("engine");
+        let names: String = engine
+            .connection
+            .query_row(
+                "SELECT string_agg(name, ',') FROM duckdb_secrets()",
+                [],
+                |row| row.get(0),
+            )
+            .expect("secrets");
+
+        assert!(names.contains("s3_lake"), "secrets were: {names}");
+    }
+
+    #[test]
+    fn the_extension_directory_is_applied() {
+        let directory = std::env::temp_dir().join(format!("feather-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let engine = open(&Limits {
+            extension_directory: Some(directory.clone()),
+            ..Limits::default()
+        })
+        .expect("engine");
+
+        assert!(directory.is_dir());
+        let resolved: String = engine
+            .connection
+            .query_row("SELECT current_setting('extension_directory')", [], |row| {
+                row.get(0)
+            })
+            .expect("setting");
+        assert!(resolved.contains("feather-ext-"), "{resolved}");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn a_missing_spill_directory_is_created() {
         // DuckDB creates the directory it spills into but not its parents, so a nested path
         // that does not exist has to be created here, or the first spill fails instead.
@@ -1258,7 +1437,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
         let nested = parent.join("a/b");
 
-        let engine = Engine::open(&Limits {
+        let engine = open(&Limits {
             temp_directory: nested.clone(),
             ..Limits::default()
         })
@@ -1276,8 +1455,8 @@ mod tests {
         // DuckDB removes its spill directory when the instance shuts down, so two engines
         // sharing one would let the first to finish delete the second's live spill files.
         let limits = Limits::default();
-        let first = Engine::open(&limits).expect("first");
-        let second = Engine::open(&limits).expect("second");
+        let first = open(&limits).expect("first");
+        let second = open(&limits).expect("second");
 
         assert_ne!(first.spill_directory(), second.spill_directory());
     }
@@ -1285,7 +1464,7 @@ mod tests {
     #[test]
     fn an_engines_spill_directory_is_removed_with_it() {
         let spill = {
-            let engine = Engine::open(&Limits::default()).expect("engine");
+            let engine = open(&Limits::default()).expect("engine");
             engine.spill_directory().to_path_buf()
         };
 
@@ -1312,14 +1491,14 @@ mod tests {
         // A value DuckDB refuses is itself the assertion that the statement ran: if the
         // setting were never applied, both of these would open successfully.
         assert!(
-            Engine::open(&Limits {
+            open(&Limits {
                 memory_limit: Some("not-a-size".to_owned()),
                 ..Limits::default()
             })
             .is_err()
         );
         assert!(
-            Engine::open(&Limits {
+            open(&Limits {
                 max_temp_directory_size: Some("not-a-size".to_owned()),
                 ..Limits::default()
             })
@@ -1350,7 +1529,7 @@ mod tests {
             .point_in_time_join(&labels, &view, &JoinOptions::default())
             .expect("unconstrained join");
 
-        let constrained = Engine::open(&Limits {
+        let constrained = open(&Limits {
             memory_limit: Some("64MB".to_owned()),
             ..Limits::default()
         })

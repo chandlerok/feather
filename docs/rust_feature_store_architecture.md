@@ -570,7 +570,7 @@ engine; they differ in where the source data lives and how it is reached.
 - **Mechanism.** The `iceberg` and `delta` extensions read table formats; `httpfs` provides
   S3 and generic HTTP access, and the `azure` extension covers Blob Storage. `httpfs` issues
   HTTP range requests, so a scan fetches only the byte ranges it needs rather than whole
-  files.
+  files. All of them are loadable rather than compiled in; see "Loadable extensions".
 - **Consequence.** Compute runs locally, so there is no warehouse compute charge. Metadata
   operations (manifest reads, snapshot resolution) still hit the catalog and are the usual
   source of latency on high-file-count tables.
@@ -980,6 +980,27 @@ variable before load. A literal secret in this file is a bug.
 A `[connections]` entry is the only place a credential is expected, and it is the only
 consumer of `${VAR}` today. Credentials are never declared in a definition module, because
 those are committed and every process reads them.
+
+A configured entry is handed to DuckDB as a secret when the engine opens, which is what makes an
+`s3://` path work. With no entry, DuckDB's own credential chain applies instead, so a cloud
+instance role or the standard environment variables are found with nothing configured at all.
+That is the intended shape in the cloud: no secret in the file, nothing to rotate there.
+
+### Loadable extensions
+
+Nothing beyond Parquet and JSON is compiled into the engine. The crate exposes no feature for
+`httpfs`, `postgres`, `iceberg`, or `delta`, so those are loadable extensions rather than
+libraries, and a build cannot turn them on:
+
+- `httpfs` is loaded on the first read of a URI path, and a configured object-store connection
+  loads it at open, because the `s3` secret type comes from the extension itself. A project
+  reading only local files never loads it.
+- An image that cannot reach the extension repository bakes the files in and points
+  `Limits::extension_directory` at them, so `INSTALL` is a no-op and `LOAD` finds them locally.
+
+The cost of that design is the same one the warehouse extensions carry: an extension is built for
+one DuckDB version and one platform, and the path it lives at names both. An extension that lags
+the engine fails to load rather than degrading.
 
 ### Backend coverage
 
