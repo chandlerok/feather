@@ -126,9 +126,11 @@ fn intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
 /// is what they need: one DuckDB connection is one session, and the online store is one
 /// connection too.
 ///
-/// Holding the lock across a long refresh is deliberate. The GIL is released for the duration,
-/// so other Python threads keep running; what they cannot do is refresh the same project
-/// concurrently, and a second refresh would only write the same values a second time.
+/// Holding the lock across a long refresh is deliberate: what a second call cannot do is refresh
+/// the same project concurrently, and a second refresh would only write the same values again.
+///
+/// The lock is taken *inside* the GIL-released region, in [`FeatureStore::with_inner`], and that
+/// ordering is the point rather than a detail. See the note there for what goes wrong otherwise.
 #[cfg(feature = "offline")]
 #[pyclass]
 struct FeatureStore {
@@ -226,6 +228,43 @@ impl ProjectScan for Online {
 
 /// The error a poisoned lock becomes.
 ///
+/// The one place the store's lock is taken.
+///
+/// The order of the two locks is the whole point, and it is the opposite of what looks natural.
+/// The GIL is released *before* the mutex is taken, never after. Taking the mutex first looks
+/// equivalent and is not: a second thread would then block on the mutex while still holding the
+/// GIL, while this thread holds the mutex and waits to reacquire the GIL so that it can return.
+/// Neither can proceed, so the interpreter hangs permanently rather than waiting. That is the
+/// first thing a threaded server would hit.
+///
+/// So every method that needs the store's state goes through here, and none of them lock
+/// directly. A call that arrives while the lock is held waits with the GIL released, which is a
+/// wait rather than a deadlock.
+///
+/// Args:
+///     py: The calling thread's token, used to release the GIL.
+///     f: The work to run against the store's state, with the GIL released.
+///
+/// Returns:
+///     Whatever `f` returned.
+///
+/// Raises:
+///     OSError: If another thread panicked while holding the lock, so the state cannot be
+///         trusted.
+#[cfg(feature = "offline")]
+impl FeatureStore {
+    fn with_inner<T, F>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&mut Inner) -> PyResult<T> + Send,
+        T: Send,
+    {
+        py.detach(|| {
+            let mut inner = self.inner.lock().map_err(poisoned)?;
+            f(&mut inner)
+        })
+    }
+}
+
 /// A panic while another thread held the lock is what poisons it, which means the engine's
 /// state is unknown; saying so beats unwrapping into a second panic.
 #[cfg(feature = "offline")]
@@ -415,48 +454,52 @@ impl FeatureStore {
         };
 
         let references = parse_references(&features)?;
-        let mut inner = self.inner.lock().map_err(poisoned)?;
-        let Inner {
-            engine,
-            definitions,
-            ..
-        } = &mut *inner;
 
-        // Checked before any query runs, so a name the project does not declare fails with
-        // that name rather than as a column missing from the join's output.
-        for reference in &references {
-            let view = definitions.view(&reference.view).map_err(core_error)?;
-            if view.field(&reference.feature).is_none() {
-                return Err(PyValueError::new_err(format!(
-                    "view `{}` declares no feature `{}`",
-                    reference.view, reference.feature
-                )));
-            }
-        }
-
+        // Read out of the capsule before the lock is taken: it is pure Arrow work with no Python
+        // in it, and the frame's own columns are needed again after the joins.
         let (batches, entity_schema) = entity_frame.into_inner();
         let entity = concat_batches(&entity_schema, &batches).map_err(arrow_error)?;
-        for reference in &references {
-            if entity_schema.index_of(&reference.feature).is_ok() {
-                return Err(PyValueError::new_err(format!(
-                    "the entity frame already has a column named `{}`, which is the requested \
-                     feature `{}`; rename it, or the two cannot be told apart in the result",
-                    reference.feature, reference.view
-                )));
+
+        // The definition checks and the joins both need the engine, so the block runs with the
+        // lock held and the GIL released. A DuckDB join over a large frame is seconds of work,
+        // and holding the GIL for it would stop every other Python thread in the process.
+        let (joined, index_of_view) = self.with_inner(py, |inner| {
+            let Inner {
+                engine,
+                definitions,
+                ..
+            } = &mut *inner;
+
+            // Checked before any query runs, so a name the project does not declare fails with
+            // that name rather than as a column missing from the join's output.
+            for reference in &references {
+                let view = definitions.view(&reference.view).map_err(core_error)?;
+                if view.field(&reference.feature).is_none() {
+                    return Err(PyValueError::new_err(format!(
+                        "view `{}` declares no feature `{}`",
+                        reference.view, reference.feature
+                    )));
+                }
             }
-        }
 
-        let options = JoinOptions {
-            label_timestamp_column: label_timestamp_column.to_owned(),
-            strict,
-            on_missing,
-        };
+            for reference in &references {
+                if entity_schema.index_of(&reference.feature).is_ok() {
+                    return Err(PyValueError::new_err(format!(
+                        "the entity frame already has a column named `{}`, which is the requested \
+                     feature `{}`; rename it, or the two cannot be told apart in the result",
+                        reference.feature, reference.view
+                    )));
+                }
+            }
 
-        // The joins run with the GIL released. A DuckDB join over a large frame is seconds of
-        // work, and holding the GIL for it would stop every other Python thread in the process.
-        let (joined, index_of_view) = py.detach(|| {
+            let options = JoinOptions {
+                label_timestamp_column: label_timestamp_column.to_owned(),
+                strict,
+                on_missing,
+            };
+
             let mut joined: Vec<JoinedView> = Vec::new();
-            let mut index_of_view: HashMap<&str, usize> = HashMap::new();
+            let mut index_of_view: HashMap<String, usize> = HashMap::new();
             for reference in &references {
                 if index_of_view.contains_key(reference.view.as_str()) {
                     continue;
@@ -465,10 +508,10 @@ impl FeatureStore {
                 let batch = engine
                     .point_in_time_join(&entity, view, &options)
                     .map_err(core_error)?;
-                index_of_view.insert(&reference.view, joined.len());
+                index_of_view.insert(reference.view.clone(), joined.len());
                 joined.push(index_of_view_of(batch)?);
             }
-            Ok::<_, PyErr>((joined, index_of_view))
+            Ok((joined, index_of_view))
         })?;
 
         // A row survives only if every requested view produced one, so `drop`
@@ -558,34 +601,32 @@ impl FeatureStore {
         views: Option<Vec<String>>,
     ) -> PyResult<MaterializeReport> {
         let selected = views.unwrap_or_default();
-        let mut inner = self.inner.lock().map_err(poisoned)?;
-        open_online(&mut inner)?;
-        let Inner {
-            runtime,
-            engine,
-            definitions,
-            online,
-            project,
-            ..
-        } = &mut *inner;
-        let store = online
-            .as_mut()
-            .expect("open_online leaves a store in place");
 
-        // The GIL is released for the whole refresh, which is minutes of DuckDB work and network
-        // I/O. Nothing in this block touches Python, and the mutex is what keeps another thread
-        // out while it runs.
-        let report = py
-            .detach(|| {
-                runtime.block_on(materialize_project(
+        // Minutes of DuckDB work and network I/O, with the GIL released for all of it. The lock
+        // is taken inside that region rather than before it; see `with_inner`.
+        let report = self.with_inner(py, |inner| {
+            open_online(inner)?;
+            let Inner {
+                runtime,
+                engine,
+                definitions,
+                online,
+                project,
+                ..
+            } = &mut *inner;
+            let store = online
+                .as_mut()
+                .expect("open_online leaves a store in place");
+            runtime
+                .block_on(materialize_project(
                     store,
                     engine,
                     project,
                     &definitions.views,
                     &selected,
                 ))
-            })
-            .map_err(core_error)?;
+                .map_err(core_error)
+        })?;
 
         Ok(MaterializeReport {
             views: report
@@ -636,104 +677,110 @@ impl FeatureStore {
         let (batches, entity_schema) = entity_frame.into_inner();
         let entity = concat_batches(&entity_schema, &batches).map_err(arrow_error)?;
 
-        let mut inner = self.inner.lock().map_err(poisoned)?;
-        open_online(&mut inner)?;
-        let Inner {
-            runtime,
-            definitions,
-            online,
-            project,
-            ..
-        } = &mut *inner;
-        let store = online
-            .as_mut()
-            .expect("open_online leaves a store in place");
+        // Opening the store can block on a handshake, so it happens with the GIL released as
+        // well. The lock is taken inside `with_inner` for the reason documented there.
+        let (values, views, slots) = self.with_inner(py, |inner| {
+            open_online(inner)?;
+            let Inner {
+                runtime,
+                definitions,
+                online,
+                project,
+                ..
+            } = &mut *inner;
+            let store = online
+                .as_mut()
+                .expect("open_online leaves a store in place");
 
-        // One view slot per distinct view, in first-appearance order, holding that view's
-        // requested features in request order. One `HMGET` per entity asks for one field per
-        // view, so the whole request costs one store read per entity however many views it
-        // names, which is the rule the storage layout exists to make possible.
-        let mut views: BTreeMap<String, FeatureView> = BTreeMap::new();
-        let mut slots: Vec<(usize, usize)> = Vec::with_capacity(references.len());
-        let mut view_names: Vec<String> = Vec::new();
-        let mut fields_per_view: Vec<Vec<String>> = Vec::new();
-        let mut join_key: Option<String> = None;
+            // One view slot per distinct view, in first-appearance order, holding that view's
+            // requested features in request order. One `HMGET` per entity asks for one field per
+            // view, so the whole request costs one store read per entity however many views it
+            // names, which is the rule the storage layout exists to make possible.
+            let mut views: BTreeMap<String, FeatureView> = BTreeMap::new();
+            let mut slots: Vec<(usize, usize)> = Vec::with_capacity(references.len());
+            let mut view_names: Vec<String> = Vec::new();
+            let mut fields_per_view: Vec<Vec<String>> = Vec::new();
+            let mut join_key: Option<String> = None;
 
-        for reference in &references {
-            let view = definitions.view(&reference.view).map_err(core_error)?;
-            let field = view.field(&reference.feature).ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "view `{}` declares no feature `{}`",
-                    reference.view, reference.feature
-                ))
-            })?;
-            if entity_schema.index_of(&reference.feature).is_ok() {
-                return Err(PyValueError::new_err(format!(
-                    "the entity frame already has a column named `{}`, which is the requested \
-                     feature `{}`; rename it, or the two cannot be told apart in the result",
-                    reference.feature, reference.view
-                )));
-            }
-
-            // One request reads one entity, because the entity name is part of the hash key.
-            let key = view.entity().map_err(core_error)?.join_key.clone();
-            match &join_key {
-                None => join_key = Some(key),
-                Some(existing) if existing == &key => {}
-                Some(existing) => {
+            for reference in &references {
+                let view = definitions.view(&reference.view).map_err(core_error)?;
+                let field = view.field(&reference.feature).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "view `{}` declares no feature `{}`",
+                        reference.view, reference.feature
+                    ))
+                })?;
+                if entity_schema.index_of(&reference.feature).is_ok() {
                     return Err(PyValueError::new_err(format!(
-                        "view `{}` is joined on `{key}` and another requested view on \
-                         `{existing}`; one request reads one entity type",
-                        reference.view
+                        "the entity frame already has a column named `{}`, which is the requested \
+                     feature `{}`; rename it, or the two cannot be told apart in the result",
+                        reference.feature, reference.view
                     )));
                 }
+
+                // One request reads one entity, because the entity name is part of the hash key.
+                let key = view.entity().map_err(core_error)?.join_key.clone();
+                match &join_key {
+                    None => join_key = Some(key),
+                    Some(existing) if existing == &key => {}
+                    Some(existing) => {
+                        return Err(PyValueError::new_err(format!(
+                            "view `{}` is joined on `{key}` and another requested view on \
+                         `{existing}`; one request reads one entity type",
+                            reference.view
+                        )));
+                    }
+                }
+
+                let slot = match view_names.iter().position(|name| name == &reference.view) {
+                    Some(slot) => slot,
+                    None => {
+                        view_names.push(reference.view.clone());
+                        fields_per_view.push(Vec::new());
+                        view_names.len() - 1
+                    }
+                };
+                let feature_slot = fields_per_view[slot].len();
+                fields_per_view[slot].push(field.name.clone());
+                slots.push((slot, feature_slot));
+                views.insert(reference.view.clone(), view.clone());
             }
 
-            let slot = match view_names.iter().position(|name| name == &reference.view) {
-                Some(slot) => slot,
-                None => {
-                    view_names.push(reference.view.clone());
-                    fields_per_view.push(Vec::new());
-                    view_names.len() - 1
-                }
-            };
-            let feature_slot = fields_per_view[slot].len();
-            fields_per_view[slot].push(field.name.clone());
-            slots.push((slot, feature_slot));
-            views.insert(reference.view.clone(), view.clone());
-        }
-
-        let join_key = join_key.expect("parse_references rejects an empty list");
-        let key_index = entity_schema.index_of(&join_key).map_err(|_| {
-            PyValueError::new_err(format!(
-                "the entity frame has no column `{join_key}`, which is the join key the \
+            let join_key = join_key.expect("parse_references rejects an empty list");
+            let key_index = entity_schema.index_of(&join_key).map_err(|_| {
+                PyValueError::new_err(format!(
+                    "the entity frame has no column `{join_key}`, which is the join key the \
                  requested views are keyed on"
-            ))
+                ))
+            })?;
+
+            // The entity keys are encoded here rather than in Python: the key format is the core's,
+            // and a caller that encoded its own could disagree with what the write path stored.
+            let key_column = entity.column(key_index).clone();
+            let mut entities = Vec::with_capacity(entity.num_rows());
+            for row in 0..entity.num_rows() {
+                let component =
+                    entity_key_component(key_column.as_ref(), row).map_err(core_error)?;
+                entities.push(EntityRequest {
+                    encoded_key: feather_core::encode_entity_key(&[&component])
+                        .map_err(core_error)?,
+                    views: view_names
+                        .iter()
+                        .zip(&fields_per_view)
+                        .map(|(view, fields)| ViewRequest {
+                            view: view.clone(),
+                            fields: fields.clone(),
+                        })
+                        .collect(),
+                });
+            }
+
+            let now = now_micros();
+            let values = runtime
+                .block_on(read_entities(store, project, &views, &entities, now))
+                .map_err(core_error)?;
+            Ok((values, views, slots))
         })?;
-
-        // The entity keys are encoded here rather than in Python: the key format is the core's,
-        // and a caller that encoded its own could disagree with what the write path stored.
-        let key_column = entity.column(key_index).clone();
-        let mut entities = Vec::with_capacity(entity.num_rows());
-        for row in 0..entity.num_rows() {
-            let component = entity_key_component(key_column.as_ref(), row).map_err(core_error)?;
-            entities.push(EntityRequest {
-                encoded_key: feather_core::encode_entity_key(&[&component]).map_err(core_error)?,
-                views: view_names
-                    .iter()
-                    .zip(&fields_per_view)
-                    .map(|(view, fields)| ViewRequest {
-                        view: view.clone(),
-                        fields: fields.clone(),
-                    })
-                    .collect(),
-            });
-        }
-
-        let now = now_micros();
-        let values = py
-            .detach(|| runtime.block_on(read_entities(store, project, &views, &entities, now)))
-            .map_err(core_error)?;
 
         // The frame's own columns come back untouched: only the value writes are reordered, so
         // reattaching by position is exact rather than a join.
