@@ -5,9 +5,12 @@ open-source alternative to Feast. It strips out multi-provider abstraction and s
 on a native Rust core, with DuckDB for historical computation and Valkey for online serving.
 
 Scope note: this is a design document with a partial implementation. The definition layer,
-entity key encoding, value codec, and the two-tier online read path are built and measured.
-The offline engine, Arrow Flight serving, and materialization are design only. Figures that
-are measurements say so and carry their hardware and cardinality; the rest are targets.
+entity key encoding, value codec, and the online serving layer are built and measured, and so is
+materialization, which computes a view's values from its source and writes them to the online
+store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
+is design only for the source kinds with no reader. Arrow Flight serving and the L1 cache are
+design only. Figures that are measurements say so and carry their hardware and cardinality; the
+rest are targets.
 
 ---
 
@@ -240,6 +243,13 @@ fields: v:{view}   the view's encoded feature vector, all its features in one bl
         f:{view}   event timestamp of the last write for this view (int64 micros)
 ```
 
+One key holds no entity's values: the project registry, `{project}:views`. It is a hash whose
+fields are the declared view names and whose values are each view's newest event timestamp,
+encoded the way a freshness field is. A refresh reads it to learn which views the previous
+refresh declared, writes it last, and garbage collection diffs the two sets. Being a hash is
+what lets it reuse the read, write and delete the other hashes already need, rather than adding
+a command family for one key per project.
+
 #### Entity key encoding
 
 `encoded_entity_key` is the entity tuple encoded so that the result is unambiguous without
@@ -358,17 +368,19 @@ Two mechanisms, belt and braces:
 
 - **Read-time check (authoritative, portable).** `f:{view}` plus the declared `ttl`. Works on
   any Valkey. This is the correctness path.
-- **Native field expiration (reclamation, Valkey 9.0+ / Redis 8.0+).** Write fields with
-  `HSETEX`/`HEXPIREAT`, setting an absolute expiry derived from the event timestamp plus the
-  TTL, not from wall-clock write time. Expired fields are then reclaimed by the server's
-  periodic job instead of lingering.
+- **Native field expiration (reclamation).** Write the value field with an absolute expiry
+  derived from its event timestamp plus the TTL, not from wall-clock write time, and the server
+  reclaims it instead of leaving it for the next rewrite of its hash. The freshness field is
+  deliberately not expired: the read path tells `expired` from `never written` by comparing it
+  against the TTL, so reclaiming it would collapse two states the contract keeps apart.
 
-Using the event timestamp for the absolute expiry matters. Setting a relative TTL at write
-time would give a 40-day-old value another 30 days of life under a 30-day TTL.
-
-The version floor is real: field expiration landed in Valkey 9.0 and Redis 8.0, with a
-compatible API. On older servers the read-time check still returns correct results, but
-expired fields are not reclaimed until the hash is rewritten or deleted.
+The version floor is real, and it is per command rather than per feature. Field expiration
+landed in Redis 7.4 as `HEXPIREAT` and the rest of the family, and `HSETEX` and `HGETEX` are the
+Redis 8.0 additions; Valkey carries the family from 9.0. A write therefore probes the server
+once per connection and uses `HSETEX` where it exists, `HSET` plus `HEXPIREAT` otherwise, and
+neither on a server that has no field expiration at all. On such a server the read-time check
+still returns correct results, and the only loss is that an expired field is not reclaimed
+until its hash is rewritten or deleted.
 
 Feast has neither mechanism. Its Redis adapter can only expire whole entities, so its own
 documented principle ("if you request a feature ... older than its TTL, you should get a
@@ -777,17 +789,27 @@ consumer noticing stale features.
 
 ### Garbage collection
 
-Full refresh only writes fields for currently defined views, so fields belonging to renamed
-or removed views would otherwise persist forever. Feast has exactly this leak, growing the
-online store indefinitely because it only deletes data when the last view for an entity is
-gone ([#3596](https://github.com/feast-dev/feast/issues/3596)).
+Full refresh only writes fields for currently defined views, so fields belonging to renamed or
+removed views would otherwise persist forever. Feast has exactly this leak, growing the online
+store indefinitely because it only deletes data when the last view for an entity is gone
+([#3596](https://github.com/feast-dev/feast/issues/3596)).
 
-Feather reclaims them during a full refresh. The refresh already holds the current view set,
-which is what identifying an orphan field needs, so the same pass `HDEL`s the `v:{view}:*` and
-`f:{view}` fields of any view that is no longer declared. The deletion has to be idempotent and
-safe to re-run, which it is: removing a field that is already gone is a no-op. This is the
-reason a refresh is not a pure function of its inputs, and it is the only part of it that is
-not.
+The refresh knows which views retired, because it reads the project registry before it writes
+anything and diffs it against the set it is about to refresh. What it does not know is where
+their fields are. A retired view's entities do not have to appear in any source any more, and
+their hashes carry no trace of which view put a field in them, so the view set names the orphan
+but not its location: the project's keyspace is the only complete list. When, and only when, a
+view retires, the refresh therefore walks that keyspace with `SCAN` and `HDEL`s the retired
+views' `v:{view}` and `f:{view}` fields from every entity hash it finds, leaving every other
+field alone. A key that is not shaped like an entity hash is not touched, because `HDEL`
+against a key that is not a hash is an error rather than a no-op.
+
+The walk is rare by construction, which is the point of the registry: a project whose declared
+views have not changed retires nothing and walks nothing. It is idempotent as well, because
+removing a field that is already gone is a no-op, and the registry is written after the walk
+rather than before it, so a run that dies partway leaves a state the next run repairs. This is
+the reason a refresh is not a pure function of its inputs, and it is the only part of it that
+is not.
 
 ### Ceiling
 
@@ -981,8 +1003,9 @@ ssl_mode = "verify-full"
 [valkey]
 endpoint = "valkey-cluster.internal.svc:6379"
 tls = true
-# Needs Valkey 9.0+ / Redis 8.0+ for native field expiration.
-# Older servers fall back to read-time TTL checks only.
+# Needs a server that can expire a hash field: HEXPIREAT is a Redis 7.4 addition and HSETEX a
+# Redis 8.0 one. A server with neither falls back to the read-time TTL check, which is the
+# authoritative path either way.
 field_expiration = true
 
 [l1_cache]

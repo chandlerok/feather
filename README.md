@@ -5,11 +5,13 @@ uses an in-process `moka` cache over Valkey. Historical point-in-time joins run 
 embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
-> and the two-tier online read path are built and measured; the point-in-time join is built
-> over local Parquet, object storage, and a Postgres table, and `FeatureStore` exposes it to
-> Python. Snowflake sources, Arrow Flight serving, and materialization are design only. There
-> is no published package and no Helm chart yet, so the install and `init` steps below
-> describe the intended interface; the code after them runs.
+> and the online serving layer are built and measured, and materialization writes a view's
+> values into the online store from its source. The point-in-time join is built over local
+> Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
+> refresh, and the online read to Python. Snowflake sources and Arrow Flight serving are
+> design only, and the L1 cache is not built. There is no published package and no Helm chart
+> yet, so the install and `init` steps below describe the intended interface; the code after
+> them runs.
 
 ## Design goals
 
