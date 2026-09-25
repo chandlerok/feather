@@ -185,6 +185,26 @@ def test_a_postgres_port_defaults_to_5432(tmp_path: Path, monkeypatch: pytest.Mo
     assert pg.model_dump(mode="json")["port"] == 5432
 
 
+def test_a_postgres_port_of_zero_is_carried_because_libpq_accepts_it() -> None:
+    """The bound is the core's ``u16``, not a narrower one.
+
+    0 means "use the default port" to libpq, so a mirror that refused it would reject a
+    connection the core would have used.
+    """
+    body = {
+        "type": "postgres",
+        "host": "h",
+        "port": 0,
+        "database": "d",
+        "user": "u",
+        "password": "p",
+    }
+
+    pg = PostgresConnection.model_validate(body)
+
+    assert pg.port == 0
+
+
 def test_an_empty_postgres_host_is_rejected_in_the_model() -> None:
     """A present-but-empty value is rejected by the binding as well as by the core."""
     body = {
@@ -213,7 +233,9 @@ def test_a_postgres_port_outside_the_cores_range_is_rejected_in_the_model() -> N
         "password": "p",
     }
 
-    for port in (0, 65536):
+    # 0 is deliberately not in this list: libpq reads it as "use the default port", so the
+    # core can carry it and the mirror must not refuse it. See the zero case above.
+    for port in (65536, -1):
         with pytest.raises(pydantic.ValidationError):
             PostgresConnection.model_validate(body | {"port": port})
 
