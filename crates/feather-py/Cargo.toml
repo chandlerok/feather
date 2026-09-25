@@ -13,11 +13,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 arrow.workspace = true
-# No engine features here. This crate exposes `__version__` and `load_settings`,
-# and neither touches the engines, so asking for `full` would compile bundled
-# DuckDB from source (minutes on a cold build) to ship a binding that cannot use
-# it. That cost landed on every build of the extension, including the Python CI
-# job and any `pip install`. A release that exposes the engines turns them on.
+# `offline` is a default feature: `FeatureStore` runs the point-in-time join, so
+# the engine has to be in the wheel. That means bundled DuckDB, which compiles
+# from source, so every build of the extension now pays what this crate used to
+# avoid. It also means the Python CI job can no longer skip the C++ build.
 feather-core = { path = "../feather-core" }
 # No `extension-module` feature here on purpose. maturin sets
 # PYO3_BUILD_EXTENSION_MODULE for PyO3 >= 0.27, and enabling the feature
@@ -30,8 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [features]
-default = []
+default = ["offline"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
-# tests the engines, and so a wheel that exposes them can opt in.
+# tests the engines, and so a build can drop DuckDB with --no-default-features.
 offline = ["feather-core/offline"]
 valkey = ["feather-core/valkey"]

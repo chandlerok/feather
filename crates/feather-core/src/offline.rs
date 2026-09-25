@@ -544,7 +544,10 @@ fn join_sql(
     };
 
     // Microseconds on both sides, so the window is integer arithmetic and needs no date
-    // functions, matching how the value codec stores timestamps.
+    // functions, matching how the value codec stores timestamps. The label side is
+    // normalized rather than taken raw: a label column that is a real timestamp would
+    // otherwise subtract from the source's micros as `timestamp - bigint`, which DuckDB
+    // refuses to bind.
     let ttl = view.ttl_days.map(|days| {
         format!(
             "(m.{LABEL_TS} - m.{MATCHED_TS}) <= {}",
@@ -593,7 +596,7 @@ fn join_sql(
          ),
          matched AS (
              SELECT l.feather_row AS feather_row,
-                    l.{LABEL_TS} AS {LABEL_TS},
+                    {label_ts} AS {LABEL_TS},
                     s.{LABEL_TS} AS {MATCHED_TS}{from_matched}
              FROM {LABELS_TABLE} l
              ASOF LEFT JOIN source s
@@ -1222,6 +1225,68 @@ mod tests {
             .expect("join");
 
         assert_eq!(counts(&joined), [Some(42)]);
+    }
+
+    #[test]
+    fn a_timestamp_label_measures_its_ttl_window() {
+        // The label frame carries a real timestamp rather than integer micros, which is
+        // what a warehouse source produces. Both sides of the TTL subtraction have to be
+        // normalized to micros, or DuckDB refuses to bind `timestamp - bigint`.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new(
+                "event_timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        let stamp = 1_700_000_000_000_000i64;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![stamp])
+                        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None)),
+                ),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .expect("source batch");
+        let source = Source::write(&batch);
+
+        let label_schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, true),
+            Field::new(
+                "event_timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let label_frame = RecordBatch::try_new(
+            label_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![stamp + DAY, stamp + 2 * DAY])
+                        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None)),
+                ),
+            ],
+        )
+        .expect("labels batch");
+
+        let joined = engine()
+            .point_in_time_join(
+                &label_frame,
+                &view(&source.string(), Some(1)),
+                &JoinOptions::default(),
+            )
+            .expect("join");
+
+        // Exactly one day old is still fresh; two days is not.
+        assert_eq!(counts(&joined), [Some(42), None]);
+        assert_eq!(rows(&joined), [0, 1]);
     }
 
     #[test]

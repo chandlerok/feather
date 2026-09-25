@@ -24,6 +24,7 @@ from feather.definitions import (
     view_to_wire,
 )
 from feather.settings import FeatherSettings, load_settings
+from feather.store import FeatureStore, MissingPolicy
 from feather.types import (
     Boolean,
     DType,
@@ -45,12 +46,14 @@ __all__ = [
     "Entity",
     "FeatherSettings",
     "FeatureService",
+    "FeatureStore",
     "FeatureStoreConfig",
     "FeatureView",
     "Field",
     "FileSource",
     "Float64",
     "Int64",
+    "MissingPolicy",
     "TimestampMicros",
     "Utf8",
     "WireDType",

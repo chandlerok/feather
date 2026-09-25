@@ -141,6 +141,28 @@ existed.
 > runtime `KeyError` rather than a static error. Upgrade path: `DataFrame[Schema]` when Polars
 > ships it, which needs no Feather-owned wrapper.
 
+#### The historical read path
+
+`FeatureStore(path)` reads and validates `feather.toml` through the core, imports the modules
+it lists, and hands the compiled definitions back for the core to validate again. Nothing is
+registered and nothing is generated.
+
+`store.get_historical_features(entity_df=..., features=[...])` returns an Arrow table: the
+entity frame's own columns in the surviving row order, then one column per requested feature
+in request order. The frame's columns are reattached by row index, which is why the engine
+returns `feather_row` rather than the labels it was handed.
+
+One join runs per distinct view, however many of that view's features were requested. Under
+`on_missing: "null"` every view covers every label row, so the result is row-for-row aligned
+with the input. Under `"drop"` a row survives only if **every** requested view produced a
+fresh value, so a row that `drop` kept never holds a null it was asked to remove. The engine
+cannot express that rule because it joins one view at a time; the binding applies it.
+
+The result is an Arrow table rather than a Polars or pandas one, so `feather` depends on no
+dataframe library. `pl.DataFrame(result)` accepts it through the same PyCapsule interface the
+input used. A pandas frame does not export Arrow buffers, so it has to be converted before the
+call, which copies.
+
 #### Definitions are imported, not compiled
 
 Feature definitions are Python modules. Both the offline path and the serving path import

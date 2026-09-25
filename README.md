@@ -6,18 +6,19 @@ embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
 > and the two-tier online read path are built and measured; the point-in-time join over local
-> Parquet is built and covered by a conformance suite. Warehouse sources, Arrow Flight
-> serving, and materialization are design only. There is no published package and no Helm
-> chart yet, so the quickstart below describes the intended interface.
+> Parquet is built and covered by a conformance suite, and `FeatureStore` exposes it to
+> Python. Warehouse sources, Arrow Flight serving, and materialization are design only. There
+> is no published package and no Helm chart yet, so the install and `init` steps below
+> describe the intended interface; the code after them runs.
 
 ## Design goals
 
 - **Single configuration file.** One `feather.toml`, validated by the Rust core when it
   is loaded, so misconfiguration fails before any engine starts.
-- **Zero-copy input handoff.** DataFrames cross the PyO3 boundary through the Arrow
-  PyCapsule interface, so Rust reads Polars or pandas buffers without serializing them.
-  The join result is materialized as a new Arrow table; only the input transfer is
-  zero-copy.
+- **Zero-copy input handoff.** Frames cross the PyO3 boundary through the Arrow PyCapsule
+  interface, so Rust reads a Polars or PyArrow table's own buffers without serializing them.
+  A pandas frame has to be converted first, which copies. The join result is materialized as
+  a new Arrow table; only the input transfer is zero-copy.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a warehouse. No separate compute cluster is required
   for local or medium-scale workloads.
@@ -73,7 +74,7 @@ Definition modules depend only on `feather` and contain no logic at import time,
 can load them without pulling in a dataframe library or running user code. `feather.toml`
 lists the modules explicitly rather than discovering them by scanning the directory.
 
-Run a historical join. The entity DataFrame is passed by reference through Arrow, and the
+Run a historical join. The entity frame is passed by reference through Arrow, and the
 temporal join executes inside DuckDB. The feature list takes the declared fields, so a typo
 is a type error rather than a missing-column failure at runtime.
 
@@ -85,11 +86,19 @@ from definitions.user_clicks import UserClicks
 store = FeatureStore("feather.toml")
 entity_df = pl.read_parquet("data/training_labels.parquet")
 
-training_data = store.get_historical_features(
-    entity_df=entity_df,
-    features=[UserClicks.click_count, UserClicks.purchase_count],
+training_data = pl.DataFrame(
+    store.get_historical_features(
+        entity_df=entity_df,
+        features=[UserClicks.click_count, UserClicks.purchase_count],
+    )
 )
 ```
+
+The result is an Arrow table: the label set's own columns, then one column per requested
+feature. `pl.DataFrame` above converts it. A label row whose value is missing or older than
+`ttl_days` keeps its place holding a null, and `on_missing="drop"` removes those rows
+instead. Anything exporting Arrow buffers is accepted, which a pandas frame is not until it
+has been converted.
 
 Both files are yours to supply; `init` does not create sample data.
 
