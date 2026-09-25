@@ -402,6 +402,57 @@ mod tests {
         project(|_| {}).validate().expect("valid");
     }
 
+    /// A configured connection, built through the shape the settings loader produces.
+    fn connection(json: &str) -> Connection {
+        serde_json::from_str(json).expect("connection")
+    }
+
+    #[test]
+    fn a_file_source_validates_with_no_connections() {
+        // Which is what local mode looks like: the check is per source kind, so a project
+        // of file sources needing credentials would be the bug.
+        project(|_| {})
+            .validate_sources(&BTreeMap::new())
+            .expect("valid");
+    }
+
+    #[test]
+    fn a_source_naming_an_unknown_connection_is_rejected() {
+        let definitions = project(|v| {
+            v.source = Source::postgres("pg_prod", "public", "user_stats");
+        });
+
+        let error = definitions
+            .validate_sources(&BTreeMap::new())
+            .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` names connection `pg_prod`, which is not configured"
+        );
+    }
+
+    #[test]
+    fn a_source_and_a_connection_of_different_kinds_are_rejected() {
+        let definitions = project(|v| {
+            v.source = Source::postgres("s3_lake", "public", "user_stats");
+        });
+        let connections = BTreeMap::from([(
+            "s3_lake".to_owned(),
+            connection(r#"{"type":"s3","region":"us-east-1","key_id":"k","secret":"s"}"#),
+        )]);
+
+        let error = definitions
+            .validate_sources(&connections)
+            .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` reads a `postgres` source through connection `s3_lake`, \
+             which is a `s3` connection"
+        );
+    }
+
     #[test]
     fn an_unnamed_field_is_rejected() {
         let error = project(|v| v.features[1].name.clear())
