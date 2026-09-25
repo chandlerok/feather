@@ -5,9 +5,9 @@ uses an in-process `moka` cache over Valkey. Historical point-in-time joins run 
 embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
-> and the two-tier online read path are built and measured; the point-in-time join over local
-> Parquet is built and covered by a conformance suite, and `FeatureStore` exposes it to
-> Python. Warehouse sources, Arrow Flight serving, and materialization are design only. There
+> and the two-tier online read path are built and measured; the point-in-time join is built
+> over local Parquet, object storage, and a Postgres table, and `FeatureStore` exposes it to
+> Python. Snowflake sources, Arrow Flight serving, and materialization are design only. There
 > is no published package and no Helm chart yet, so the install and `init` steps below
 > describe the intended interface; the code after them runs.
 
@@ -20,8 +20,8 @@ embedded DuckDB engine over Arrow.
   A pandas frame has to be converted first, which copies. The join result is materialized as
   a new Arrow table; only the input transfer is zero-copy.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
-  local Parquet, object storage, or a warehouse. No separate compute cluster is required
-  for local or medium-scale workloads.
+  local Parquet, object storage, or a table in a configured database. No separate compute
+  cluster is required for local or medium-scale workloads.
 - **Two-tier online reads.** An in-process `moka` cache (L1) absorbs hot keys, invalidated
   by Valkey client-side caching rather than a fixed TTL; Valkey (L2) serves the rest over
   async `tokio` I/O. Performance targets are stated in the architecture document and are not
@@ -108,7 +108,8 @@ Both files are yours to supply; `init` does not create sample data.
   want features for, plus the column you are training on. Each label row takes the newest
   feature row for the same `user_id` at or before its own timestamp.
 
-The source is declared on the view, next to the fields it feeds. The label set decides which
+The source is declared on the view, next to the fields it feeds, and it is a Parquet file or
+a table in a Postgres database named in `feather.toml`. The label set decides which
 rows exist and carries the target, so it is passed per call and changes with every
 experiment.
 
