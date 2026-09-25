@@ -111,6 +111,14 @@ pub enum Error {
     DuckDb(#[from] duckdb::Error),
 
     #[cfg(feature = "offline")]
+    #[error("could not create the spill directory `{path}`: {source}")]
+    SpillDirectory {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[cfg(feature = "offline")]
     #[error("{location} has no column `{column}`")]
     MissingColumn { location: String, column: String },
 

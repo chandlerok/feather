@@ -538,9 +538,31 @@ engine; they differ in where the source data lives and how it is reached.
   DuckDB version and the extension version together; an extension that lags the DuckDB
   release will fail to load. DuckDB's generic `adbc` extension is an alternative for any
   database with an ADBC driver.
-- **Spill behavior.** When a join exceeds `memory_limit`, DuckDB spills to its temp
-  directory, which should be pointed at local SSD. It does not use swap. The temp directory
-  location and `memory_limit` are the two knobs that matter for large joins.
+- **Spill behavior.** DuckDB spills automatically: temporary storage is on by default, and a
+  query that exceeds `memory_limit` writes its intermediates to the temp directory rather than
+  failing. It does not use swap. Spilling is a safety net and not a plan, and the ceiling is
+  real: DuckDB cancels the query with an out-of-memory error when the spill directory exceeds
+  `max_temp_directory_size`, so the budget is one local disk rather than "unlimited".
+
+  Four things make that budget usable, all set when the engine opens in
+  `crates/feather-core/src/offline.rs`:
+
+  - **The spill directory is private to the engine.** DuckDB removes it when the instance shuts
+    down, so a shared one lets the first engine to finish delete another's live spill files.
+    It is created at open and removed when the engine is dropped.
+  - **Its parents are created, not assumed.** DuckDB creates the directory it spills into but
+    not its parents, so a missing parent otherwise fails with an IO error at the first spill,
+    under load, rather than at startup.
+  - **`memory_limit` is derived from the container.** DuckDB's default is 80% of the machine's
+    RAM, which inside a container can exceed what the container may use, so the kernel kills
+    the process before DuckDB ever spills. A cgroup limit, when there is one, becomes the
+    ceiling at 80% of it.
+  - **Its size is capped.** DuckDB's default is 90% of free disk, which an engine embedded in
+    someone else's process has no business taking.
+
+  The directory must be local disk. Every spill read and write is synchronous, so on a network
+  mount each block becomes a round trip, and object storage cannot be a spill target at all:
+  spilling goes through the local filesystem.
 
 #### Tier 2: open table formats on object storage
 
@@ -1040,6 +1062,26 @@ scan is read through the Arrow path.
 The cost is materializing the result. The ordering is applied to the scan rather than at
 materialization, because a sort performed while building the table would not order a later
 scan, and the row order is the thing that keeps labels and features aligned.
+
+### Spill is local, capped, and private
+
+**Rejected:** leaving `temp_directory` and `memory_limit` at their defaults, or at literals.
+
+DuckDB's own defaults are 80% of the machine's RAM and 90% of free disk. Both are wrong for an
+engine embedded in someone else's process:
+
+- 80% of the machine is more than a container may use, so the kernel kills the process before
+  DuckDB reaches the point of spilling at all. The limit is derived from the cgroup when there
+  is one.
+- 90% of free disk means a spill can fill the host. There is a cap, and exceeding it cancels the
+  query rather than growing.
+- A shared spill directory is unsafe, because DuckDB removes the directory when the instance
+  shuts down. Each engine takes a private subdirectory.
+
+Measured before these were set, with a one-million-row source and 100k labels: a join at 8, 16,
+and 24 MB spilled megabytes and still failed, and succeeded at 32 MB while spilling 7.3 MB, and
+at 64 MB while spilling 1.7 MB. Spilling is adaptive rather than a capacity guarantee. That is
+the reason the scaling answer is partitioning the work, not relying on the spill to absorb it.
 
 ### No registry, no lockfile
 

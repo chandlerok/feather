@@ -22,8 +22,9 @@
 //!   training set.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::compute::concat_batches;
@@ -46,21 +47,42 @@ const LABEL_KEY: &str = "feather_key";
 const LABEL_TS: &str = "feather_ts";
 const MATCHED_TS: &str = "feather_matched_ts";
 
+/// The default ceiling on what the spill directory may hold.
+///
+/// DuckDB's own default is 90% of free disk, which an engine embedded in someone else's
+/// process has no business taking.
+pub const DEFAULT_SPILL_CAP: &str = "20GB";
+
 /// How much memory DuckDB may use before it spills, and where it spills to.
+///
+/// Both belong to the deployment rather than to a query, which is why they are set once
+/// when the engine opens.
 #[derive(Debug, Clone)]
 pub struct Limits {
     /// DuckDB's `memory_limit`, such as `2GB`.
-    pub memory_limit: String,
-    /// DuckDB's `temp_directory`. Should be local disk, since this is what a join larger
-    /// than memory spills into.
+    ///
+    /// `None` uses the container's limit when there is one. DuckDB's own default is 80% of
+    /// the machine's RAM, and inside a container that can be more than the container is
+    /// allowed to use, so the kernel kills the process before DuckDB ever spills.
+    pub memory_limit: Option<String>,
+    /// The parent of this engine's spill directory, which is private to it.
+    ///
+    /// Local disk. DuckDB creates the directory, removes it on shutdown, and reads and
+    /// writes it synchronously, so on a network mount every spill block becomes a round
+    /// trip, which is the usual reason spilling is called catastrophic rather than slow.
     pub temp_directory: PathBuf,
+    /// Cap on what the spill directory may hold, such as `20GB`.
+    ///
+    /// `None` leaves DuckDB's default of 90% of free disk.
+    pub max_temp_directory_size: Option<String>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            memory_limit: "2GB".to_owned(),
-            temp_directory: std::env::temp_dir(),
+            memory_limit: None,
+            temp_directory: std::env::temp_dir().join("feather-spill"),
+            max_temp_directory_size: Some(DEFAULT_SPILL_CAP.to_owned()),
         }
     }
 }
@@ -106,29 +128,119 @@ impl Default for JoinOptions {
 /// An in-memory DuckDB engine.
 pub struct Engine {
     connection: Connection,
+    /// This engine's private spill directory. DuckDB removes the files inside it when the
+    /// instance shuts down; the directory itself is removed when the engine is dropped.
+    spill: PathBuf,
 }
 
 impl Engine {
-    /// Open an engine that spills to the configured directory.
+    /// Open an engine that spills into a private directory under `limits.temp_directory`.
     ///
     /// Args:
-    ///     limits: The memory ceiling and spill directory.
+    ///     limits: The memory ceiling, the spill parent directory, and the spill cap.
     ///
     /// Returns:
     ///     The engine.
     ///
     /// Raises:
+    ///     [`Error::SpillDirectory`] if the spill directory cannot be created. Checked here
+    ///         because DuckDB creates the directory it spills into but not its parents, so
+    ///         a missing parent otherwise fails at the first spill, under load, rather than
+    ///         at startup.
     ///     [`Error::DuckDb`] if the connection cannot be opened or a setting is rejected.
     pub fn open(limits: &Limits) -> Result<Self> {
+        // Private to this engine: DuckDB removes its spill directory when the instance shuts
+        // down, so a directory shared between engines means one engine's shutdown can delete
+        // another's live spill files.
+        let spill = limits.temp_directory.join(engine_id());
+        std::fs::create_dir_all(&spill).map_err(|source| Error::SpillDirectory {
+            path: spill.display().to_string(),
+            source,
+        })?;
+
         let connection = Connection::open_in_memory()?;
-        connection.execute_batch(&format!(
-            "SET memory_limit = {}; SET temp_directory = {};",
-            quote_literal(&limits.memory_limit),
-            quote_literal(&limits.temp_directory.display().to_string()),
-        ))?;
-        Ok(Self { connection })
+
+        let mut settings = vec![format!(
+            "SET temp_directory = {}",
+            quote_literal(&spill.display().to_string())
+        )];
+        // An explicit limit wins; otherwise take the container's, and otherwise leave
+        // DuckDB's own default of 80% of RAM alone.
+        if let Some(memory) = limits.memory_limit.clone().or_else(cgroup_memory_limit) {
+            settings.push(format!("SET memory_limit = {}", quote_literal(&memory)));
+        }
+        if let Some(cap) = &limits.max_temp_directory_size {
+            settings.push(format!(
+                "SET max_temp_directory_size = {}",
+                quote_literal(cap)
+            ));
+        }
+        connection.execute_batch(&settings.join("; "))?;
+
+        Ok(Self { connection, spill })
     }
 
+    /// The directory this engine spills into.
+    pub fn spill_directory(&self) -> &Path {
+        &self.spill
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // This runs before the connection is dropped, so DuckDB has not cleared its own
+        // spill files yet. Unlinking them anyway is safe on POSIX, and the point is that a
+        // dropped engine leaves nothing behind for the next one to find.
+        let _ = std::fs::remove_dir_all(&self.spill);
+    }
+}
+
+/// Distinguishes one engine's spill directory from another's.
+fn engine_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// The memory ceiling implied by the container this process is running in.
+///
+/// Returns `None` when there is no cgroup limit, which is the normal case on a laptop and
+/// means DuckDB's own default applies.
+fn cgroup_memory_limit() -> Option<String> {
+    // cgroup v2, then v1. Neither path exists on macOS.
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return memory_limit_from_cgroup(&contents);
+        }
+    }
+    None
+}
+
+/// The ceiling to set from a cgroup file's contents, at 80% of the limit.
+///
+/// Args:
+///     contents: The file's contents, which may be the literal `max` when unlimited.
+///
+/// Returns:
+///     A byte count as a string, or `None` when the file reports no real limit.
+fn memory_limit_from_cgroup(contents: &str) -> Option<String> {
+    let bytes: u64 = contents.trim().parse().ok()?;
+    // Both cgroup versions report an enormous sentinel rather than a flag when unlimited.
+    if bytes == 0 || bytes >= (1 << 62) {
+        return None;
+    }
+    // Divided before multiplying, because 8x a limit near the sentinel would overflow.
+    Some((bytes / 10 * 8).to_string())
+}
+
+/// Query methods, in their own block so the settings a deployment owns stay next to `open`.
+impl Engine {
     /// Join one view onto an entity frame, in the frame's own row order.
     ///
     /// Args:
@@ -1136,5 +1248,123 @@ mod tests {
             .expect("join");
 
         assert_eq!(counts(&joined), [Some(10)]);
+    }
+
+    #[test]
+    fn a_missing_spill_directory_is_created() {
+        // DuckDB creates the directory it spills into but not its parents, so a nested path
+        // that does not exist has to be created here, or the first spill fails instead.
+        let parent = std::env::temp_dir().join(format!("feather-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        let nested = parent.join("a/b");
+
+        let engine = Engine::open(&Limits {
+            temp_directory: nested.clone(),
+            ..Limits::default()
+        })
+        .expect("engine");
+
+        assert!(engine.spill_directory().is_dir());
+        assert!(engine.spill_directory().starts_with(&nested));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn each_engine_spills_into_its_own_directory() {
+        // DuckDB removes its spill directory when the instance shuts down, so two engines
+        // sharing one would let the first to finish delete the second's live spill files.
+        let limits = Limits::default();
+        let first = Engine::open(&limits).expect("first");
+        let second = Engine::open(&limits).expect("second");
+
+        assert_ne!(first.spill_directory(), second.spill_directory());
+    }
+
+    #[test]
+    fn an_engines_spill_directory_is_removed_with_it() {
+        let spill = {
+            let engine = Engine::open(&Limits::default()).expect("engine");
+            engine.spill_directory().to_path_buf()
+        };
+
+        assert!(!spill.exists(), "{} was left behind", spill.display());
+    }
+
+    #[test]
+    fn a_cgroup_limit_becomes_eighty_percent_of_it() {
+        assert_eq!(memory_limit_from_cgroup("1000\n"), Some("800".to_owned()));
+        assert_eq!(
+            memory_limit_from_cgroup("1000000000"),
+            Some("800000000".to_owned())
+        );
+        // `max`, the v1 sentinel, and zero all mean no real limit, which leaves DuckDB's own
+        // default of 80% of RAM in place.
+        assert_eq!(memory_limit_from_cgroup("max"), None);
+        assert_eq!(memory_limit_from_cgroup("9223372036854771712"), None);
+        assert_eq!(memory_limit_from_cgroup("0"), None);
+        assert_eq!(memory_limit_from_cgroup(""), None);
+    }
+
+    #[test]
+    fn a_rejected_setting_proves_it_reaches_the_engine() {
+        // A value DuckDB refuses is itself the assertion that the statement ran: if the
+        // setting were never applied, both of these would open successfully.
+        assert!(
+            Engine::open(&Limits {
+                memory_limit: Some("not-a-size".to_owned()),
+                ..Limits::default()
+            })
+            .is_err()
+        );
+        assert!(
+            Engine::open(&Limits {
+                max_temp_directory_size: Some("not-a-size".to_owned()),
+                ..Limits::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_constrained_join_agrees_with_an_unconstrained_one() {
+        // The limit is below what this join needs, so DuckDB spills intermediates and reads
+        // them back. Measured at 64MB against this data: it succeeds and writes about 1.7MB
+        // to the spill directory. Threads are pinned because DuckDB budgets memory per
+        // thread, so leaving them unpinned would move the floor with the core count and make
+        // a fixed limit machine-dependent.
+        let source = Source::write(&integer_source(
+            &(0..1_000_000i64)
+                .map(|i| (i % 5_000, i, i))
+                .collect::<Vec<_>>(),
+        ));
+        let labels = labels(
+            &(0..100_000i64)
+                .map(|i| (Some(i % 5_000), i + 1))
+                .collect::<Vec<_>>(),
+        );
+        let view = view(&source.string(), None);
+
+        let unconstrained = engine()
+            .point_in_time_join(&labels, &view, &JoinOptions::default())
+            .expect("unconstrained join");
+
+        let constrained = Engine::open(&Limits {
+            memory_limit: Some("64MB".to_owned()),
+            ..Limits::default()
+        })
+        .expect("engine");
+        constrained
+            .connection
+            .execute_batch("SET threads = 2")
+            .expect("threads");
+        let result = constrained
+            .point_in_time_join(&labels, &view, &JoinOptions::default())
+            .expect("constrained join");
+
+        assert_eq!(result.num_rows(), unconstrained.num_rows());
+        assert_eq!(rows(&result), rows(&unconstrained));
+        assert_eq!(counts(&result), counts(&unconstrained));
     }
 }
