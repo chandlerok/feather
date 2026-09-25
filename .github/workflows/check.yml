@@ -44,19 +44,19 @@ jobs:
           persist-credentials: false
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
-      # fmt and clippy are components of the toolchain rather than tools, so
-      # mise does not treat them as missing, and a mise-action cache hit can
-      # leave them uninstalled: the first run died on `cargo-fmt` not being
-      # installed for the toolchain. Installing it here is explicit and does not
-      # depend on the cache being cold.
+      # rustfmt is a component of the toolchain rather than a tool, so mise does
+      # not treat it as missing, and a mise-action cache hit can leave it
+      # uninstalled: the first run died on `cargo-fmt` not being installed for
+      # the toolchain. Installing it here is explicit and does not depend on the
+      # cache being cold.
       - name: rust components
         run: rustup component add rustfmt
       - name: fmt
         run: cargo fmt --all --check
-      # ruff is resolved as a tool rather than taken from the venv, because it is
-      # not a dependency: the Python job ran it through `uv run`, which pulls it
-      # from uv's tool cache. Same floating version either way, and this way it
-      # is on PATH without building the extension first.
+      # ruff is not a project dependency: it is in neither the dev group in
+      # pyproject.toml nor uv.lock. mise declares it and puts it on PATH, so
+      # the job calls it directly, the same tool `mise run lint:python` runs,
+      # and it no longer needs the extension built first.
       - name: ruff
         run: |
           ruff check python tests
@@ -80,57 +80,18 @@ jobs:
       # trees in parallel costs the largest one rather than their sum.
       - name: free disk space
         run: |
+          pids=()
           for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /usr/local/share/boost /usr/local/.ghcup; do
             sudo rm -rf "$dir" &
+            pids+=("$!")
           done
-          wait
+          for pid in "${pids[@]}"; do
+            wait "$pid" || exit 1
+          done
           df -h /
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
-      # The compiled DuckDB is content-addressed here rather than keyed by
-      # cargo's unit metadata. Cargo gives libduckdb-sys a build directory per
-      # distinct feature set and profile, so a change to either recompiles ~4000
-      # C++ translation units: locally that produced five separate 3.3GB builds
-      # in one target/ directory. ccache sees the same compile command and
-      # returns the object instead, which keeps a cold cargo cache from costing
-      # 45 minutes. Nothing here changes the compiler flags, so the linked result
-      # is the same as an unassisted build.
-      #
-      # The key is deliberately stable rather than a hash of Cargo.lock. This
-      # repository shares a 10GB cache budget with the cargo cache below, and a
-      # rolling key would add roughly a gigabyte per dependency change and
-      # eventually evict the entry that matters. The first run fills this with
-      # every object a full build produces, which is the whole set. A compiler or
-      # duckdb version change simply misses; bump the suffix to start over.
-      # renovate: datasource=github-tags depName=actions/cache
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.ccache
-            ~/.cache/ccache
-          key: ccache-v1-${{ runner.os }}
-      - name: ccache
-        run: |
-          if ! command -v ccache >/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ccache
-          fi
-          ccache --set-config=max_size=3G
-          ccache --set-config=compression=true
-          # Masquerade on PATH rather than CC/CXX in the environment, because
-          # those names are part of the rust-cache key and setting them would
-          # give this job another key of its own.
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          # Both candidates for ccache's own directory are created and both are
-          # cached, so the layout does not depend on whether this image sets
-          # XDG_CACHE_HOME.
-          mkdir -p "$HOME/.ccache" "$HOME/.cache/ccache"
-          ccache --version | head -1
-          for cc in gcc g++ cc c++; do
-            test -x "/usr/lib/ccache/$cc" ||
-              echo "::warning::ccache has no $cc masquerade, the C++ build is uncached"
-          done
       # Bundled DuckDB compiles from source on a cold cache: measured on a
       # 2-core runner the rust job takes around 45 minutes, nearly all of it in
       # clippy and test.
@@ -180,11 +141,6 @@ jobs:
       - name: services down
         if: always()
         run: docker compose down -v
-      # Printed so the hit rate is visible rather than assumed. A run that
-      # recompiles DuckDB shows up here as misses.
-      - name: ccache stats
-        if: always()
-        run: ccache -s || true
 
   python:
     name: python ${{ matrix.python }}
@@ -201,6 +157,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      # Same cleanup as the rust job, for the same reason. The two jobs now
+      # share one cargo cache key, so this job restores the same 2267MB entry
+      # and extracting it is what fills the disk: the rust job only survives
+      # that restore because it deletes these trees first. The runner died with
+      # "No space left on device" while writing its own diagnostic log, part
+      # way through the restore, which is also why this job's log is missing.
+      - name: free disk space
+        run: |
+          pids=()
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup; do
+            sudo rm -rf "$dir" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid" || exit 1
+          done
+          df -h /
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # astral-sh/setup-uv, pinned at v10.2.0
@@ -217,35 +191,13 @@ jobs:
       # cold-cache figure is around 45. See the cold-build issue.
       #
       # Both matrix entries restore the entry the rust job writes, which is
-      # where that archive lives, and fall back to ccache for the C++ objects if
-      # it misses. Before the keys were unified each entry compiled the C++
-      # itself, and a pull request spent 26 minutes in this job alone.
+      # where that archive lives. Before the keys were unified each entry
+      # compiled the C++ itself, and a pull request spent 26 minutes in this job
+      # alone.
       #
       # This is also the only place the Python-to-Rust handoff is tested at
       # all: the rust job links the core directly and never loads the
       # extension.
-      # renovate: datasource=github-tags depName=actions/cache
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.ccache
-            ~/.cache/ccache
-          key: ccache-v1-${{ runner.os }}
-      - name: ccache
-        run: |
-          if ! command -v ccache >/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ccache
-          fi
-          ccache --set-config=max_size=3G
-          ccache --set-config=compression=true
-          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
-          mkdir -p "$HOME/.ccache" "$HOME/.cache/ccache"
-          ccache --version | head -1
-          for cc in gcc g++ cc c++; do
-            test -x "/usr/lib/ccache/$cc" ||
-              echo "::warning::ccache has no $cc masquerade, the C++ build is uncached"
-          done
       # Restore only. The rust job writes the one entry both matrix entries
       # read, and a second writer with a narrower target directory would only
       # race it.
@@ -265,6 +217,3 @@ jobs:
         run: uv run --no-sync pyrefly check
       - name: pytest
         run: uv run --no-sync pytest
-      - name: ccache stats
-        if: always()
-        run: ccache -s || true

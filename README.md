@@ -130,7 +130,11 @@ Refusing to push to main. Open a pull request instead.
 
 The hook is declared in `hk.pkl` and reads the refs Git hands the hook, so
 `git push origin feature:main` is caught along with `git push origin main`. `mise run setup`
-installs it; `mise run check` runs what CI runs.
+installs it; `mise run check` runs what CI runs. The Rust toolchain is pinned in `mise.toml`
+rather than in a `rust-toolchain.toml`, so run cargo through mise, in an activated shell or as
+`mise run ...`, to build with the compiler CI uses. A newer rustup default builds its own
+`target/` and can accept code the pinned compiler rejects, and the resolved compiler version is
+what the CI build cache is keyed on.
 
 The hook is local. It guards only a clone where it has been installed, and
 `git push --no-verify` skips it. Server-side enforcement is not available on this
