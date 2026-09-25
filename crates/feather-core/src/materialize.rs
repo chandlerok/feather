@@ -30,8 +30,8 @@ use arrow::record_batch::RecordBatch;
 use crate::definitions::FeatureView;
 use crate::error::{Error, Result};
 use crate::key::{
-    encode_entity_key_for, entity_hash_key, entity_key_component, freshness_field, value_field,
-    views_registry_key,
+    encode_entity_key_for, entity_hash_key, entity_key_component, freshness_field,
+    is_entity_hash_key, value_field, views_registry_key,
 };
 use crate::offline::{Engine, LatestBatchSink, SCAN_TS_COLUMN};
 use crate::online::{OnlineStore, ProjectScan, WriteBatch, WrittenField, encode_freshness};
@@ -58,6 +58,9 @@ pub struct ViewRefresh {
 pub struct MaterializeReport {
     /// One entry per refreshed view, in declaration order.
     pub views: Vec<ViewRefresh>,
+    /// The views a previous refresh declared and this one does not, whose fields were removed
+    /// from the store. Empty on every run but the one that follows a rename or a removal.
+    pub retired: Vec<String>,
     /// Rows written across every refreshed view.
     pub total_rows: u64,
     /// How long the whole call took.
@@ -129,6 +132,19 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
         });
     }
 
+    // A retired view is one the previous refresh declared and this one does not. Its fields
+    // cannot be found from the declarations alone: the entities it used to cover do not have to
+    // appear in any source any more, so the keyspace is the only complete list of where they
+    // are. This is therefore the one part of a refresh that is not a pure function of its
+    // inputs, and it is why the walk happens here and nowhere else.
+    let declared_names: BTreeSet<&str> = declared.iter().map(|view| view.name.as_str()).collect();
+    let retired: Vec<String> = registry
+        .keys()
+        .filter(|name| !declared_names.contains(name.as_str()))
+        .cloned()
+        .collect();
+    collect_orphans(store, project, &retired).await?;
+
     // The registry is written last, after every value write. The order is the whole argument
     // for what a crashed run costs: a run that dies before this point leaves the retired views
     // in the registry, so the next run computes the same `retired` set and walks the keyspace
@@ -159,7 +175,61 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
         total_rows: views.iter().map(|view| view.rows).sum(),
         elapsed: started.elapsed(),
         views,
+        retired,
     })
+}
+
+/// Remove a retired view's fields from every entity hash of a project.
+///
+/// The refresh already knows which views retired, from the registry it read. What it does not
+/// know is where their fields are, so the project's keyspace is walked once. That walk is the
+/// only reason a refresh reads keys it was not asked to write.
+///
+/// Args:
+///     store: The online store to delete from.
+///     project: The project whose keyspace is walked.
+///     retired: The view names to remove the fields of. An empty list walks nothing.
+///
+/// Returns:
+///     How many entity hashes were visited, whether or not they held anything.
+///
+/// Raises:
+///     Whatever the store reports for a failed scan or deletion.
+///
+/// The deletion is idempotent: removing a field that is already gone is a no-op, so a run that
+/// died after deleting can be repeated. That is what lets the registry be written last, and the
+/// comment on that write says why the order matters.
+pub async fn collect_orphans<S: OnlineStore + ProjectScan>(
+    store: &mut S,
+    project: &str,
+    retired: &[String],
+) -> Result<usize> {
+    if retired.is_empty() {
+        return Ok(0);
+    }
+
+    let registry_key = views_registry_key(project);
+    let scanned = store.scan_entity_keys(project, &registry_key).await?;
+
+    let mut fields = Vec::with_capacity(retired.len() * 2);
+    for view in retired {
+        fields.push(value_field(view));
+        fields.push(freshness_field(view));
+    }
+
+    let mut deletions = Vec::with_capacity(scanned.len());
+    for key in scanned {
+        // Only a key shaped like an entity hash is touched. `HDEL` against a key that is not a
+        // hash fails with `WRONGTYPE`, so a walk that deleted blindly would fail a refresh over
+        // a key that has nothing to do with the view being retired.
+        if is_entity_hash_key(&key, project) {
+            deletions.push((key, fields.clone()));
+        }
+    }
+
+    let visited = deletions.len();
+    store.delete_fields(&deletions).await?;
+    Ok(visited)
 }
 
 /// The views a refresh was asked for, in declaration order.
@@ -313,6 +383,7 @@ mod tests {
     use super::*;
     use crate::definitions::{DType, Entity, Field as FeatureField, Source};
     use crate::offline::{Engine, Limits};
+    use crate::online::ReadRequest;
     use crate::online::memory::MemoryStore;
     use crate::value::{SchemaTag, decode_batch};
 
@@ -599,6 +670,159 @@ mod tests {
         let registry = store.fields(&views_registry_key("ads")).expect("registry");
         assert_eq!(registry.get("clicks"), Some(&encode_freshness(100)));
         assert_eq!(registry.get("stats"), Some(&encode_freshness(100)));
+    }
+
+    /// A store that counts the keyspace walks a refresh performs, to pin that a refresh with
+    /// nothing retired does not walk at all.
+    struct CountingWalk {
+        inner: MemoryStore,
+        walks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl OnlineStore for CountingWalk {
+        async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+            self.inner.write(batches).await
+        }
+
+        async fn read(&self, requests: &[ReadRequest]) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
+            self.inner.read(requests).await
+        }
+
+        async fn delete_fields(&mut self, keys: &[(Vec<u8>, Vec<String>)]) -> Result<()> {
+            self.inner.delete_fields(keys).await
+        }
+    }
+
+    impl ProjectScan for CountingWalk {
+        async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+            self.inner.hash_fields(key).await
+        }
+
+        async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>> {
+            self.walks.fetch_add(1, Ordering::SeqCst);
+            self.inner.scan_entity_keys(project, exclude).await
+        }
+    }
+
+    /// Two views over one fixture, so one can be retired and the other left alone.
+    fn two_views(path: &str) -> Vec<FeatureView> {
+        let mut stats = a_view(path, None);
+        stats.name = "stats".to_owned();
+        vec![a_view(path, None), stats]
+    }
+
+    #[tokio::test]
+    async fn a_retired_views_fields_go_and_a_live_views_fields_stay() {
+        let source = Parquet::write(&source(&[(1, 100, 10), (2, 200, 20)]));
+        let declared = two_views(&source.string());
+        let mut store = MemoryStore::new();
+        let engine = an_engine();
+        materialize(&mut store, &engine, "ads", &declared, &[])
+            .await
+            .expect("refresh both views");
+
+        // Only `clicks` is declared now, so `stats` is retired and its fields have to go.
+        let report = materialize(&mut store, &engine, "ads", &declared[..1], &[])
+            .await
+            .expect("retire stats");
+
+        assert_eq!(report.retired, vec!["stats".to_owned()]);
+        for entity in [b"1".as_slice(), b"2".as_slice()] {
+            let fields = store
+                .fields(&key_of(entity))
+                .expect("a live entity keeps its hash");
+            assert!(fields.contains_key(&value_field("clicks")));
+            assert!(fields.contains_key(&freshness_field("clicks")));
+            assert!(!fields.contains_key(&value_field("stats")));
+            assert!(!fields.contains_key(&freshness_field("stats")));
+        }
+    }
+
+    #[tokio::test]
+    async fn collecting_the_same_orphans_twice_is_the_same_as_collecting_them_once() {
+        let source = Parquet::write(&source(&[(1, 100, 10)]));
+        let declared = two_views(&source.string());
+        let mut store = MemoryStore::new();
+        materialize(&mut store, &an_engine(), "ads", &declared, &[])
+            .await
+            .expect("refresh both views");
+
+        let once = collect_orphans(&mut store, "ads", &["stats".to_owned()])
+            .await
+            .expect("collect");
+        let twice = collect_orphans(&mut store, "ads", &["stats".to_owned()])
+            .await
+            .expect("collect again");
+
+        assert_eq!(once, 1);
+        assert_eq!(
+            twice, 1,
+            "the walk happens either way; the deletion is a no-op"
+        );
+        let fields = store.fields(&key_of(b"1")).expect("hash");
+        assert!(fields.contains_key(&value_field("clicks")));
+        assert!(!fields.contains_key(&value_field("stats")));
+    }
+
+    #[tokio::test]
+    async fn a_key_that_is_not_an_entity_hash_is_left_alone() {
+        let source = Parquet::write(&source(&[(1, 100, 10)]));
+        let declared = two_views(&source.string());
+        let mut store = MemoryStore::new();
+        materialize(&mut store, &an_engine(), "ads", &declared, &[])
+            .await
+            .expect("refresh both views");
+
+        // Something else under the same project prefix, holding a field named like a retired
+        // view's. A walk that deleted blindly would send `HDEL` at it.
+        store
+            .write(&[WriteBatch {
+                key: b"ads:meta".to_vec(),
+                fields: vec![WrittenField::new(value_field("stats"), b"x".to_vec(), None)],
+            }])
+            .await
+            .expect("stray key");
+
+        collect_orphans(&mut store, "ads", &["stats".to_owned()])
+            .await
+            .expect("collect");
+
+        assert!(
+            store
+                .fields(b"ads:meta")
+                .is_some_and(|fields| fields.contains_key(&value_field("stats"))),
+            "a key that is not shaped like an entity hash is not touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_declared_set_never_walks_the_keyspace() {
+        let source = Parquet::write(&source(&[(1, 100, 10)]));
+        let declared = two_views(&source.string());
+        let walks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut store = CountingWalk {
+            inner: MemoryStore::new(),
+            walks: Arc::clone(&walks),
+        };
+        let engine = an_engine();
+        materialize(&mut store, &engine, "ads", &declared, &[])
+            .await
+            .expect("first refresh");
+        materialize(&mut store, &engine, "ads", &declared, &[])
+            .await
+            .expect("second refresh");
+
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            0,
+            "the registry exists and nothing retired, so there is nothing to collect"
+        );
+        // Two refreshes, and the registry still names both views.
+        let registry = store
+            .inner
+            .fields(&views_registry_key("ads"))
+            .expect("registry");
+        assert_eq!(registry.len(), 2);
     }
 
     #[tokio::test]
