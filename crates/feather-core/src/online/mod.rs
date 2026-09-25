@@ -122,6 +122,49 @@ pub trait ProjectScan {
     ///     Each field with its value. An absent key yields an empty list rather than an error,
     ///     which is the first refresh of a project.
     async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>>;
+
+    /// Every key in a project's namespace except `exclude`, which is compared exactly.
+    ///
+    /// Used to find the entity hashes a retired view's fields may still sit in. An entity that
+    /// the retired view used to cover does not have to appear in the source any more, so there
+    /// is no way to enumerate them from the declarations: the keyspace itself is the only
+    /// complete list.
+    ///
+    /// Args:
+    ///     project: The project whose keys are wanted.
+    ///     exclude: A key to leave out. The caller names the project registry, which lives
+    ///         under the same prefix and is not an entity hash.
+    ///
+    /// Returns:
+    ///     The keys, in no particular order. The caller filters them further; this is a key
+    ///     listing, not a promise that every key in it is an entity hash.
+    async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>>;
+}
+
+/// The key prefix every key of a project shares.
+///
+/// One spelling of the prefix, so a walk and a filter cannot disagree about where a project's
+/// keys start.
+pub fn project_key_prefix(project: &str) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(project.len() + 1);
+    prefix.extend_from_slice(project.as_bytes());
+    prefix.push(b':');
+    prefix
+}
+
+/// A project name escaped for a `SCAN` pattern.
+///
+/// `MATCH` reads `*`, `?`, `[` and `\` as pattern syntax, so a project named `ads*` would
+/// otherwise walk another project's keys. Backslash is the escape for all four.
+pub fn glob_escape(project: &str) -> String {
+    let mut escaped = String::with_capacity(project.len());
+    for character in project.chars() {
+        if matches!(character, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// Why a view's values are not usable for an entity.
@@ -593,6 +636,54 @@ mod tests {
             read_entities(&store, "ads", &many, &[entity], NOW).await,
             Err(Error::MixedEntities { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_keyspace_scan_returns_the_entity_hashes_and_not_the_registry() {
+        use crate::key::views_registry_key;
+        let mut store = MemoryStore::new();
+        let registry = views_registry_key("ads");
+        let mut keys = vec![registry.clone()];
+        for entity in [b"u1".as_slice(), b"u2".as_slice()] {
+            let key = crate::key::entity_hash_key("ads", "user_id", entity);
+            store
+                .write(&[WriteBatch {
+                    key: key.clone(),
+                    fields: vec![WrittenField::new(
+                        crate::key::value_field("clicks"),
+                        vec![1],
+                        None,
+                    )],
+                }])
+                .await
+                .unwrap();
+            keys.push(key);
+        }
+        store
+            .write(&[WriteBatch {
+                key: registry.clone(),
+                fields: vec![WrittenField::new("clicks", vec![2], None)],
+            }])
+            .await
+            .unwrap();
+
+        let mut scanned = store.scan_entity_keys("ads", &registry).await.unwrap();
+        scanned.sort();
+        keys.remove(0);
+        keys.sort();
+        assert_eq!(scanned, keys);
+
+        // Another project shares no prefix with this one.
+        assert!(
+            store
+                .scan_entity_keys("other", b"other:views")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let fields = store.hash_fields(&registry).await.unwrap();
+        assert_eq!(fields, vec![("clicks".to_owned(), vec![2])]);
     }
 
     #[tokio::test]

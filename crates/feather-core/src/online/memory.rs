@@ -114,4 +114,14 @@ impl ProjectScan for MemoryStore {
             })
             .unwrap_or_default())
     }
+
+    async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let prefix = crate::online::project_key_prefix(project);
+        Ok(self
+            .hashes
+            .keys()
+            .filter(|key| key.starts_with(&prefix) && key.as_slice() != exclude)
+            .cloned()
+            .collect())
+    }
 }

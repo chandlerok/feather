@@ -25,6 +25,10 @@ use crate::error::Result;
 /// enough that one flush does not hold a multi-megabyte request buffer.
 const DEFAULT_CHUNK: usize = 1024;
 
+/// How many keys one `SCAN` step is asked to return. A hint to the server, not a bound on the
+/// reply, and large enough that a project of any size takes few steps.
+const SCAN_COUNT: usize = 1024;
+
 /// How a server sets an absolute expiry on a hash field, decided once per connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldExpiry {
@@ -293,5 +297,35 @@ impl ProjectScan for ValkeyStore {
             .query_async(&mut connection)
             .await?;
         Ok(fields.into_iter().collect())
+    }
+
+    async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut connection = self.connection.clone();
+        let pattern = format!("{}*", crate::online::glob_escape(project));
+        let mut keys = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            // `SCAN` with a bounded `COUNT`, never `KEYS`: a walk that blocks the server for its
+            // whole duration is not something a refresh may do to a serving instance. The count
+            // is a hint, so the reply's length is not the bound; the loop ends when the server
+            // returns cursor 0.
+            let (next, batch): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_COUNT)
+                .query_async(&mut connection)
+                .await?;
+            for key in batch {
+                if key.as_slice() != exclude {
+                    keys.push(key);
+                }
+            }
+            cursor = next;
+            if cursor == 0 {
+                return Ok(keys);
+            }
+        }
     }
 }
