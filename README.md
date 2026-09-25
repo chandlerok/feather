@@ -109,6 +109,26 @@ The same code runs against remote stores; only `feather.toml` changes. The
 configuration schema, the query routing rules, and the deployment topology are described in
 [the architecture document](docs/rust_feature_store_architecture.md).
 
+## Contributing
+
+`main` takes no direct pushes. Every change reaches it through a pull request, and a
+pre-push hook refuses a push that would update `refs/heads/main`:
+
+```text
+$ git push origin main
+Refusing to push to main. Open a pull request instead.
+```
+
+The hook is declared in `hk.pkl` and reads the refs Git hands the hook, so
+`git push origin feature:main` is caught along with `git push origin main`. `mise run setup`
+installs it; `mise run check` runs what CI runs.
+
+The hook is local. It guards only a clone where it has been installed, and
+`git push --no-verify` skips it. Server-side enforcement is not available on this
+repository: it is private, and GitHub offers branch protection and branch rulesets for
+private repositories only on a paid plan. Making the repository public, or upgrading to
+GitHub Pro, is what would close that gap.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).

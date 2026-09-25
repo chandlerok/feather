@@ -39,6 +39,31 @@ local linters = new Mapping<String, Step> {
   }
 }
 
+// Refuses a push that would update `refs/heads/main`.
+//
+// Reads the refs Git pipes to the hook, not the checked-out branch. The
+// `no_commit_to_branch` builtin runs `hk util no-commit-to-branch`, which reads
+// `git symbolic-ref --short HEAD`: that would block `git push origin feature`
+// while on main, and allow `git push origin feature:main` while on a branch. The
+// second case is the hole this exists to close, so the builtin is the wrong tool
+// here despite the name.
+//
+// A hook is local, so it only guards a clone where it is installed, and
+// `git push --no-verify` skips it. This repository is private on GitHub Free,
+// which offers neither branch protection nor branch rulesets, so there is no
+// server-side backstop. See README "Contributing".
+local noPushToMain = new Step {
+  // Git's pre-push stdin, one line per ref being pushed:
+  // `<local-ref> <local-sha> <remote-ref> <remote-sha>`.
+  stdin = "{{ hook_stdin }}"
+  check = """
+    if awk '$3 == "refs/heads/main" { found = 1 } END { exit found ? 0 : 1 }'; then
+      echo "Refusing to push to main. Open a pull request instead." >&2
+      exit 1
+    fi
+    """
+}
+
 hooks {
   ["pre-commit"] {
     // Check only. Autofix on every commit is surprising; use `hk fix`.
@@ -46,7 +71,12 @@ hooks {
     steps = linters
   }
   ["pre-push"] {
-    steps = linters
+    // Listed first so it reports before the linters do, though steps run
+    // concurrently: a failing linter blocks the push too.
+    steps = new Mapping<String, Step> {
+      ["no-push-to-main"] = noPushToMain
+      ...linters
+    }
   }
   ["check"] {
     steps = linters
