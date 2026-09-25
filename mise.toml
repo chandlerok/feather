@@ -84,6 +84,42 @@ run = "docker compose logs -f valkey"
 [tasks."valkey:cli"]
 run = "docker compose exec valkey valkey-cli"
 
+# The bucket cannot come from the server. RUSTFS_DEFAULT_BUCKETS is ignored by the image
+# (the variable reaches the container and no bucket appears), rustfs 1.0.0 has no
+# bucket-create subcommand, and writing an object into a missing bucket is refused rather
+# than creating one, so docker-compose.yml declares no bucket at all. curl signs this PUT
+# itself (`--aws-sigv4`), which is why it needs no S3 client. The retry doubles as the
+# readiness wait, because `--wait` returns when the container is running rather than when
+# the server accepts connections. The endpoint, credentials, and bucket name mirror
+# docker-compose.yml, which is where the server gets them.
+[tasks."s3:up"]
+description = "Start RustFS and create the bucket the S3 integration test reads"
+run = '''
+docker compose up -d --wait rustfs
+
+for _ in $(seq 30); do
+  curl -fsS -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "feathertest:feathertest" "http://127.0.0.1:9000/feather-test" && exit 0
+  # Retry a refused connection; stop on anything else, which is a real error rather
+  # than a server that has not started listening yet.
+  code=$?
+  [ "$code" = 7 ] || { echo "curl --aws-sigv4 exited $code" >&2; exit "$code"; }
+  sleep 1
+done
+
+echo "RustFS at 127.0.0.1:9000 did not accept a connection within 30s" >&2
+exit 1
+'''
+
+# This compose version rejects a service argument to `down`, so, as with `valkey:down`,
+# stopping one container stops the project and deletes both volumes.
+[tasks."s3:down"]
+description = "Stop RustFS and Valkey and delete their volumes"
+run = "docker compose down -v"
+
+[tasks."s3:logs"]
+run = "docker compose logs -f rustfs"
+
 # ------------------------------------------------------------------ load/bench
 
 [tasks.bench]

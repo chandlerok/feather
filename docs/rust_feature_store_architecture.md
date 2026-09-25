@@ -938,6 +938,12 @@ type = "s3"
 region = "us-east-1"
 key_id = "${AWS_ACCESS_KEY_ID}"
 secret = "${AWS_SECRET_ACCESS_KEY}"
+# An S3-compatible store rather than AWS. The key pair comes from the same environment
+# variables, but the endpoint is not AWS's, and DuckDB addresses S3 virtual hosted style
+# over TLS by default, which a server reached at a host and a port does not answer.
+endpoint = "minio.internal.svc:9000"
+use_ssl = false
+url_style = "path"
 
 [valkey]
 endpoint = "valkey-cluster.internal.svc:6379"
@@ -953,6 +959,16 @@ max_capacity_mb = 2048
 # contract when an invalidation message is missed.
 fallback_ttl_seconds = 30
 ```
+
+An `endpoint` is what makes the entry an S3-compatible store rather than AWS, and it brings
+`use_ssl` and `url_style` with it, because DuckDB's defaults are AWS's. Its S3 client
+addresses buckets virtual hosted style and speaks TLS, while a server reached at a host and a
+port answers path style in the clear, so an `endpoint` implies path style and is paired with an
+explicit `use_ssl`. Both are written out in the example rather than left to that implication,
+since the implication exists to make the common local case short, not to make the two settings
+invisible. The integration test in `crates/feather-core/tests/s3_integration.rs` runs against
+RustFS, an S3-compatible server, and joins the same Parquet rows read from a local file and
+from `s3://` to check that the two agree.
 
 Three absences are deliberate.
 
