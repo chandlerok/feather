@@ -12,7 +12,7 @@ import pydantic
 import pytest
 
 from feather import FeatherSettings, load_settings
-from feather.settings import DEFAULT_PATH, S3Connection, SnowflakeConnection
+from feather.settings import DEFAULT_PATH, PostgresConnection, S3Connection, SnowflakeConnection
 
 LOCAL = """
 project = "ad_recommendations"
@@ -45,6 +45,21 @@ field_expiration = true
 enabled = true
 max_capacity_mb = 2048
 fallback_ttl_seconds = 30
+"""
+
+
+POSTGRES = """
+project = "ad_recommendations"
+definitions = ["definitions/user_clicks.py"]
+
+[connections.pg_prod]
+type = "postgres"
+host = "pg.internal.svc"
+port = 5433
+database = "warehouse"
+user = "fs_runner"
+password = "${POSTGRES_PASSWORD}"
+ssl_mode = "verify-full"
 """
 
 
@@ -115,6 +130,85 @@ def test_the_l1_cache_is_configured_without_valkey(tmp_path: Path) -> None:
     assert settings.l1_cache is not None
     assert settings.l1_cache.max_capacity_mb == 512
     assert settings.l1_cache.enabled is True
+
+
+def test_a_postgres_connection_arrives_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "pgsecret")
+
+    settings = load_settings(write(tmp_path, POSTGRES))
+
+    pg = settings.connections["pg_prod"]
+    assert isinstance(pg, PostgresConnection)
+    # Compared as a whole rather than field by field, so a key the core produces and the
+    # binding does not know about is a failure here instead of being ignored. The password
+    # is masked in a dump, which is the property the `SecretStr` is there for.
+    assert pg.model_dump(mode="json") == {
+        "type": "postgres",
+        "host": "pg.internal.svc",
+        "port": 5433,
+        "database": "warehouse",
+        "user": "fs_runner",
+        "password": "**********",
+        "ssl_mode": "verify-full",
+    }
+
+
+def test_a_postgres_connection_validates_without_a_file() -> None:
+    """The binding's own model, so its defaults and its secret are checked directly."""
+    pg = PostgresConnection.model_validate(
+        {
+            "type": "postgres",
+            "host": "h",
+            "database": "d",
+            "user": "u",
+            "password": "pgsecret",
+        }
+    )
+
+    assert pg.port == 5432
+    assert pg.ssl_mode is None
+    assert pg.password.get_secret_value() == "pgsecret"
+    assert "pgsecret" not in repr(pg)
+
+
+def test_a_postgres_port_defaults_to_5432(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("POSTGRES_PASSWORD", "pgsecret")
+    body = POSTGRES.replace("port = 5433\n", "")
+
+    pg = load_settings(write(tmp_path, body)).connections["pg_prod"]
+
+    # Absent in the file, so the binding's own default applies, which is what libpq's
+    # would be.
+    assert isinstance(pg, PostgresConnection)
+    assert pg.model_dump(mode="json")["port"] == 5432
+
+
+def test_an_empty_postgres_host_is_rejected_in_the_model() -> None:
+    """A present-but-empty value is rejected by the binding as well as by the core."""
+    body = {
+        "type": "postgres",
+        "host": "",
+        "database": "d",
+        "user": "u",
+        "password": "p",
+    }
+
+    with pytest.raises(pydantic.ValidationError):
+        PostgresConnection.model_validate(body)
+
+
+def test_the_connection_union_rejects_an_unknown_type() -> None:
+    """The union is discriminated on `type`, so an unlisted kind has no variant."""
+    with pytest.raises(pydantic.ValidationError):
+        FeatherSettings.model_validate(
+            {
+                "project": "p",
+                "definitions": ["definitions/a.py"],
+                "connections": {"pg": {"type": "mysql", "host": "h"}},
+            }
+        )
 
 
 def test_a_missing_file_raises_file_not_found(tmp_path: Path) -> None:

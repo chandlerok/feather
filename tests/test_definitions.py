@@ -18,6 +18,7 @@ from feather import (
     FileSource,
     Float64,
     Int64,
+    PostgresSource,
     Utf8,
     config_to_wire,
     feature_view,
@@ -27,6 +28,7 @@ from feather import (
 
 USER = Entity(name="user_id", join_key="user_id")
 SOURCE = FileSource(path="data/user_stats.parquet")
+POSTGRES_SOURCE = PostgresSource(connection="pg_prod", schema="public", table="user_stats")
 
 
 @feature_view(name="user_clicks", entity=USER, source=SOURCE, ttl_days=30)
@@ -58,6 +60,11 @@ class OtherUserClicks(FeatureView):
     other = Field(Int64)
 
 
+@feature_view(name="user_stats_pg", entity=USER, source=POSTGRES_SOURCE)
+class UserStatsPg(FeatureView):
+    ltv = Field(Float64)
+
+
 def test_a_declared_view_compiles_to_the_wire_model() -> None:
     """The declarative layer produces what Rust deserializes."""
     wire = view_to_wire(UserClicks)
@@ -80,7 +87,7 @@ def test_the_compiled_json_is_the_rust_contract() -> None:
     assert payload["views"][0] == {
         "name": "user_clicks",
         "entities": [{"name": "user_id", "join_key": "user_id"}],
-        "source": {"path": "data/user_stats.parquet"},
+        "source": {"type": "file", "path": "data/user_stats.parquet"},
         "features": [
             {"name": "click_count", "dtype": "int64"},
             {"name": "purchase_count", "dtype": "int64"},
@@ -88,6 +95,19 @@ def test_the_compiled_json_is_the_rust_contract() -> None:
         "ttl_days": 30,
         "timestamp_field": None,
         "created_timestamp_field": None,
+    }
+
+
+def test_a_view_over_a_postgres_table_compiles_to_the_tagged_source() -> None:
+    """Either source kind reaches Rust the same way, tagged with its kind."""
+    config = FeatureStoreConfig(project="ads", views=[UserStatsPg])
+    payload = json.loads(config_to_wire(config).model_dump_json())
+
+    assert payload["views"][0]["source"] == {
+        "type": "postgres",
+        "connection": "pg_prod",
+        "schema": "public",
+        "table": "user_stats",
     }
 
 

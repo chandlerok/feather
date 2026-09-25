@@ -22,6 +22,7 @@ from feather._wire import (
     FeatureView,
     Field,
     FileSource,
+    PostgresSource,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "definitions.json"
@@ -79,7 +80,7 @@ def test_definition_json_uses_the_keys_rust_expects() -> None:
     view = payload["views"][0]
     assert view["name"] == "user_clicks"
     assert view["entities"] == [{"name": "user_id", "join_key": "user_id"}]
-    assert view["source"] == {"path": "data/user_stats.parquet"}
+    assert view["source"] == {"type": "file", "path": "data/user_stats.parquet"}
     assert view["features"] == [{"name": "click_count", "dtype": "int64"}]
     assert view["ttl_days"] == 30
     # Absent optional fields serialize as null, which serde's default handles.
@@ -89,6 +90,50 @@ def test_definition_json_uses_the_keys_rust_expects() -> None:
         "name": "ranking",
         "features": ["user_clicks:click_count"],
     }
+
+
+def test_a_postgres_source_serializes_with_its_own_tag() -> None:
+    """The second source kind crosses with its tag and its own keys.
+
+    The tag is what selects the variant on the Rust side, so a source that serializes
+    without one would be read as whatever kind serde tried first.
+    """
+    view = a_view(source=PostgresSource(connection="pg_prod", schema="public", table="user_stats"))
+
+    payload = json.loads(FeatureStoreConfig(project="ads", views=[view]).model_dump_json())
+
+    assert payload["views"][0]["source"] == {
+        "type": "postgres",
+        "connection": "pg_prod",
+        "schema": "public",
+        "table": "user_stats",
+    }
+
+
+def test_a_source_of_an_unknown_type_is_rejected() -> None:
+    """The union is discriminated on `type`, so an unlisted kind has no variant."""
+    with pytest.raises(pydantic.ValidationError):
+        FeatureView.model_validate(
+            {
+                "name": "v",
+                "entities": [{"name": "e", "join_key": "e"}],
+                "source": {"type": "bigquery", "table": "t"},
+                "features": [{"name": "f", "dtype": "int64"}],
+            }
+        )
+
+
+def test_a_source_key_belonging_to_another_kind_is_rejected() -> None:
+    """A key lifted from the other variant is a mistake, not something to ignore."""
+    with pytest.raises(pydantic.ValidationError):
+        FeatureView.model_validate(
+            {
+                "name": "v",
+                "entities": [{"name": "e", "join_key": "e"}],
+                "source": {"type": "file", "path": "p", "table": "t"},
+                "features": [{"name": "f", "dtype": "int64"}],
+            }
+        )
 
 
 def test_an_unknown_wire_name_is_rejected() -> None:

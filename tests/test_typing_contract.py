@@ -27,18 +27,25 @@ from feather import (
     Field,
     FileSource,
     Int64,
+    PostgresSource,
     Utf8,
     feature_view,
 )
 
 USER = Entity(name="user_id", join_key="user_id")
 SOURCE = FileSource(path="data/user_stats.parquet")
+POSTGRES = PostgresSource(connection="pg_prod", schema="public", table="user_stats")
 
 
 @feature_view(name="user_clicks", entity=USER, source=SOURCE)
 class UserClicks(FeatureView):
     click_count = Field(Int64)
     label = Field(Utf8)
+
+
+@feature_view(name="user_stats", entity=USER, source=POSTGRES)
+class UserStats(FeatureView):
+    order_count = Field(Int64)
 
 
 class NotAView:
@@ -49,6 +56,9 @@ def _positive() -> None:
     """References are typed, and configuration is an ordinary checked call."""
     assert_type(UserClicks.click_count, Field[Int64])
     assert_type(UserClicks.label, Field[Utf8])
+
+    # Either source kind is a source, and neither narrows what the decorator accepts.
+    assert_type(UserStats.order_count, Field[Int64])
 
     # A selection may mix dtypes, and a whole view is allowed alongside fields.
     FeatureService(name="mixed", features=[UserClicks.click_count, UserClicks.label])
@@ -80,6 +90,14 @@ def _negative() -> None:
     # The decorator only applies to a declared view.
     apply_view = feature_view(name="x", entity=USER, source=SOURCE)
     apply_view(NotAView)  # pyrefly: ignore[bad-specialization]
+
+    # A source is a model rather than a path, so a bare string is rejected here rather
+    # than at the first read.
+    feature_view(
+        name="x",
+        entity=USER,
+        source="data/user_stats.parquet",  # pyrefly: ignore[bad-argument-type]
+    )
 
 
 def _bad_marker() -> None:

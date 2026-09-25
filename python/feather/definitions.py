@@ -38,7 +38,7 @@ from feather.types import DType
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from feather._wire import Entity, FileSource
+    from feather._wire import Entity, Source
 
 T = TypeVar("T", bound=DType, covariant=True)
 """A field's dtype. Covariant so a selection can mix dtypes in one list."""
@@ -59,7 +59,7 @@ class _ViewConfig:
 
     name: str
     entity: Entity
-    source: FileSource
+    source: Source
     ttl_days: int | None
     timestamp_field: str | None
     created_timestamp_field: str | None
@@ -126,7 +126,7 @@ def feature_view(
     *,
     name: str,
     entity: Entity,
-    source: FileSource,
+    source: Source,
     ttl_days: int | None = None,
     timestamp_field: str | None = None,
     created_timestamp_field: str | None = None,
@@ -138,7 +138,8 @@ def feature_view(
             ``view:feature`` convention use.
         entity: The entity the view is keyed by. Not a list: v1 keys one hash per
             entity, so the wire model rejects more than one.
-        source: The offline source the features are read from.
+        source: The offline source the features are read from: ``FileSource`` for a
+            Parquet file, ``PostgresSource`` for a table in a configured database.
         ttl_days: Whole days before a value is stale, or None for no expiry.
             Deliberately not a duration: Rust stores whole days, so a
             ``timedelta`` would silently truncate.
