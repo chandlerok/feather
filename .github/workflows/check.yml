@@ -104,12 +104,15 @@ jobs:
       - name: pin the interpreter
         run: uv venv --python ${{ matrix.python }}
       # The extension is built, because these tests exercise it: load_settings
-      # reads feather.toml through the core rather than parsing it in Python.
-      # That is affordable because crates/feather-py does not ask feather-core
-      # for the engines, so this build is Rust and Arrow rather than the bundled
-      # DuckDB C++ build the rust job pays for. It is also the only place the
-      # Python-to-Rust handoff is tested at all: the rust job links the core
-      # directly and never loads the extension.
+      # reads feather.toml through the core, and FeatureStore runs the join
+      # through it. That second one means crates/feather-py asks feather-core
+      # for the offline engine, so this job pays the bundled DuckDB build it
+      # used to skip, on both matrix interpreters. Measured with the archive
+      # already in target/, a rebuild takes about four minutes; the rust job's
+      # cold-cache figure is around 45. See the cold-build issue.
+      # This is also the only place the Python-to-Rust handoff is tested at
+      # all: the rust job links the core directly and never loads the
+      # extension.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: sync
