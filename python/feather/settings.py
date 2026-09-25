@@ -47,6 +47,10 @@ class S3Connection(pydantic.BaseModel):
 
     ``key_id`` is not a secret and is left readable, so a misconfigured key is
     diagnosable from a log. ``secret`` is not.
+
+    ``endpoint`` is for a server that is not AWS. DuckDB addresses S3 virtually by
+    default and over HTTPS, which a host and port endpoint does not answer, so an
+    endpoint implies path style unless ``url_style`` says otherwise.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
@@ -55,6 +59,9 @@ class S3Connection(pydantic.BaseModel):
     region: NonEmptyStr
     key_id: NonEmptyStr
     secret: pydantic.SecretStr
+    endpoint: NonEmptyStr | None = None
+    use_ssl: bool = True
+    url_style: Literal["path", "vhost"] | None = None
 
 
 Connection = Annotated[SnowflakeConnection | S3Connection, pydantic.Field(discriminator="type")]
