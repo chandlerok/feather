@@ -94,6 +94,9 @@ pub struct MaterializeReport {
 ///     [`Error::SourceConnectionKind`] or [`Error::UnreadableSource`] if a view's source
 ///     cannot be read as the view declares it.
 ///     [`Error::StreamInterrupted`] if a scan failed after it had started.
+///     [`Error::AmbiguousTimestamp`] if the source holds two rows for one entity at one event
+///         timestamp and the view declares no `created_timestamp_field`, which is the same
+///         refusal the join makes.
 ///     [`Error::NullEntityKey`] if a source row's entity key is null, which the scan's own
 ///         filter already excludes.
 ///     [`Error::UnsupportedKeyType`] if a source's entity key is not an integer or a string.
@@ -912,6 +915,78 @@ mod tests {
                 .expect("stats was written")
                 .contains_key(&value_field("stats"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_source_a_join_would_refuse_is_refused_before_anything_is_written() {
+        // Two rows for one entity at one event timestamp, and no `created_timestamp_field` to
+        // decide between them, so which one wins would depend on the query plan. The join refuses
+        // that source; a refresh has to refuse it too, or serving would quietly answer from a row
+        // training would not read.
+        let source = Parquet::write(&source(&[(1, 100, 10), (1, 100, 11)]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+
+        let refused = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await;
+
+        assert!(
+            matches!(refused, Err(Error::AmbiguousTimestamp { .. })),
+            "expected an ambiguous source to be refused, got {refused:?}"
+        );
+        assert_eq!(
+            store.hash_count(),
+            0,
+            "the refusal comes before the first write, so nothing is stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_created_timestamp_breaks_the_tie_and_the_newer_creation_wins() {
+        // The same two rows, with a created timestamp, which is the rule the join uses for the
+        // same ambiguity.
+        let fields = vec![
+            ArrowField::new("user_id", DataType::Int64, false),
+            ArrowField::new("event_timestamp", DataType::Int64, false),
+            ArrowField::new("created_at", DataType::Int64, false),
+            ArrowField::new("count", DataType::Int64, false),
+        ];
+        let rows = [(1i64, 100i64, 5i64, 10i64), (1, 100, 9, 11), (1, 50, 1, 7)];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+        ];
+        let source = Parquet::write(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("source batch"),
+        );
+        let mut view = a_view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let mut store = MemoryStore::new();
+        materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("materialize");
+
+        assert_eq!(
+            stored_count(&store, &view, b"1"),
+            Some(11),
+            "the later creation wins"
+        );
+        assert_eq!(stored_freshness(&store, b"1"), Some(100));
     }
 
     #[tokio::test]

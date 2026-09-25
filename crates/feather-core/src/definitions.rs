@@ -286,10 +286,35 @@ impl Definitions {
     /// thing earlier and in its own words, but a value that reaches here is checked
     /// again, and references that cross objects are checked only here.
     pub fn validate(&self) -> Result<()> {
+        // A key is `{project}:{entity}:{encoded}`, and the parser finds its two separators by
+        // position, so a colon in either name produces a key that cannot be taken apart again.
+        // Nothing would be deleted that should not be, because garbage collection checks a key's
+        // shape before touching it, but that project's keys would be skipped silently and for
+        // good. A name the key layout cannot carry is refused here rather than skipped later.
+        if self.project.contains(':') {
+            return Err(Error::MalformedDefinitions {
+                reason: format!(
+                    "project `{}` contains a colon, which is the key layout's separator",
+                    self.project
+                ),
+            });
+        }
         for view in &self.views {
             // Surfaces the multi-entity error at validation time rather than at
             // the first read.
             view.entity()?;
+            for entity in &view.entities {
+                if entity.name.contains(':') {
+                    return Err(Error::MalformedView {
+                        view: view.name.clone(),
+                        reason: format!(
+                            "declares entity `{}`, whose name contains a colon, which is the key \
+                             layout's separator",
+                            entity.name
+                        ),
+                    });
+                }
+            }
             // Emptiness, not whitespace, because that is the rule the Python mirror states
             // with its non-empty string type and this module is the authority. Left empty, a
             // source field reaches the scanner as an opaque read failure.
@@ -615,5 +640,22 @@ mod tests {
             error.to_string().contains("malformed definitions"),
             "{error}"
         );
+    }
+    #[test]
+    fn a_project_name_the_key_layout_cannot_carry_is_refused() {
+        let mut definitions = project(|_| {});
+        definitions.project = "ad:s".to_owned();
+        let error = definitions.validate().expect_err("must fail");
+        assert!(error.to_string().contains("ad:s"), "{error}");
+    }
+
+    #[test]
+    fn an_entity_name_the_key_layout_cannot_carry_is_refused() {
+        let error = project(|view| {
+            view.entities = vec![Entity::new("user:id", "user_id")];
+        })
+        .validate()
+        .expect_err("must fail");
+        assert!(error.to_string().contains("user:id"), "{error}");
     }
 }

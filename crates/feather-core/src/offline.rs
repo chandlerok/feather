@@ -564,7 +564,13 @@ impl Engine {
         let source_ts_value = source_ts_kind.to_micros(&quote_ident(source_ts_column));
 
         if view.created_timestamp_field.is_none() {
-            self.reject_ambiguous_timestamps(view, &relation, &key_expr, &source_ts_value)?;
+            self.reject_ambiguous_timestamps(
+                view,
+                &relation,
+                &key_expr,
+                &source_ts_value,
+                AmbiguityScope::LabelKeys,
+            )?;
         }
 
         let sql = join_sql(
@@ -644,14 +650,22 @@ impl Engine {
         relation: &str,
         key_expr: &str,
         source_ts_value: &str,
+        scope: AmbiguityScope,
     ) -> Result<()> {
-        // Restricted to the keys in the label frame: a duplicate among keys nobody asked
-        // about cannot affect this join, and the restriction keeps the scan bounded.
+        // A join only cares about the keys its frame names, and restricting the check to them is
+        // what keeps it bounded by the request rather than by the source. A refresh has no such
+        // frame, so it looks at every key: which row wins has to be decided the same way for
+        // every entity a source holds, not only the ones some label row happened to name.
+        let restriction = match scope {
+            AmbiguityScope::LabelKeys => {
+                format!(" WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
+            }
+            AmbiguityScope::WholeSource => String::new(),
+        };
         let sql = format!(
             "WITH source AS (SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation})
              SELECT CAST(k AS VARCHAR), t, count(*) AS n
-             FROM source
-             WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})
+             FROM source{restriction}
              GROUP BY k, t
              HAVING count(*) > 1
              LIMIT 1"
@@ -794,9 +808,20 @@ impl Engine {
                 location: location.clone(),
                 column: key_column.to_owned(),
             })?;
-        // The family is not used here; the call is the check that this key is one the
-        // encoder can carry, which is the same set the join compares against.
-        KeyFamily::of_duckdb(source_key)?;
+        // The exact types whose Arrow counterparts the key encoder carries: DuckDB exports
+        // INTEGER as Int32, BIGINT as Int64 and VARCHAR as Utf8, and those three are what
+        // `entity_key_component` reads. `KeyFamily::of_duckdb` is wider on purpose, because the
+        // join only ever compares keys, so a check in terms of the family would admit a
+        // SMALLINT key and fail later in the sink instead of here.
+        match normalize_type(source_key).as_str() {
+            "INTEGER" | "BIGINT" | "VARCHAR" | "TEXT" | "STRING" => {}
+            other => {
+                return Err(Error::UnsupportedOfflineType {
+                    role: "entity key".to_owned(),
+                    dtype: other.to_owned(),
+                });
+            }
+        }
 
         let source_ts_column = view.timestamp_field();
         let source_ts = described
@@ -806,6 +831,24 @@ impl Engine {
                 column: source_ts_column.to_owned(),
             })?;
         let source_ts_kind = TimestampKind::of_duckdb(source_ts)?;
+        // The timestamp reaches the write path as an `Int64` of microseconds, so the types that
+        // could not survive that are refused here. An integer column is cast rather than trusted:
+        // DuckDB will export an `INTEGER` as Arrow `Int32`, which the sink cannot read, and the
+        // catch-all for a family would let it through to fail there.
+        let source_ts_expr = match normalize_type(source_ts).as_str() {
+            "TIMESTAMP" | "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIME" => {
+                source_ts_kind.to_micros(&quote_ident(source_ts_column))
+            }
+            "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" => {
+                format!("CAST({} AS BIGINT)", quote_ident(source_ts_column))
+            }
+            other => {
+                return Err(Error::UnsupportedOfflineType {
+                    role: "timestamp".to_owned(),
+                    dtype: other.to_owned(),
+                });
+            }
+        };
 
         for field in &view.features {
             let actual = described
@@ -825,11 +868,27 @@ impl Engine {
         }
 
         let relation = self.relation(view)?;
+
+        // The same refusal the join makes, for the same reason: without a created timestamp to
+        // break a tie, which of two rows sharing a key and an event timestamp wins would depend
+        // on the query plan. A refresh has no label frame to restrict the check to, so it looks at
+        // the whole source, and it looks before writing anything, so a source that training
+        // refuses to read is not one serving quietly answers from.
+        if view.created_timestamp_field.is_none() {
+            self.reject_ambiguous_timestamps(
+                view,
+                &relation,
+                &quote_ident(key_column),
+                &source_ts_expr,
+                AmbiguityScope::WholeSource,
+            )?;
+        }
+
         Ok(latest_per_entity_sql(
             view,
             &relation,
             &quote_ident(key_column),
-            &source_ts_kind.to_micros(&quote_ident(source_ts_column)),
+            &source_ts_expr,
         ))
     }
 }
@@ -1012,6 +1071,20 @@ fn join_sql(
          )
          SELECT m.feather_row{output} FROM matched m{filter}"
     )
+}
+
+/// How much of a source the ambiguity check looks at.
+///
+/// A view that declares no `created_timestamp_field` has no rule for two rows sharing a key and
+/// an event timestamp, so which one wins would depend on the query plan. Both paths refuse that,
+/// and this says how far each has to look to find it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguityScope {
+    /// Only the keys an entity frame names, which bounds the check by the request.
+    LabelKeys,
+    /// Every key the source holds, which is what a refresh needs: it writes one row per entity
+    /// for all of them.
+    WholeSource,
 }
 
 /// A source's columns and their DuckDB type names.
@@ -2230,5 +2303,100 @@ mod tests {
         assert_eq!(result.num_rows(), unconstrained.num_rows());
         assert_eq!(rows(&result), rows(&unconstrained));
         assert_eq!(counts(&result), counts(&unconstrained));
+    }
+
+    /// A sink that counts what it was handed, for tests that only need the scan to run.
+    #[derive(Default)]
+    struct Counted(usize);
+
+    impl LatestBatchSink for Counted {
+        async fn accept(&mut self, batch: RecordBatch) -> Result<()> {
+            self.0 += batch.num_rows();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_panic_inside_a_scan_becomes_an_error_rather_than_unwinding() {
+        // `duckdb`'s Arrow iterator panics when a chunk fetch or the Arrow conversion fails, and
+        // there is no lazy iterator that yields an error instead. This is the shim that puts the
+        // failure back into the return type, and it is exercised directly because a genuine
+        // mid-scan fetch failure cannot be forced from a test. The two payload shapes are the two
+        // `panic!` produces, plus one with no message at all.
+        let borrowed = catching_panics(|| -> Option<RecordBatch> { panic!("boom") })
+            .expect_err("a panic is an error");
+        assert_eq!(borrowed, "boom");
+
+        let owned = catching_panics(|| -> Option<RecordBatch> {
+            std::panic::panic_any(String::from("owned"))
+        })
+        .expect_err("a panic is an error");
+        assert_eq!(owned, "owned");
+
+        let bare = catching_panics(|| -> Option<RecordBatch> { std::panic::panic_any(7u8) })
+            .expect_err("a panic is an error");
+        assert_eq!(bare, "a panic with no message");
+
+        // And a scan that does not panic is unaffected.
+        let kept = catching_panics(|| 7u8).expect("no panic");
+        assert_eq!(kept, 7);
+    }
+
+    #[tokio::test]
+    async fn a_scan_over_a_source_that_disappeared_returns_an_error_and_the_engine_answers() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+        let declared = view(&source.string(), None);
+        let engine = engine();
+
+        // The fixture removes its file when it is dropped, so the source a view names is gone by
+        // the time anything reads it. The failure comes back as a value, which is the property
+        // that matters for a library called across FFI: a panic here would abort the host.
+        drop(source);
+
+        let mut sink = Counted::default();
+        let failed = engine.scan_latest_per_entity(&declared, &mut sink).await;
+        assert!(
+            failed.is_err(),
+            "a source that cannot be read has to be an error, not a panic"
+        );
+        assert_eq!(sink.0, 0);
+
+        // The engine is usable afterwards, which is what a caller does next.
+        let other = Parquet::write(&integer_source(&[(1, 300, 30)]));
+        let mut again = Counted::default();
+        engine
+            .scan_latest_per_entity(&view(&other.string(), None), &mut again)
+            .await
+            .expect("the engine still answers");
+        assert_eq!(again.0, 1);
+    }
+
+    #[test]
+    fn a_discarded_connection_is_opened_again_by_the_next_query() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+        let engine = engine();
+        let options = JoinOptions::default();
+        let joined = engine
+            .point_in_time_join(
+                &labels(&[(Some(1), 150)]),
+                &view(&source.string(), None),
+                &options,
+            )
+            .expect("join");
+        assert_eq!(counts(&joined), [Some(10)]);
+
+        // What a caught panic inside a scan does to the connection: it is dropped, because a
+        // panic during a fetch leaves DuckDB's session state unknown and reusing it would be
+        // worse than the failure that was just caught.
+        engine.discard_connection();
+
+        let reopened = engine
+            .point_in_time_join(
+                &labels(&[(Some(1), 150)]),
+                &view(&source.string(), None),
+                &options,
+            )
+            .expect("join through a fresh connection");
+        assert_eq!(counts(&reopened), [Some(10)]);
     }
 }
