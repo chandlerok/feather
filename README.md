@@ -1,8 +1,8 @@
 # Feather
 
-An opinionated feature store with a Rust core and a native Python API. Online serving
-uses an in-process `moka` cache over Valkey. Historical point-in-time joins run in an
-embedded DuckDB engine over Arrow.
+An opinionated feature store with a Rust core and a native Python API. Online serving reads
+from Valkey over async `tokio` I/O; the in-process `moka` L1 cache that will sit in front of it
+is design only. Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
 > and the online serving layer are built and measured, and materialization writes a view's

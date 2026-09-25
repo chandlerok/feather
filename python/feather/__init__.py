@@ -64,11 +64,20 @@ def __getattr__(name: str) -> object:
         The attribute, for one of the names in :data:`_COMPILED_EXPORTS`.
 
     Raises:
-        AttributeError: If ``name`` is not one of them.
+        AttributeError: If ``name`` is not one of them, or if it is and the compiled
+            extension is not built. An ``AttributeError`` rather than the ``ImportError`` the
+            import itself raises, because this runs under ``hasattr`` and under ``from feather
+            import *``, where an unbuilt extension means the name is absent rather than that
+            the import failed. The message says which extension to build.
     """
     if name in _COMPILED_EXPORTS:
-        from feather import _core
-
+        try:
+            from feather import _core
+        except ImportError as unbuilt:
+            raise AttributeError(
+                f"{__name__} has no attribute {name!r}: it lives in the compiled extension "
+                f"`feather._core`, which is not built ({unbuilt})"
+            ) from unbuilt
         return getattr(_core, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -76,10 +85,19 @@ def __getattr__(name: str) -> object:
 def __dir__() -> list[str]:
     """The names this module offers, including the lazily resolved ones.
 
+    The compiled names are listed only when the extension imports, so a completion list does
+    not advertise a name that would raise.
+
     Returns:
         The module's attributes.
     """
-    return sorted([*globals(), *_COMPILED_EXPORTS])
+    names = [*globals()]
+    try:
+        from feather import _core  # noqa: F401
+    except ImportError:
+        return sorted(names)
+    names.extend(_COMPILED_EXPORTS)
+    return sorted(names)
 
 
 __all__ = [

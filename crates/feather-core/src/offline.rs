@@ -757,7 +757,9 @@ impl Engine {
         let result = self.run_scan(&view.name, &sql, sink).await;
         // A caught panic leaves the connection's state unknown, so it is dropped and the
         // next use opens a fresh one. Every other failure arrived as a value from a call that
-        // returned, which leaves the connection usable.
+        // returned, which leaves the connection usable. This branch cannot be reached from a
+        // test without a seam to force a mid-scan failure, which is #26's work rather than this
+        // path's.
         if matches!(&result, Err(Error::StreamInterrupted { .. })) {
             self.discard_connection();
         }
@@ -880,8 +882,10 @@ impl Engine {
         // The same refusal the join makes, for the same reason: without a created timestamp to
         // break a tie, which of two rows sharing a key and an event timestamp wins would depend
         // on the query plan. A refresh has no label frame to restrict the check to, so it looks at
-        // the whole source, and it looks before writing anything, so a source that training
-        // refuses to read is not one serving quietly answers from.
+        // the whole source, and it looks before writing anything of this view's, so a source that
+        // training refuses to read is not one serving quietly answers from. That is per view:
+        // views are refreshed in declaration order, so the ones before this have already written
+        // by the time the check runs.
         if view.created_timestamp_field.is_none() {
             self.reject_ambiguous_timestamps(
                 view,
@@ -1502,6 +1506,25 @@ mod tests {
         .expect("labels batch")
     }
 
+    /// `user_id, event_timestamp, count`, with the key and the timestamp nullable, so a source
+    /// that carries the nulls the scan drops can be built.
+    fn nullable_source(rows: &[(Option<i64>, Option<i64>, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, true),
+            Field::new("event_timestamp", DataType::Int64, true),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .expect("source batch")
+    }
+
     fn view(path: &str, ttl_days: Option<u32>) -> FeatureView {
         FeatureView {
             name: "user_clicks".to_owned(),
@@ -1695,6 +1718,37 @@ mod tests {
             .expect_err("must fail");
 
         assert!(matches!(error, Error::AmbiguousTimestamp { .. }), "{error}");
+    }
+
+    #[test]
+    fn repeated_nulls_are_not_an_ambiguity_the_join_refuses() {
+        // The check groups a key and a timestamp, and reading a null back out of either is a
+        // column-type error rather than a value, so a source the join reads perfectly well used
+        // to fail the whole join. The rows it has to ignore are the ones the scan drops: here two
+        // rows with a null key at one timestamp, and two with a null event timestamp under entity
+        // 4, which is the pair that reaches this path — the check here is restricted to the keys
+        // the label frame names, so it is the labels that have to name the entity whose rows have
+        // no timestamp.
+        let source = Parquet::write(&nullable_source(&[
+            (None, Some(10), 1),
+            (None, Some(10), 2),
+            (Some(4), None, 3),
+            (Some(4), None, 4),
+            (Some(3), Some(20), 5),
+        ]));
+
+        let joined = engine()
+            .point_in_time_join(
+                &labels(&[(Some(4), 20), (Some(3), 20)]),
+                &view(&source.string(), None),
+                &JoinOptions::default(),
+            )
+            .expect("a source with repeated nulls is not ambiguous");
+
+        // Entity 4's only rows have no timestamp, so nothing matches it; entity 3's row is the
+        // value the join is for.
+        assert_eq!(rows(&joined), [0, 1]);
+        assert_eq!(counts(&joined), [None, Some(5)]);
     }
 
     #[test]

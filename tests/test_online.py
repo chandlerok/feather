@@ -31,7 +31,9 @@ CLICKS = """
 from feather import Entity, FeatureView, Field, FileSource, feature_view
 from feather.types import Int64
 
-user_entity = Entity(name="user_id", join_key="user_id")
+# The entity's name and its join key differ on purpose: the frame's column is named after the
+# join key, so a lookup that fell back to the name would fail here instead of passing quietly.
+user_entity = Entity(name="user", join_key="user_id")
 clicks_source = FileSource(path="{clicks}")
 
 
@@ -199,6 +201,12 @@ def test_the_requested_order_is_the_returned_order(project: Project) -> None:
     )
 
     assert frame.columns == ["user_id", "label", "purchase_count", "click_count"]
+    # The names come from the request, but the values are projected out of the stored vector
+    # separately, so a projection that used declaration order would keep these names and swap the
+    # data. Entity 1's newest source row is click_count 10, purchase_count 100, the other way
+    # round from the request above.
+    assert frame["purchase_count"].to_list() == [100]
+    assert frame["click_count"].to_list() == [10]
 
 
 def test_a_value_older_than_its_ttl_reads_as_null(tmp_path: Path) -> None:
@@ -244,7 +252,27 @@ def test_a_subset_refresh_names_only_the_views_it_refreshed(tmp_path: Path) -> N
     store = FeatureStore(tmp_path / "feather.toml")
 
     assert [view.name for view in store.materialize().views] == ["clicks", "purchases"]
-    assert [view.name for view in store.materialize(views=["clicks"]).views] == ["clicks"]
+    subset = store.materialize(views=["clicks"])
+    assert [view.name for view in subset.views] == ["clicks"]
+
+    # `retired` is a diff against every declared view, not against the selection, so a subset
+    # refresh retires nothing. A diff against the selection would name `purchases` here and then
+    # walk the keyspace to delete its fields.
+    assert subset.retired == []
+
+    # Which is what the other view's value coming back afterwards shows: it was written by the
+    # full refresh and the subset refresh left it alone.
+    spec = importlib.util.spec_from_file_location("clicks", module)
+    assert spec is not None
+    assert spec.loader is not None
+    declared = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(declared)
+    frame = pl.DataFrame(
+        store.get_online_features(
+            entity_df=entities([1]), features=[declared.Purchases.purchase_count]
+        )
+    )
+    assert frame["purchase_count"].to_list() == [100]
 
 
 def test_a_view_the_project_does_not_declare_is_refused(project: Project) -> None:

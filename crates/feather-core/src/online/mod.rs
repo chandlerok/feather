@@ -440,15 +440,25 @@ mod tests {
             .to_vec()
     }
 
+    /// An entity key as the read path is given it: the encoded form the binding builds, not the
+    /// raw component. A raw component is a key the encoder would never produce, so it is also a
+    /// key garbage collection skips, and a fixture built from one cannot show what a real key
+    /// does.
+    fn encoded_key(value: &str) -> Vec<u8> {
+        crate::key::encode_entity_key(&[value.as_bytes()]).expect("encode the key")
+    }
+
+    /// `seed` and `request` take the join key value and encode it, so the hash a fixture writes
+    /// and the hash a read looks up cannot be spelled differently.
     async fn seed(
         store: &mut MemoryStore,
         project: &str,
         view: &FeatureView,
-        entity: &[u8],
+        entity: &str,
         value: i64,
         freshness: i64,
     ) {
-        let key = crate::key::entity_hash_key(project, "user_id", entity);
+        let key = crate::key::entity_hash_key(project, "user_id", &encoded_key(entity));
         store
             .write(&[WriteBatch {
                 key,
@@ -465,9 +475,9 @@ mod tests {
             .unwrap();
     }
 
-    fn request(view_name: &str, entity: &[u8]) -> EntityRequest {
+    fn request(view_name: &str, entity: &str) -> EntityRequest {
         EntityRequest {
-            encoded_key: entity.to_vec(),
+            encoded_key: encoded_key(entity),
             views: vec![ViewRequest {
                 view: view_name.to_owned(),
                 fields: vec!["count".to_owned()],
@@ -480,9 +490,9 @@ mod tests {
         let views = views(&[("clicks", Some(30))]);
         let view = views.get("clicks").unwrap();
         let mut store = MemoryStore::new();
-        seed(&mut store, "ads", view, b"u1", 42, NOW).await;
+        seed(&mut store, "ads", view, "u1", 42, NOW).await;
 
-        let out = read_entities(&store, "ads", &views, &[request("clicks", b"u1")], NOW)
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "u1")], NOW)
             .await
             .unwrap();
         match &out[0][0] {
@@ -508,13 +518,13 @@ mod tests {
             &mut store,
             "ads",
             view,
-            b"u1",
+            "u1",
             1,
             NOW - 2 * 86_400 * 1_000_000,
         )
         .await;
 
-        let out = read_entities(&store, "ads", &views, &[request("clicks", b"u1")], NOW)
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "u1")], NOW)
             .await
             .unwrap();
         assert!(matches!(out[0][0], ViewValues::Missing(Missing::Expired)));
@@ -524,7 +534,7 @@ mod tests {
     async fn a_never_written_entity_is_missing() {
         let views = views(&[("clicks", Some(30))]);
         let store = MemoryStore::new();
-        let out = read_entities(&store, "ads", &views, &[request("clicks", b"nobody")], NOW)
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "nobody")], NOW)
             .await
             .unwrap();
         assert!(matches!(
@@ -538,13 +548,13 @@ mod tests {
         let views = views(&[("clicks", Some(30))]);
         let old = views.get("clicks").unwrap();
         let mut store = MemoryStore::new();
-        seed(&mut store, "ads", old, b"u1", 7, NOW).await;
+        seed(&mut store, "ads", old, "u1", 7, NOW).await;
 
         // The definition changes dtype; the stored tag no longer matches.
         let mut changed = views.clone();
         changed.get_mut("clicks").unwrap().features = vec![Field::new("count", DType::Float64)];
 
-        let out = read_entities(&store, "ads", &changed, &[request("clicks", b"u1")], NOW)
+        let out = read_entities(&store, "ads", &changed, &[request("clicks", "u1")], NOW)
             .await
             .unwrap();
         assert!(matches!(
@@ -584,7 +594,7 @@ mod tests {
         ]);
         let mut inner = MemoryStore::new();
         for name in ["a", "b", "c", "d"] {
-            seed(&mut inner, "ads", many.get(name).unwrap(), b"u1", 1, NOW).await;
+            seed(&mut inner, "ads", many.get(name).unwrap(), "u1", 1, NOW).await;
         }
 
         let reads = Arc::new(AtomicUsize::new(0));
@@ -593,7 +603,7 @@ mod tests {
             reads: Arc::clone(&reads),
         };
 
-        let mut entity = request("a", b"u1");
+        let mut entity = request("a", "u1");
         for name in ["b", "c", "d"] {
             entity.views.push(ViewRequest {
                 view: name.to_owned(),
@@ -619,7 +629,7 @@ mod tests {
         let store = MemoryStore::new();
 
         let entity = EntityRequest {
-            encoded_key: b"u1".to_vec(),
+            encoded_key: encoded_key("u1"),
             views: vec![
                 ViewRequest {
                     view: "a".to_owned(),
@@ -644,8 +654,8 @@ mod tests {
         let mut store = MemoryStore::new();
         let registry = views_registry_key("ads");
         let mut keys = vec![registry.clone()];
-        for entity in [b"u1".as_slice(), b"u2".as_slice()] {
-            let key = crate::key::entity_hash_key("ads", "user_id", entity);
+        for entity in ["u1", "u2"] {
+            let key = crate::key::entity_hash_key("ads", "user_id", &encoded_key(entity));
             store
                 .write(&[WriteBatch {
                     key: key.clone(),
@@ -691,17 +701,21 @@ mod tests {
         let views = views(&[("clicks", None)]);
         let view = views.get("clicks").unwrap();
         let mut store = MemoryStore::new();
-        seed(&mut store, "ads", view, b"u1", 1, NOW).await;
+        seed(&mut store, "ads", view, "u1", 1, NOW).await;
         assert_eq!(store.hash_count(), 1);
 
-        let key = crate::key::entity_hash_key("ads", "user_id", b"u1");
+        let key = crate::key::entity_hash_key("ads", "user_id", &encoded_key("u1"));
         store
             .delete_fields(&[(key, vec![value_field("clicks")])])
             .await
             .unwrap();
         assert!(
             !store
-                .fields(&crate::key::entity_hash_key("ads", "user_id", b"u1"))
+                .fields(&crate::key::entity_hash_key(
+                    "ads",
+                    "user_id",
+                    &encoded_key("u1"),
+                ))
                 .unwrap()
                 .contains_key(&value_field("clicks"))
         );

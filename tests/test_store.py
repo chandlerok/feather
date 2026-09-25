@@ -435,6 +435,50 @@ def test_a_definition_the_core_rejects_is_reported(tmp_path: Path) -> None:
         FeatureStore(config)
 
 
+def test_a_colon_in_the_project_name_is_refused(tmp_path: Path) -> None:
+    """The key layout splits on the first two colons, so a project name cannot carry one.
+
+    Nothing Python-side checks this, so the refusal only exists in the core; a project that
+    loaded before now fails, which is a breaking change and is recorded as one in the
+    architecture document.
+    """
+    (tmp_path / "definitions").mkdir()
+    (tmp_path / "definitions/clicks.py").write_text(
+        CLICKS.format(clicks=tmp_path / "clicks.parquet"), encoding="utf-8"
+    )
+    config = tmp_path / "feather.toml"
+    config.write_text(
+        'project = "ads:raw"\ndefinitions = ["definitions/clicks.py"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="ads:raw"):
+        FeatureStore(config)
+
+
+def test_a_colon_in_a_view_name_is_refused(tmp_path: Path) -> None:
+    """A colon in a view name re-splits a `view:feature` reference.
+
+    `view:feature` splits on the first colon, so a view named `clicks:raw` is indistinguishable
+    from view `clicks`'s field `raw:count`, and one of the two silently resolves. A colon in a
+    feature name is safe, because everything after the first separator is the feature, so this
+    is only about the view's own name.
+    """
+    (tmp_path / "definitions").mkdir()
+    (tmp_path / "definitions/clicks.py").write_text(
+        CLICKS.format(clicks=tmp_path / "clicks.parquet").replace(
+            'name="clicks"', 'name="clicks:raw"'
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / "feather.toml"
+    config.write_text(
+        'project = "ads"\ndefinitions = ["definitions/clicks.py"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="clicks:raw"):
+        FeatureStore(config)
+
+
 def test_malformed_settings_are_reported(tmp_path: Path) -> None:
     config = tmp_path / "feather.toml"
     config.write_text('project = "ads"\n', encoding="utf-8")

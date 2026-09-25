@@ -6,6 +6,10 @@
 //! A field's expiry is remembered and never acted on: this store has no clock and reclaims
 //! nothing, and the read-time TTL check is the authoritative path in any case. Keeping the
 //! expiry visible is what lets a test assert what the write path asked for without a server.
+//!
+//! A write that carries no expiry leaves an expiry this store already holds alone, because that
+//! is what the server does: a field with no expiry is written as a plain `HSET`, and `HSET` does
+//! not clear a TTL the server has already recorded for that field.
 
 use std::collections::HashMap;
 
@@ -47,18 +51,15 @@ impl OnlineStore for MemoryStore {
             let hash = self.hashes.entry(batch.key.clone()).or_default();
             for field in &batch.fields {
                 hash.insert(field.name.clone(), field.value.clone());
-                match field.expires_at_unix_secs {
-                    Some(at) => {
-                        self.expiries
-                            .entry(batch.key.clone())
-                            .or_default()
-                            .insert(field.name.clone(), at);
-                    }
-                    None => {
-                        if let Some(expiries) = self.expiries.get_mut(&batch.key) {
-                            expiries.remove(&field.name);
-                        }
-                    }
+                // Recorded when there is one, left alone when there is not, rather than cleared.
+                // A field written with no expiry is a plain `HSET` on the server, and `HSET` does
+                // not clear an expiry the server already holds for that field, so clearing the
+                // recorded one here would let a test see a state the server never reaches.
+                if let Some(at) = field.expires_at_unix_secs {
+                    self.expiries
+                        .entry(batch.key.clone())
+                        .or_default()
+                        .insert(field.name.clone(), at);
                 }
             }
         }
@@ -123,5 +124,53 @@ impl ProjectScan for MemoryStore {
             .filter(|key| key.starts_with(&prefix) && key.as_slice() != exclude)
             .cloned()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemoryStore;
+    use crate::online::{OnlineStore, WriteBatch, WrittenField};
+
+    /// A field written with no expiry keeps the expiry the store already recorded for it,
+    /// because that is what the server does: the write is a plain `HSET`, which sets the value
+    /// and leaves the field's TTL alone. A view whose definition loses its `ttl_days` writes
+    /// `v:{view}` this way, and the read path is what stops serving the value once it is stale.
+    #[tokio::test]
+    async fn a_write_without_an_expiry_leaves_a_recorded_one_in_place() {
+        let key = b"ads:user_id:2:u1".to_vec();
+        let mut store = MemoryStore::new();
+
+        store
+            .write(&[WriteBatch {
+                key: key.clone(),
+                fields: vec![WrittenField::new(
+                    "v:clicks",
+                    b"one".to_vec(),
+                    Some(1_700_000_000),
+                )],
+            }])
+            .await
+            .expect("a write with an expiry");
+        assert_eq!(store.field_expiry(&key, "v:clicks"), Some(1_700_000_000));
+
+        store
+            .write(&[WriteBatch {
+                key: key.clone(),
+                fields: vec![WrittenField::new("v:clicks", b"two".to_vec(), None)],
+            }])
+            .await
+            .expect("a write with no expiry");
+
+        assert_eq!(
+            store.fields(&key).and_then(|hash| hash.get("v:clicks")),
+            Some(&b"two".to_vec()),
+            "the value is overwritten either way"
+        );
+        assert_eq!(
+            store.field_expiry(&key, "v:clicks"),
+            Some(1_700_000_000),
+            "the server's `HSET` leaves the field's expiry alone, so the double does too"
+        );
     }
 }

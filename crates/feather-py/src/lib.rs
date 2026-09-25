@@ -578,8 +578,10 @@ impl FeatureStore {
     /// Refresh feature values from their sources into the online store.
     ///
     /// A full refresh: every selected view is recomputed from its source and every value is
-    /// overwritten. There is no watermark and no partial state to reconcile, so a run that
-    /// fails leaves the previous run's values in place and the call can simply be repeated.
+    /// overwritten. There is no watermark and nothing partial to reconcile, so a run that fails
+    /// leaves the values it had not yet overwritten as they were and the call can simply be
+    /// repeated. A run that is still going serves a mix of the values it has written and the ones
+    /// it has not reached yet.
     ///
     /// Args:
     ///     views: The views to refresh, by name, or `None` for every view the project declares.
@@ -650,7 +652,7 @@ impl FeatureStore {
     /// Args:
     ///     entity_frame: The entities to read, as any object exposing the Arrow
     ///         `__arrow_c_stream__` interface. The join key column is named after the views'
-    ///         entity, and one call reads one entity type.
+    ///         entity's `join_key`, and one call reads one entity type.
     ///     features: `view:feature` references, in the order the caller wants the columns back.
     ///
     /// Returns:
@@ -662,9 +664,10 @@ impl FeatureStore {
     /// Raises:
     ///     TypeError: If `entity_frame` does not export Arrow buffers.
     ///     ValueError: If a reference is malformed, names an unknown view or feature, or is
-    ///         requested twice; if the requested views do not share an entity join key; if the
-    ///         frame has no such column or has a null in it; or if a requested feature name
-    ///         collides with a column of the frame.
+    ///         requested twice; if the requested views do not declare the same entity, which is
+    ///         both the same join key and the same entity name, since the hash key carries the
+    ///         name and one request reads one entity type; if the frame has no such column or has
+    ///         a null in it; or if a requested feature name collides with a column of the frame.
     ///     ConnectionError: If the settings declare a Valkey that cannot be reached.
     ///     OSError: If another thread panicked while holding this store.
     fn get_online_features(

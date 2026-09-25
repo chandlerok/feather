@@ -222,9 +222,14 @@ impl OnlineStore for ValkeyStore {
 /// The fields are grouped by their expiry, because `HSETEX` and `HEXPIREAT` each take one
 /// time for every field they list. A batch normally holds one expiring field, the view's
 /// value, and one field that never expires, its freshness, so a view with a TTL costs one more
-/// command than one without. Both commands are queued before the pipeline is flushed, so no
-/// reader ever sees the value without its expiry, and the extra command is not an extra round
-/// trip.
+/// command than one without. Both commands are queued before the pipeline is flushed, so the
+/// pair costs one round trip rather than two.
+///
+/// The two are not atomic. `redis::pipe()` batches the commands into one write; it does not wrap
+/// them in `MULTI`/`EXEC`, so a reader on another connection can see the value in the window
+/// between the two. The value's bytes are correct either way and the read-time TTL check is what
+/// decides whether it is served, so what the window costs is a field briefly stored without the
+/// expiry meant to reclaim it.
 fn queue_write(pipeline: &mut redis::Pipeline, batch: &WriteBatch, expiry: FieldExpiry) {
     let mut groups: BTreeMap<Option<i64>, Vec<&WrittenField>> = BTreeMap::new();
     for field in &batch.fields {
@@ -264,7 +269,12 @@ fn queue_write(pipeline: &mut redis::Pipeline, batch: &WriteBatch, expiry: Field
             }
             // Either the field never expires or the server cannot expire a field. Without
             // server support the value is still correct; it is reclaimed when its hash is
-            // rewritten, and the read-time TTL check is what decides whether it is served.
+            // rewritten, and the read-time TTL check is what decides whether it is served. A
+            // plain `HSET` also leaves any TTL the server already holds for that field, and
+            // that is deliberate rather than overlooked: a view that drops its `ttl_days` stops
+            // asking for an expiry, and this path is not asked to clear one that an earlier
+            // definition set. `MemoryStore` records an expiry and leaves it in place for the
+            // same reason, so a test sees what the server would.
             (None, _) | (Some(_), FieldExpiry::None) => {
                 queue_hset(pipeline, &batch.key, &fields);
             }
