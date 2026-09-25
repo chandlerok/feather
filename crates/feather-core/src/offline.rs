@@ -1008,11 +1008,16 @@ fn join_sql(
         let _ = write!(from_matched, ", s.{name}");
     }
 
-    // Deduplicated only when a created timestamp can break the tie. Without one, the
-    // ambiguity was already rejected, so the sort here cannot change which row wins.
+    // Deduplicated only when a created timestamp can break the tie, and only among the rows
+    // that actually tie: the partition is the entity key **and** the timestamp, so the sort
+    // decides which of several rows sharing one instant wins and nothing else. Partitioning by
+    // the key alone instead collapses a key's whole history to its newest row before the join,
+    // so every label older than that row matches nothing and comes back null under the default
+    // policy. The document scopes this rule to rows sharing "the same entity key and the same
+    // maximal timestamp", which is what the timestamp in the partition expresses.
     let dedup = match &view.created_timestamp_field {
         Some(created) => format!(
-            " QUALIFY row_number() OVER (PARTITION BY {key_expr} ORDER BY {source_ts_value} DESC, {} DESC) = 1",
+            " QUALIFY row_number() OVER (PARTITION BY {key_expr}, {source_ts_value} ORDER BY {} DESC) = 1",
             quote_ident(created)
         ),
         None => String::new(),
@@ -1708,6 +1713,35 @@ mod tests {
             .expect("join");
 
         assert_eq!(counts(&joined), [Some(20)]);
+    }
+
+    #[test]
+    fn a_created_column_breaks_ties_without_collapsing_a_keys_history() {
+        // Two rows share an instant, and a third sits later. The tie-break must choose between
+        // the first two and leave the earlier instant in place for the join to find: a label
+        // between the two timestamps has to take the older row, not nothing.
+        let source = Parquet::write(&tie_breakable_source(&[
+            (1, 100, 5, 10),
+            (1, 100, 9, 20),
+            (1, 200, 7, 30),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let joined = engine()
+            .point_in_time_join(
+                &labels(&[(Some(1), 100), (Some(1), 150), (Some(1), 200)]),
+                &view,
+                &JoinOptions::default(),
+            )
+            .expect("join");
+
+        assert_eq!(
+            counts(&joined),
+            [Some(20), Some(20), Some(30)],
+            "at 100 the greatest created_at wins, at 150 the older row is still there, and at \
+             200 the newer one is"
+        );
     }
 
     #[test]
