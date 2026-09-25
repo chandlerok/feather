@@ -714,7 +714,7 @@ fallback_ttl_seconds = 30
 
     #[test]
     fn a_postgres_ssl_mode_is_carried_into_the_conninfo() {
-        let configured = serde_json::from_value(serde_json::json!({
+        let configured: Connection = serde_json::from_value(serde_json::json!({
             "type": "postgres",
             "host": "h",
             "database": "d",

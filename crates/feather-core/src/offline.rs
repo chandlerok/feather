@@ -941,6 +941,9 @@ fn s3_secret_sql(name: &str, configured: &SettingsConnection) -> Option<String> 
         // DuckDB's snowflake extension authenticates its own way, and no reader uses this kind
         // yet.
         SettingsConnection::Snowflake { .. } => None,
+        // A Postgres source reads through the connection string the relation carries, so
+        // there is no secret for the engine to hold: the scanner takes libpq's own form.
+        SettingsConnection::Postgres { .. } => None,
     }
 }
 
@@ -1643,7 +1646,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "view `user_stats` reads a `postgres` source through connection `s3_lake`, \
-             which is an `s3` connection"
+             which is a `s3` connection"
         );
     }
 
