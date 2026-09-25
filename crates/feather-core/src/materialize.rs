@@ -145,6 +145,18 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
         .collect();
     collect_orphans(store, project, &retired).await?;
 
+    // A retired view leaves the registry too. Retaining the map below is not enough on its own:
+    // `OnlineStore::write` sets the fields it is given and leaves every other field alone, which
+    // is what makes a full refresh safe to re-run, so a name that stays in the store is retired
+    // by this refresh and by every refresh after it, each of which walks the whole keyspace to
+    // delete fields that are already gone. Removing the field is one `HDEL` at one key, and
+    // removing a field that is already absent is a no-op, so this is safe to repeat.
+    if !retired.is_empty() {
+        store
+            .delete_fields(&[(registry_key.clone(), retired.clone())])
+            .await?;
+    }
+
     // The registry is written last, after every value write. The order is the whole argument
     // for what a crashed run costs: a run that dies before this point leaves the retired views
     // in the registry, so the next run computes the same `retired` set and walks the keyspace
@@ -152,10 +164,12 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
     // Writing the registry first would tell the next run those views were never declared, and
     // their fields would stay in the store for good.
     //
-    // A view whose refresh wrote nothing keeps the timestamp it already had: the registry
-    // records the newest event timestamp any refresh has seen, and a run that saw no rows did
-    // not see an older one. Views that were not selected are carried over unchanged, so
-    // refreshing a subset leaves the rest of the registry intact.
+    // What is written is exactly the declared set: retained to it, then updated with the
+    // timestamps this refresh saw. A view that was not selected keeps the timestamp it had,
+    // since the registry records the newest event timestamp any refresh has seen and a refresh
+    // that did not touch a view did not see an older one. A view whose refresh wrote no rows
+    // keeps its timestamp for the same reason.
+    registry.retain(|name, _| declared_names.contains(name.as_str()));
     for view in &views {
         if let Some(highest) = view.max_event_timestamp_micros {
             registry.insert(view.name.clone(), encode_freshness(highest));
@@ -793,6 +807,47 @@ mod tests {
                 .is_some_and(|fields| fields.contains_key(&value_field("stats"))),
             "a key that is not shaped like an entity hash is not touched"
         );
+    }
+
+    #[tokio::test]
+    async fn a_retired_name_leaves_the_registry_so_later_refreshes_do_not_walk_again() {
+        let source = Parquet::write(&source(&[(1, 100, 10)]));
+        let declared = two_views(&source.string());
+        let walks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut store = CountingWalk {
+            inner: MemoryStore::new(),
+            walks: Arc::clone(&walks),
+        };
+        let engine = an_engine();
+
+        // Both views declared, so both are in the registry.
+        materialize(&mut store, &engine, "ads", &declared, &[])
+            .await
+            .expect("refresh both views");
+        assert_eq!(walks.load(Ordering::SeqCst), 0);
+
+        // `stats` is dropped, which retires it and costs exactly one walk.
+        let renamed = materialize(&mut store, &engine, "ads", &declared[..1], &[])
+            .await
+            .expect("retire stats");
+        assert_eq!(renamed.retired, vec!["stats".to_owned()]);
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
+        let registry = store
+            .inner
+            .fields(&views_registry_key("ads"))
+            .expect("registry");
+        assert!(
+            !registry.contains_key("stats"),
+            "a retired name has to leave the registry, or every later refresh retires it again"
+        );
+
+        // A third refresh over the same declared set has nothing to retire and must not walk:
+        // the name is gone from the registry, so it is not retired a second time.
+        let again = materialize(&mut store, &engine, "ads", &declared[..1], &[])
+            .await
+            .expect("refresh again");
+        assert!(again.retired.is_empty());
+        assert_eq!(walks.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

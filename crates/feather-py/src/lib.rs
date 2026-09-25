@@ -15,7 +15,7 @@
 //! decision it makes is re-checked by the core.
 
 use feather_core::Error as CoreError;
-use pyo3::exceptions::{PyConnectionError, PyFileNotFoundError, PyOSError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 
 #[cfg(feature = "offline")]
@@ -296,7 +296,10 @@ fn connect_online(
         let store = runtime
             .block_on(ValkeyStore::connect(&url))
             .map_err(|error| {
-                PyConnectionError::new_err(format!(
+                // Named in full rather than imported: the only use is behind this feature, and an
+                // import that is unused without it is one an unused-import cleanup will remove,
+                // which breaks the `--all-features` build for the sake of the default one.
+                pyo3::exceptions::PyConnectionError::new_err(format!(
                     "could not connect to the Valkey at {}: {error}",
                     configured.endpoint
                 ))
