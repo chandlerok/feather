@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array};
 use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
@@ -475,6 +476,129 @@ async fn the_server_reclaims_an_expired_value_and_keeps_its_freshness() -> Resul
     );
 
     cleanup(&mut store, &project, clicks, &[b"u1"]).await?;
+    Ok(())
+}
+
+/// A field rewritten with no expiry loses the TTL the server already holds for it.
+///
+/// A plain `HSET` clears a field's TTL the way `SET` clears a key's without `KEEPTTL`, which is
+/// the opposite of what an earlier round of this branch assumed. The consequence is user-visible
+/// and intended: a view that drops its `ttl_days` stops asking for an expiry, the rewrite clears
+/// the old one, and its values stop expiring server-side, leaving the read-time TTL check as the
+/// only thing that stops serving them.
+///
+/// The observable is the server's own reclamation. Two entity hashes are written with an expiry a
+/// few seconds out, and one of them is rewritten with none immediately afterwards; the rewritten
+/// field is asserted readable before that deadline and still readable after it, while the one left
+/// alone is gone. The field left alone is the control, so the test discriminates in both
+/// directions: a server that kept the TTL through a plain `HSET` would reclaim the rewritten
+/// field after its deadline, and one that never reclaimed anything would leave the control
+/// readable too.
+#[tokio::test]
+async fn rewriting_a_field_without_an_expiry_clears_the_servers_expiry() -> Result<()> {
+    // Slack between the writes, and the point past which the control must be gone. Both client
+    // and server read the same clock: the expiry is absolute, and this host is the one running
+    // the container.
+    const TTL_SECS: i64 = 3;
+
+    let project = project("hsetexpiry");
+    let views = views(&[("clicks", None)]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+    assert_ne!(
+        store.field_expiry(),
+        FieldExpiry::None,
+        "this test needs a server with hash field expiration"
+    );
+
+    let rewritten_key = entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?);
+    let control_key = entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u2"])?);
+    let deadline = now_micros() / 1_000_000 + TTL_SECS;
+    store
+        .write(&[
+            WriteBatch {
+                key: rewritten_key.clone(),
+                fields: vec![WrittenField::new(
+                    value_field("clicks"),
+                    encode_vector(clicks, 1, "x"),
+                    Some(deadline),
+                )],
+            },
+            // The same field with the same expiry on another entity, never rewritten.
+            WriteBatch {
+                key: control_key.clone(),
+                fields: vec![WrittenField::new(
+                    value_field("clicks"),
+                    encode_vector(clicks, 3, "z"),
+                    Some(deadline),
+                )],
+            },
+        ])
+        .await?;
+
+    // The first field again, this time with no expiry, which the write path queues as a plain
+    // `HSET`.
+    let rewritten = encode_vector(clicks, 2, "y");
+    store
+        .write(&[WriteBatch {
+            key: rewritten_key.clone(),
+            fields: vec![WrittenField::new(
+                value_field("clicks"),
+                rewritten.clone(),
+                None,
+            )],
+        }])
+        .await?;
+
+    let live = store
+        .read(&[
+            ReadRequest {
+                key: rewritten_key.clone(),
+                fields: vec![value_field("clicks")],
+            },
+            ReadRequest {
+                key: control_key.clone(),
+                fields: vec![value_field("clicks")],
+            },
+        ])
+        .await?;
+    assert_eq!(
+        live[0][0].as_deref(),
+        Some(rewritten.as_slice()),
+        "the rewrite lands while the field is still inside its expiry"
+    );
+    assert!(
+        live[1][0].is_some(),
+        "the control is inside its expiry too, so it is still readable here"
+    );
+
+    let remaining = deadline - now_micros() / 1_000_000;
+    std::thread::sleep(Duration::from_secs(remaining.max(0) as u64 + 1));
+
+    let after = store
+        .read(&[
+            ReadRequest {
+                key: rewritten_key,
+                fields: vec![value_field("clicks")],
+            },
+            ReadRequest {
+                key: control_key,
+                fields: vec![value_field("clicks")],
+            },
+        ])
+        .await?;
+    assert_eq!(
+        after[0][0].as_deref(),
+        Some(rewritten.as_slice()),
+        "the rewrite cleared the field's TTL, so it outlives the deadline it was written with"
+    );
+    assert!(
+        after[1][0].is_none(),
+        "the control still carries its expiry, so the server reclaimed it, got {:?}",
+        after[1][0]
+    );
+
+    cleanup(&mut store, &project, clicks, &[b"u1", b"u2"]).await?;
     Ok(())
 }
 

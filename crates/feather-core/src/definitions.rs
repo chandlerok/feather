@@ -299,7 +299,27 @@ impl Definitions {
                 ),
             });
         }
+        // A view name reaches the reference syntax as well as the registry and the field names,
+        // and `view:feature` splits on the first colon, so a view named `a:b` would be
+        // indistinguishable from view `a`'s field `b:count` and `a:b:count` would resolve to
+        // whichever of the two the declarations happened to list first. A colon in a *feature*
+        // name is safe, because everything after the first separator is the feature, so only the
+        // view is refused here.
+        let mut view_names = HashSet::new();
         for view in &self.views {
+            if !view_names.insert(view.name.as_str()) {
+                return Err(Error::MalformedDefinitions {
+                    reason: format!("declares view `{}` twice", view.name),
+                });
+            }
+            if view.name.contains(':') {
+                return Err(Error::MalformedView {
+                    view: view.name.clone(),
+                    reason: "has a name containing a colon, which is the separator between a \
+                             view and a feature in a reference"
+                        .to_owned(),
+                });
+            }
             // Surfaces the multi-entity error at validation time rather than at
             // the first read.
             view.entity()?;
@@ -657,5 +677,50 @@ mod tests {
         .validate()
         .expect_err("must fail");
         assert!(error.to_string().contains("user:id"), "{error}");
+    }
+
+    #[test]
+    fn a_view_name_that_would_re_split_a_reference_is_refused() {
+        // `view:feature` splits on the first colon, so a view named `clicks:raw` would be
+        // indistinguishable from view `clicks`'s field `raw:count`, and the reference
+        // `clicks:raw:count` would resolve to whichever of the two the declarations listed
+        // first. Nothing else in the key layout sees the colon, which is why this refusal is a
+        // separate one from the project and entity names'.
+        let error = project(|view| view.name = "clicks:raw".to_owned())
+            .validate()
+            .expect_err("must fail");
+
+        assert!(error.to_string().contains("clicks:raw"), "{error}");
+        assert!(error.to_string().contains("colon"), "{error}");
+    }
+
+    #[test]
+    fn a_feature_name_containing_a_colon_is_accepted() {
+        // Everything after the first separator is the feature, so a colon there cannot be
+        // mistaken for the view's end, and the reference still resolves.
+        let mut definitions = project(|view| view.features[0].name = "count:raw".to_owned());
+        definitions.services.push(FeatureService {
+            name: "ranking_v3".to_owned(),
+            features: vec!["user_clicks:count:raw".to_owned()],
+        });
+
+        definitions.validate().expect("valid");
+    }
+
+    #[test]
+    fn a_view_declared_twice_is_refused() {
+        // Two views sharing a name make the registry write last-write-wins, so it can hold a
+        // timestamp older than the refresh that ran, and the two views write the same fields.
+        let mut definitions = project(|_| {});
+        let mut duplicate = definitions.views[0].clone();
+        duplicate.features = vec![Field::new("other", DType::Int64)];
+        definitions.views.push(duplicate);
+
+        let error = definitions.validate().expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "malformed definitions: declares view `user_clicks` twice"
+        );
     }
 }

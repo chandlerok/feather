@@ -202,13 +202,14 @@ jobs:
       # guarantees go unenforced.
       - name: pyrefly
         run: uv run --no-sync pyrefly check
-      # The suite includes two tests marked `integration`, which read and write a
-      # real Valkey: the round trip, and a rename that retires a view. They
-      # connect eagerly and have no skip guard, so with nothing listening they
-      # fail rather than skip. That is why the rust job starts services for the
-      # same class of test. The constrained container from docker-compose.yml is
-      # reused rather than a bare one, so the tests meet the maxmemory and
-      # eviction limits they are written against.
+      # The suite includes three tests marked `integration`, which read and write
+      # a real Valkey: the round trip, a rename that retires a view, and two
+      # threads sharing one store. They connect eagerly and have no skip guard,
+      # so with nothing listening they fail rather than skip. That is why the
+      # rust job starts services for the same class of test. The constrained
+      # container from docker-compose.yml is reused rather than a bare one, so
+      # the tests meet the maxmemory and eviction limits they are written
+      # against.
       - name: valkey
         run: mise run valkey:up
       - name: pytest

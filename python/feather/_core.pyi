@@ -74,7 +74,8 @@ class FeatureStore:
 
         Args:
             entity_frame: The entities to read, exporting Arrow buffers through
-                ``__arrow_c_stream__``. Its join key column is named after the views' entity.
+                ``__arrow_c_stream__``. Its join key column is named after the views' entity's
+                ``join_key``.
             features: ``view:feature`` references, in the order the caller wants the columns
                 back.
 
@@ -85,9 +86,10 @@ class FeatureStore:
 
         Raises:
             ValueError: If a reference is malformed, names an unknown view or feature, or is
-                requested twice; if the requested views are keyed on different join keys; if
-                ``entity_frame`` lacks the join key column or holds a null in it; or if a
-                requested feature name collides with a column of the frame.
+                requested twice; if the requested views do not declare the same entity, which is
+                both the same join key and the same entity name; if ``entity_frame`` lacks the
+                join key column or holds a null in it; or if a requested feature name collides
+                with a column of the frame.
             ConnectionError: If the settings declare a Valkey that cannot be reached.
         """
         ...

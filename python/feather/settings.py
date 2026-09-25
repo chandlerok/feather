@@ -70,11 +70,10 @@ class PostgresConnection(pydantic.BaseModel):
 
     ``host`` and ``port`` are libpq's rather than a URL's, which is why they are two
     fields and not one. ``port`` is bounded to what the core can carry, which is a
-    ``u16``, so 0 is allowed: libpq reads it as "use the default port" and a bound that
-    refused it would reject a connection the core would have used. A bound here is for
-    catching a value the core cannot represent, not for being a second, stricter
-    contract. ``password`` is a secret and stays out of ``repr`` the way the other
-    credentials do.
+    ``u16``, so 0 is allowed: the bound is for catching a value the core cannot
+    represent, not for being a second and stricter contract. Whether libpq then reads 0
+    as "use the default port" is unverified here, and is not what the bound rests on.
+    ``password`` is a secret and stays out of ``repr`` the way the other credentials do.
 
     ``ssl_mode`` is any of libpq's ``sslmode`` values, lower case, and has no default.
     libpq already prefers TLS when the server offers it, and a security flag guessed

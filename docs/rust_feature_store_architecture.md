@@ -9,8 +9,9 @@ entity key encoding, value codec, and the online serving layer are built and mea
 materialization, which computes a view's values from its source and writes them to the online
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
 is design only for the source kinds with no reader. Arrow Flight serving and the L1 cache are
-design only. Figures that are measurements say so and carry their hardware and cardinality; the
-rest are targets.
+design only, and so is the deployment machinery under "Materialization" — per-view parallelism,
+the schedule, and the lock — none of which the refresh implements itself. Figures that are
+measurements say so and carry their hardware and cardinality; the rest are targets.
 
 ---
 
@@ -244,11 +245,15 @@ fields: v:{view}   the view's encoded feature vector, all its features in one bl
 ```
 
 One key holds no entity's values: the project registry, `{project}:views`. It is a hash whose
-fields are the declared view names and whose values are each view's newest event timestamp,
-encoded the way a freshness field is. A refresh reads it to learn which views the previous
-refresh declared, writes it last, and garbage collection diffs the two sets. Being a hash is
-what lets it reuse the read, write and delete the other hashes already need, rather than adding
-a command family for one key per project.
+fields are the view names a refresh has declared — a view that every refresh so far has found no
+rows for has no field — and whose values are each view's newest event timestamp, encoded the way
+a freshness field is. A refresh reads it to learn which views the previous refresh declared,
+writes it last, and garbage collection diffs the two sets. Being a hash is what lets it reuse
+the read, write and delete the other hashes already need, rather than adding a command family
+for one key per project. Losing it is a worse failure than a crash before it is written:
+eviction under the configured `allkeys-lru`, a `DEL`, or a restore from an older snapshot leaves
+the next refresh reading an empty registry, retiring nothing, and leaving a renamed view's
+fields in the store for good.
 
 #### Entity key encoding
 
@@ -275,7 +280,11 @@ Four consequences:
   ambiguous rather than escapable: garbage collection would fail to recognise those keys and
   skip them, leaking the fields it was meant to reclaim. The loader refuses such a name instead
   of writing keys it cannot read back. That is a breaking change for a `project` value that
-  previously loaded.
+  previously loaded. **A view name is refused as well, for a different reason:** a reference is
+  `view:feature` split on the first colon, so a view named `a:b` is indistinguishable from view
+  `a`'s field `b:count`, and the reference `a:b:count` resolves to whichever of the two came
+  first. A colon in a _feature_ name is safe, because everything after the first separator is
+  the feature.
 - **No cluster hash tag, permanently.** One hash is already one slot, so every field of an
   entity is colocated by construction. A project-level hash tag would force every entity in
   the project into a single slot, which is the opposite of what a cluster is for. Reading N
@@ -747,7 +756,10 @@ The write path never leaves Arrow and never builds a row-oriented intermediate:
 
 1. DuckDB computes the values and streams Arrow record batches out.
 2. Each batch is encoded directly into Valkey write commands.
-3. Commands are pipelined, bounded by an in-flight byte budget.
+3. Commands are pipelined, one flush per 1024 commands (`DEFAULT_CHUNK` in
+   `online/valkey.rs`). The bound is a command count rather than a byte budget: large enough
+   to amortise the round trip, small enough that one flush does not hold a multi-megabyte
+   request buffer.
 
 No step materializes the full dataset. This is the specific difference from Feast, which
 converts the entire Arrow table into a Python list of protobuf objects before writing:
@@ -784,10 +796,17 @@ Feast's operator uses, and it needs no new component.
 
 **The lock is an efficiency guard, not a correctness one.** Feast needs a distributed lock
 plus job-state tracking because its incremental materialization is not idempotent, so a
-duplicate run can corrupt the watermark. A full refresh is idempotent by construction, so a
-duplicate run wastes work and produces the same state. Feather therefore takes a
-non-blocking lock (`SET NX PX`, TTL set to the expected maximum runtime) and exits 0 when it
-is already held. No job-state table, and no already-running detection.
+duplicate run can corrupt the watermark. A full refresh is idempotent by construction for an
+unchanged declared set, so a duplicate run wastes work and produces the same state. Two runs
+with _different_ declared sets are the exception: each computes its retired set from the
+registry it read, and the two write the same fields, so interleaving them can leave the
+registry holding a timestamp from the older read while each report counts the same rows. A
+serialized run is what removes that case, and serialization belongs to the deployment rather
+than to the refresh, which takes no lock of its own. Two deployment mechanisms do it, both
+design only, since nothing in this repository schedules a refresh or issues a lock: the
+`concurrencyPolicy: Forbid` above, or, for a scheduler without it, a non-blocking lock around
+the run (`SET NX PX`, TTL set to the expected maximum runtime) that exits 0 when the lock is
+already held. No job-state table, and no already-running detection.
 
 Freshness is surfaced from `f:{view}`, which the write path already maintains. The maximum
 lag across views is the metric to alert on, exported as a gauge rather than discovered by a
@@ -801,7 +820,8 @@ store indefinitely because it only deletes data when the last view for an entity
 ([#3596](https://github.com/feast-dev/feast/issues/3596)).
 
 The refresh knows which views retired, because it reads the project registry before it writes
-anything and diffs it against the set it is about to refresh. What it does not know is where
+anything and diffs it against every view the project declares — not against the selection, which
+is why refreshing a subset retires nothing. What it does not know is where
 their fields are. A retired view's entities do not have to appear in any source any more, and
 their hashes carry no trace of which view put a field in them, so the view set names the orphan
 but not its location: the project's keyspace is the only complete list. When, and only when, a
@@ -813,9 +833,10 @@ against a key that is not a hash is an error rather than a no-op.
 The walk is rare by construction, which is the point of the registry: a project whose declared
 views have not changed retires nothing and walks nothing. It is idempotent as well, because
 removing a field that is already gone is a no-op, and the registry is written after the walk
-rather than before it, so a run that dies partway leaves a state the next run repairs. This is
-the reason a refresh is not a pure function of its inputs, and it is the only part of it that
-is not.
+rather than before it, so a run that dies partway leaves a state the next run repairs — as long
+as that next run declares the same view set, since the retired set it computes comes from the
+registry rather than from the run it is repairing. This is the reason a refresh is not a pure
+function of its inputs, and it is the only part of it that is not.
 
 ### Ceiling
 

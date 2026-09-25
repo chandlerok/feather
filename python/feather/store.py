@@ -138,11 +138,12 @@ class FeatureStore:
         """Refresh feature values from their sources into the online store.
 
         A full refresh: every selected view is recomputed from its source and every value is
-        overwritten in place. There is no watermark and no partial state, so a run that fails
-        leaves the previous run's values where they were and the call can be repeated without
-        reconciling anything. A view that a previous refresh declared and this one does not is
-        retired: its fields are removed from every entity that still carries them, and it leaves
-        the project's view registry.
+        overwritten in place. There is no watermark and nothing partial to reconcile, so a run
+        that fails leaves the values it had not yet overwritten as they were and the call can
+        simply be repeated. A run that is still going serves a mix of the values it has written
+        and the ones it has not reached yet. A view that a previous refresh declared and this one
+        does not is retired: its fields are removed from every entity that still carries them,
+        and it leaves the project's view registry.
 
         Args:
             views: The views to refresh, by name, or ``None`` for every view the project
@@ -177,7 +178,7 @@ class FeatureStore:
         Args:
             entity_df: The entities to read, as an object exporting Arrow buffers through
                 ``__arrow_c_stream__``. A Polars DataFrame does. Its join key column is named
-                after the views' entity, and one call reads one entity type.
+                after the views' entity's ``join_key``, and one call reads one entity type.
             features: The declared fields to read, as ``View.field``. The order given here is
                 the order of the returned columns, and each field's own view decides which
                 stored vector it comes from.
@@ -194,9 +195,10 @@ class FeatureStore:
                 common case, and the message names the conversion.
             ValueError: If a feature is not bound to a view, is requested twice, names a view or
                 feature the project does not declare, or collides with a column of
-                ``entity_df``; if the requested views are keyed on different join keys; if
-                ``entity_df`` lacks the join key column or holds a null in it; or if the read
-                fails.
+                ``entity_df``; if the requested views do not declare the same entity, which is
+                both the same join key and the same entity name, since one call reads one entity
+                type; if ``entity_df`` lacks the join key column or holds a null in it; or if the
+                read fails.
             ConnectionError: If ``feather.toml`` declares a Valkey that cannot be reached.
         """
         if not hasattr(entity_df, "__arrow_c_stream__"):

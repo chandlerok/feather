@@ -229,11 +229,16 @@ pub fn entity_key_component(column: &dyn Array, row: usize) -> Result<Vec<u8>> {
 
 /// Whether a key has the shape of an entity hash, `project:{entity}:{len}:{value}`.
 ///
-/// Garbage collection walks a project's keyspace and must not send `HDEL` to a key that is
-/// not a hash, where the server answers `WRONGTYPE` and a refresh fails over a key that has
-/// nothing to do with the view being retired. The encoded tail has to decode, which is the
-/// `{len}:` suffix that also keeps `{project}:views` from looking like an entity named
+/// Garbage collection walks a project's keyspace and deletes only from the keys that look like
+/// an entity hash, so a key with nothing to do with the retired view — `{project}:views`,
+/// `{project}:meta` — is never sent a deletion at all. The encoded tail has to decode, which is
+/// the `{len}:` suffix that also keeps `{project}:views` from looking like an entity named
 /// `views`.
+///
+/// This is a check of the key's name, not of its type. The walk is `SCAN … MATCH` with no `TYPE
+/// hash`, so a key shaped like an entity hash but holding something else still reaches `HDEL`,
+/// and the server still answers `WRONGTYPE` for it; keeping that from happening is what adding
+/// `TYPE hash` to the scan would do, at the cost of a slower walk.
 ///
 /// Args:
 ///     key: The key as it exists in the store.
@@ -250,11 +255,25 @@ pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
 
 /// The project registry key, `{project}:views`.
 ///
-/// A hash whose fields are the declared view names and whose values are each view's newest
-/// event timestamp in microseconds, encoded the way [`crate::online::encode_freshness`]
-/// encodes a freshness field. One key serves three purposes: the declared view set garbage
-/// collection diffs against, a per-view freshness source for metrics, and a signal that a
-/// refresh happened.
+/// A hash whose fields are the view names a refresh has declared and whose values are each
+/// view's newest event timestamp in microseconds, encoded the way
+/// [`crate::online::encode_freshness`] encodes a freshness field. The value is the newest
+/// timestamp *any* refresh has seen for that view, which is not always the last refresh's: a
+/// view that was not selected keeps the timestamp an earlier run gave it, and a view every
+/// refresh so far has found no rows for has no field at all. A refresh writes the key last,
+/// after its value writes and after orphan collection, and the next refresh reads it to diff
+/// the view set it declares against the one it inherited. One key serves three purposes: the
+/// inherited view set garbage collection diffs against, a per-view freshness source for
+/// metrics, and a signal that a refresh which wrote something ran — an empty map is not
+/// written, so a first refresh over a source with no usable row leaves no key in either
+/// store.
+///
+/// Losing the key is a different failure from a crash before it is written. Eviction under the
+/// configured `allkeys-lru`, a `DEL`, or a restore from an older snapshot all leave a project
+/// with entity hashes and no registry, and every later refresh then reads an empty map,
+/// retires nothing, and leaks a renamed view's fields for good. Nothing else records the
+/// previous declared view set, and the write-last ordering cannot cover it: that ordering
+/// protects a run which dies before its own write, not a key that is already gone.
 ///
 /// The project name is not escaped, because a key is not a pattern. A caller that turns it
 /// into one has to escape it itself; [`crate::online::ProjectScan`] is where that happens.

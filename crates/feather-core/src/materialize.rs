@@ -2,9 +2,11 @@
 //!
 //! A refresh recomputes every value a view serves from the view's source and overwrites it
 //! in place. There is no watermark and no progress state, which is a correctness decision
-//! before a simplicity one: a crashed run leaves the previous run's values in place, still
-//! inside their TTL, and the next run overwrites all of them, so there is no partial state to
-//! reconcile. See "Materialization" in the architecture document.
+//! before a simplicity one: a run that dies partway leaves some values from the previous run
+//! in place, still inside their TTL, and the entities it had already overwritten holding what
+//! it wrote; the next run overwrites all of them, so there is nothing partial to reconcile.
+//! What a live run costs is that serving sees a mix of old and new values for as long as it
+//! takes. See "Materialization" in the architecture document.
 //!
 //! The pipeline never leaves Arrow and holds one record batch at a time. DuckDB reduces the
 //! source to the newest row per entity and streams batches out, each batch is encoded and
@@ -96,7 +98,9 @@ pub struct MaterializeReport {
 ///     [`Error::StreamInterrupted`] if a scan failed after it had started.
 ///     [`Error::AmbiguousTimestamp`] if the source holds two rows for one entity at one event
 ///         timestamp and the view declares no `created_timestamp_field`, which is the same
-///         refusal the join makes.
+///         refusal the join makes. It is a per-view guarantee rather than a per-refresh one: a
+///         refresh scans and writes its views in declaration order, so every view declared before
+///         this one has already been refreshed by the time the check runs.
 ///     [`Error::NullEntityKey`] if a source row's entity key is null, which the scan's own
 ///         filter already excludes.
 ///     [`Error::UnsupportedKeyType`] if a source's entity key is not an integer or a string.
@@ -167,26 +171,34 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
     // Writing the registry first would tell the next run those views were never declared, and
     // their fields would stay in the store for good.
     //
-    // What is written is exactly the declared set: retained to it, then updated with the
-    // timestamps this refresh saw. A view that was not selected keeps the timestamp it had,
-    // since the registry records the newest event timestamp any refresh has seen and a refresh
-    // that did not touch a view did not see an older one. A view whose refresh wrote no rows
-    // keeps its timestamp for the same reason.
+    // What is written is the old registry restricted to the declared set, then updated with the
+    // timestamps this refresh saw: `(old ∩ declared) ∪ refreshed`. Not the declared set itself.
+    // A declared view whose every refresh has yet to write a row has no field at all, and a view
+    // that was not selected this time keeps the timestamp an earlier refresh gave it: what the
+    // registry records is the newest event timestamp *any* refresh has seen for a view, and a
+    // refresh that did not touch a view did not see an older one, so leaving the timestamp alone
+    // is what keeps the recorded freshness from going backwards.
     registry.retain(|name, _| declared_names.contains(name.as_str()));
     for view in &views {
         if let Some(highest) = view.max_event_timestamp_micros {
             registry.insert(view.name.clone(), encode_freshness(highest));
         }
     }
-    store
-        .write(&[WriteBatch {
-            key: registry_key,
-            fields: registry
-                .into_iter()
-                .map(|(name, value)| WrittenField::new(name, value, None))
-                .collect(),
-        }])
-        .await?;
+    // An empty registry is not written. `MemoryStore` creates a hash for every key it is handed
+    // and `ValkeyStore` queues nothing at all for a batch with no fields, so writing one would
+    // leave the double holding a key the server never creates, and nothing was recorded either
+    // way: the next refresh reads the same empty registry and diffs the same declared set.
+    if !registry.is_empty() {
+        store
+            .write(&[WriteBatch {
+                key: registry_key,
+                fields: registry
+                    .into_iter()
+                    .map(|(name, value)| WrittenField::new(name, value, None))
+                    .collect(),
+            }])
+            .await?;
+    }
 
     Ok(MaterializeReport {
         total_rows: views.iter().map(|view| view.rows).sum(),
@@ -286,9 +298,12 @@ fn select_views<'a>(
 /// write would give it another 30 days of life; the read-time check would then disagree with
 /// what the server holds. `None` for a view that declares no TTL.
 ///
-/// Rounded up, so the server can never reclaim a field while the read-time check would still
-/// call it fresh. Rounding down opens a window just under a second wide where a value the read
-/// path would have served is already gone, which reports it as never written instead.
+/// Rounded up, so rounding is not what makes the server reclaim a field while the read-time
+/// check would still call it fresh. Rounding down opens a window just under a second wide where
+/// a value the read path would have served is already gone, which reports it as never written
+/// instead. The two sides read different clocks — the server's, against this absolute instant,
+/// and the caller's `now`, against the recorded freshness — so a skew between them is the one
+/// way left for the server to reclaim early, and no rounding direction can cover it.
 fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
     let ttl_days = view.ttl_days?;
     // Rounded up rather than down. `i64::div_ceil` is still unstable in this toolchain, so the
@@ -681,6 +696,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_with_repeated_nulls_is_not_ambiguous() {
+        // Two rows with a null key at one timestamp. That is the shape the ambiguity check used
+        // to group: it reads the key back as a string, a null is a column-type error rather than
+        // a value, so a source the scan handles fine failed the whole refresh with a message
+        // naming neither the source nor the rows. The two rows whose timestamp is null under one
+        // entity are the same shape on the join path, where the check only looks at the keys a
+        // frame names. Neither pair is an ambiguity a refresh has to resolve.
+        let source = Parquet::write(&source_with_nulls(&[
+            (None, Some(10), 1),
+            (None, Some(10), 2),
+            (Some(4), None, 3),
+            (Some(4), None, 4),
+            (Some(3), Some(20), 5),
+        ]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+        let report = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("a source with repeated nulls is not ambiguous");
+
+        assert_eq!(stored_count(&store, &view, b"3"), Some(5));
+        assert_eq!(report.total_rows, 1);
+        assert_eq!(report.views[0].max_event_timestamp_micros, Some(20));
+        assert!(
+            store.fields(&key_of(b"4")).is_none(),
+            "a row with no timestamp has no freshness to record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_whose_source_yields_nothing_writes_no_registry() {
+        // The registry is written only when it has something to record. A refresh over an empty
+        // source has nothing, and the two stores disagreed about that: `MemoryStore` created an
+        // empty hash for the key while `ValkeyStore` queued no command at all and left the key
+        // absent, so a test could see a registry the server never had.
+        let source = Parquet::write(&source(&[]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+        let report = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("an empty source is not an error");
+
+        assert_eq!(report.views[0].rows, 0);
+        assert_eq!(report.views[0].max_event_timestamp_micros, None);
+        assert!(report.retired.is_empty());
+        assert_eq!(report.total_rows, 0);
+        assert!(
+            store.fields(&views_registry_key("ads")).is_none(),
+            "nothing was written, so no key exists, in either store"
+        );
+        assert_eq!(store.hash_count(), 0);
+    }
+
+    #[tokio::test]
     async fn every_refresh_writes_the_registry_with_each_views_newest_event_timestamp() {
         let (store, _) = refresh(&[(1, 300, 30), (1, 500, 50), (2, 900, 90)]).await;
 
@@ -946,7 +1027,10 @@ mod tests {
         // Two rows for one entity at one event timestamp, and no `created_timestamp_field` to
         // decide between them, so which one wins would depend on the query plan. The join refuses
         // that source; a refresh has to refuse it too, or serving would quietly answer from a row
-        // training would not read.
+        // training would not read. The refusal is this view's rather than the refresh's: views
+        // are scanned and written in declaration order, so every view declared before this one
+        // has already been refreshed by the time the check runs, and what holds is that this view
+        // wrote nothing.
         let source = Parquet::write(&source(&[(1, 100, 10), (1, 100, 11)]));
         let view = a_view(&source.string(), None);
         let mut store = MemoryStore::new();
@@ -967,7 +1051,7 @@ mod tests {
         assert_eq!(
             store.hash_count(),
             0,
-            "the refusal comes before the first write, so nothing is stored"
+            "the refusal comes before this view's first write, so nothing is stored"
         );
     }
 
