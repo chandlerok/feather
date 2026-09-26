@@ -50,8 +50,8 @@ for the evidence behind it.
    with no per-row Python and no serialization format on the hot path.
 2. **Zero-infrastructure local mode.** Point-in-time joins and online lookups work out of
    the box with no external services.
-3. **Opinionated simplification.** One online store (Valkey), one local compute engine
-   (DuckDB), one internal representation (Arrow).
+3. **Opinionated simplification.** One configurable online store (Valkey), one local compute
+   engine (DuckDB), one internal representation (Arrow).
 4. **Additive upgrade paths.** Every capability deferred from v1 has a documented retrofit
    that does not require changing the storage format or the serving path.
 
@@ -62,7 +62,7 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No streaming ingestion or real-time feature computation. Features are materialized in
   batches.
 - No Spark or Flink execution backend.
-- No pluggable online store interface. Valkey is the only online store.
+- No pluggable online store interface. Valkey is the only online store that can be configured.
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -434,7 +434,8 @@ max_staleness = refresh_interval
 ```
 
 - `refresh_interval` is the deployment's schedule, so this number is per deployment rather
-  than a constant. A read goes to Valkey, so it sees the newest materialized value.
+  than a constant. In a deployment a read goes to Valkey, so it sees the newest
+  materialized value.
 - TTL expiry caps staleness by construction: an expired value reads as missing rather than as
   a stale value.
 
@@ -674,7 +675,8 @@ row alignment.
 
 ## Materialization
 
-Materialization computes feature values from offline sources and writes them to Valkey.
+Materialization computes feature values from offline sources and writes them to the online
+store (Valkey in a deployment, the in-process store in local mode).
 
 ### Full refresh, no watermarks
 
@@ -711,7 +713,7 @@ Re-materialization is the migration.
 The write path never leaves Arrow and never builds a row-oriented intermediate:
 
 1. DuckDB computes the values and streams Arrow record batches out.
-2. Each batch is encoded directly into Valkey write commands.
+2. In a deployment, each batch is encoded directly into Valkey write commands.
 3. Commands are pipelined, one flush per 1024 commands (`DEFAULT_CHUNK` in
    `online/valkey.rs`). The bound is a command count rather than a byte budget: large enough
    to amortise the round trip, small enough that one flush does not hold a multi-megabyte
@@ -1013,9 +1015,9 @@ Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
   so there is no deployment-wide offline store to name. See "Offline engine".
-- **No `type` on `[valkey]`.** Valkey is the only online store, and a pluggable one is a
-  non-goal. The table name carries the kind, so a key that could only hold one value is not
-  written down.
+- **No `type` on `[valkey]`.** Valkey is the only online store that can be configured, and
+  a pluggable one is a non-goal. The table name carries the kind, so a key that could only
+  hold one value is not written down.
 - **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
   prefix, and a database table differ only in how the source is declared, not in what
   executes it.
@@ -1094,7 +1096,8 @@ database still need their keys specified before they can be documented.
 ## Deployment
 
 1. **Local development.** `pip install feather-py`. Everything runs in-process: local
-   Parquet and an in-memory DuckDB. No external services, and an online read needs a Valkey.
+   Parquet, an in-memory DuckDB, and an in-memory online store, so nothing external is
+   needed. In a deployment an online read needs a Valkey.
 2. **Production.** Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled
    Deployment behind gRPC and REST; materialization runs as resource-isolated Kubernetes
    Jobs on a schedule or on demand.

@@ -225,8 +225,9 @@ pub struct L1Cache {
     pub max_capacity_mb: Option<NonZeroU64>,
     /// `None` leaves the interval to the engine's default.
     ///
-    /// Always on, not conditional on push invalidation being available: it bounds
-    /// staleness when an invalidation message is missed.
+    /// With no cache and no invalidation, nothing falls back to this. The view's declared
+    /// `ttl_days` is what caps staleness: a read-time check makes an expired value read as
+    /// missing rather than as a stale one.
     #[serde(default)]
     pub fallback_ttl_seconds: Option<NonZeroU64>,
 }
@@ -281,8 +282,9 @@ fn conninfo_value(value: &str) -> String {
 
 /// The Valkey connection.
 ///
-/// Valkey is the only online store, so no `type` discriminates it. `tls` has no default: a
-/// security flag guessed wrong is worse than one an operator had to write down.
+/// Valkey is the only online store that can be configured, so no `type` discriminates it.
+/// `tls` has no default: a security flag guessed wrong is worse than one an operator had to
+/// write down.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Valkey {
