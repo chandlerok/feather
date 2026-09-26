@@ -193,7 +193,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             init(args.directory, force=args.force)
         elif args.command == "demo":
             demo(args.directory, force=args.force)
-        else:
+        elif args.command == "refresh":
             refresh(args.directory, args.views)
     except Exception as error:
         # ConnectionError is an OSError, so a Valkey that cannot be reached is
