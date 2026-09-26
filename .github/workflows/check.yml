@@ -277,9 +277,10 @@ jobs:
       # is what a publish job would use, and that is a separate issue.
       #
       # `--strip` is the one thing that is not incidental, because the wheel is
-      # mostly DuckDB's symbol table: 255MB unstripped, and PyPI refuses a file
-      # over 100MB. The next step prints the size, so the number is on the record
-      # rather than guessed at.
+      # almost entirely DuckDB's symbol table: 255MB unstripped, 24MB stripped,
+      # and PyPI refuses a file over 100MB. So a wheel that skipped this would not
+      # upload, rather than merely being large. The next step prints the size, so
+      # the number stays on the record instead of being re-derived.
       - name: build the wheel
         run: maturin build --strip --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
