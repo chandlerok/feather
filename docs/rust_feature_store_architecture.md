@@ -9,12 +9,12 @@ Scope note: this is a design document with a partial implementation. The definit
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
 materialization, which computes a view's values from its source and writes them to the online
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
-is design only for the source kinds with no reader. Arrow Flight serving is design only, and so
-is the deployment machinery under "Materialization" — per-view parallelism,
-the schedule, and the lock — none of which the refresh implements itself. The serving figures
-are measured against a shared Valkey, the position a deployment graduates to, so the in-process
-default carries no published figure yet. Figures that are measurements say so and carry their
-hardware and cardinality; the rest are targets.
+is design only for the source kinds with no reader. There is no served API: the library runs in
+the caller's process, so the deployment machinery under "Materialization", the per-view
+parallelism, the schedule, and the lock, is design only, none of which the refresh implements
+itself. The serving figures are measured against a shared Valkey, the position a deployment
+graduates to, so the in-process default carries no published figure yet. Figures that are
+measurements say so and carry their hardware and cardinality; the rest are targets.
 
 ---
 
@@ -70,6 +70,9 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No pluggable online store interface. There are two positions, in-process and Valkey, and
   which one a deployment runs is configuration rather than a plugin. See "Online serving
   layer".
+- No feature server. The library runs in the caller's process and reads Valkey directly. A
+  team that wants an RPC surface over it builds that in its own service; this project ships no
+  server, no HTTP endpoint, and no deployment manifests.
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -229,14 +232,43 @@ FeatureService(
   would be a second source of truth.
 - **No versioning, no logging config, no infrastructure.** Feast's feature service bundles all
   of that, which makes it registry-shaped, and this design has no registry.
-- **The name is what the serving request carries**, so serving resolves the field set once at
-  startup instead of accepting a raw field list per request. That is what makes the
-  "no per-request metadata resolution" rule in "Read path" enforceable.
-- **A raw field list stays available** as an escape hatch for ad-hoc and debug requests. The
-  hot path uses a name.
+- **Nothing consumes it yet.** The original reason for a name was that a serving request would
+  carry it, and there is no served API. In-process, a checked module-level list gives the same
+  protection against a training script and a serving handler listing different features, so what
+  a `FeatureService` adds today is validation and a compiled identity rather than a wire one. It
+  is kept because the shape is settled and cheap; it becomes load-bearing only if a request ever
+  crosses a process boundary.
+- **A raw field list stays available** as an escape hatch for ad-hoc and debug requests.
 
 If logged features are ever adopted (see "Open design questions"), this is where their
 configuration belongs.
+
+#### Other language bindings
+
+The language that defines the features is the language that reads them. A Go binding exists so a
+Go project can declare its views in Go and read them in its own process, the same way the Python
+binding does. It links this crate the way the PyO3 crate does, so the key encoding, the value
+codec, the TTL check, and the point-in-time join stay one implementation rather than becoming one
+per language.
+
+That is also the fastest arrangement available: a read is a call in the same process, with no
+server to reach and no hop to pay for. Serving from a separate process would add one, which is
+why there is no such process here.
+
+Reading from another language is therefore a build-your-own path rather than a supported one. A
+project that wants, say, a Go service to read features the defining language declared builds a
+gRPC, HTTP, or Arrow Flight surface over the defining process and owns it. This project ships no
+server, and the note under "Open design questions" records the transport research for whoever
+builds one.
+
+One thing is worth knowing if a surface is ever built over a _second_ declaration of the same
+fields, rather than over the defining process. The schema tag covers field names, dtypes, and
+declaration order, and does not cover `ttl_days`. Two declarations that agree on fields and
+disagree on the TTL compute the same tag, so the same stored value reads as fresh in one and
+expired in the other, and nothing detects it. That is harmless while one declaration exists,
+because the read-time check uses that one. Mixing `ttl_days` into the hash, announced by the
+reserved `flags` byte, is the fix, and it is cheap while nothing published depends on the current
+tag.
 
 ### 2. Online serving layer
 
@@ -309,10 +341,12 @@ than a key-format change:
 - `f:` freshness metadata. Used for the read-time TTL check and for staleness reporting.
 - `t:` pre-aggregated tiles. Reserved for the tiling upgrade path, see "Scalability".
 
-Values are self-describing: each encoded value carries a small schema tag. Serving treats a
-value whose tag does not match the expected dtype as missing rather than attempting to
-decode it. This is what makes a dtype change a null window instead of a decode failure, and
-it is what allows the encoding to change later without a migration.
+Values carry a small schema tag, which **verifies** a schema rather than carrying one. The tag
+is a hash of the field names, dtypes, and declaration order, and the reader supplies the schema
+it expects. Serving treats a value whose tag does not match as missing rather than attempting to
+decode it. This is what makes a dtype change a null window instead of a decode failure, and what
+allows the encoding to change later without a migration. It is also what lets an independent
+implementation agree with this one without a shared artifact.
 
 #### Value byte layout
 
@@ -369,10 +403,11 @@ synchronous, and
 [#2247](https://github.com/feast-dev/feast/issues/2247) reports the same for DynamoDB. The
 rule here is absolute: never one read per view.
 
-Requested fields are resolved from the feature service definition **once at process start**
-and cached. Feast resolves registry metadata on every request, which profiling shows is more
-than half of `get_online_features` execution time
-([#4710](https://github.com/feast-dev/feast/issues/4710)).
+Requested fields are resolved against already-loaded in-process definitions, so resolution is a
+table lookup rather than I/O. Feast resolves registry metadata on every request, which profiling
+shows is more than half of `get_online_features` execution time
+([#4710](https://github.com/feast-dev/feast/issues/4710)); that cost does not exist here,
+because there is no registry and no separate process to resolve against.
 
 Batch within a request, not across requests. A staff-level design for a comparable system
 measured this and rejected cross-request micro-batching: at 1M requests/second across 2000
@@ -465,8 +500,8 @@ one. It is the trade SQLite and Postgres present, where the embedded store is th
 server is what a project graduates to.
 
 Both positions are the same trait. `read_entities<S: OnlineStore>` is the only caller in the
-serving path, so which store is behind it does not touch the Python surface, the serving API, or
-the offline path, and choosing between them is configuration.
+serving path, so which store is behind it does not touch the Python surface or the offline path,
+and choosing between them is configuration.
 
 Two things differ, and both matter:
 
@@ -512,38 +547,7 @@ alongside the numbers so a figure cannot be quoted without them. Compare against
 These numbers are from one host and one container shape. Treat them as an order of magnitude,
 not a guarantee.
 
-### 3. Serving API (Arrow Flight)
-
-The serving transport is **Arrow Flight**, not protobuf over gRPC and not JSON over REST.
-Flight runs on gRPC and carries Arrow IPC as its payload, so the gRPC transport claim holds
-while protobuf stays out of the data path, consistent with the encoding decision.
-
-The precedent is direct. Hopsworks built this same combination for a feature store, DuckDB
-plus Arrow Flight plus Python clients, and reported up to 45x throughput over their previous
-REST API, with "zero-copy data transfer on server- as well as on client-side". Independent
-benchmarks put Flight up to 30x over ODBC for Arrow data.
-
-What this buys, in order of importance:
-
-- **No decode step for the client.** A Python client receives Arrow record batches and hands
-  them to Polars, pandas, or PyArrow directly. The alternative deserializes every value before
-  a DataFrame can exist.
-- **Batch semantics come free.** Flight streams record batches, so a request covering N
-  entities is one streamed response rather than N round trips.
-- **Auth has a defined home.** Flight supports token and handshake-based auth handlers, so
-  authentication is a supported extension point rather than a bolt-on.
-- **Columnar throughout.** The offline path already produces Arrow, so there is one
-  representation end to end.
-
-Feast's community asked for this and did not get it
-([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments). That thread is also
-where the real cost of the alternative is documented; see "Recorded decisions".
-
-A request must carry a feature service reference plus entity keys, not a raw field list, so
-that serving can resolve the field set once at startup. The feature service model itself is
-not yet defined; see "Open design questions".
-
-### 4. Offline engine (query routing)
+### 3. Offline engine (query routing)
 
 Historical queries are routed between two execution tiers. Both execute in the local DuckDB
 engine; they differ in where the source data lives and how it is reached. The engine choice and
@@ -899,16 +903,19 @@ The properties matter more than the speedup:
   recomputed. No watermark, no backfill logic.
 - **Bounded read cost.** O(windows) rather than O(events), regardless of stream volume.
 
-Chronon requires Flink for this. Feather does not: the same tiles can be computed in DuckDB
-during batch materialization. Same idempotency, same bounded reads, no streaming runtime and
-no new process.
+Chronon requires Flink for this, and Feast ships the same idea as tiling with intermediate
+representations, which in its streaming form needs Spark or Ray. Feather's version needs neither:
+the same tiles are computed in DuckDB during batch materialization, with the same idempotency and
+the same bounded reads. That is a deployment difference rather than a design difference, and this
+document should not claim more than that.
 
 ### Tile encoding: partial aggregates, never final values
 
 A tile stores a **partial aggregate**, not the finished feature. This is the rule that makes
-merging correct, and it is the mistake Feast names explicitly: recomputing from raw data is
-slow, while storing final aggregated values per tile is fast but "often incorrect when
-merging".
+merging correct. Feast states it and implements it: storing final aggregated values per tile is
+fast but "often incorrect when merging", which is why Feast's tiling stores intermediate
+representations too. The two designs converge here, so the choice of stored aggregates is not a
+differentiator.
 
 The v1 set is closed and small, covering the aggregates that merge exactly:
 
@@ -964,7 +971,7 @@ is what makes that safe.
 
 Two limits, restated: tiling only helps aggregation features, since lookup features remain
 latest-value. And the read path gains a merge step, which is why the value encoding is
-versioned and self-describing.
+versioned and the tag acts as the check.
 
 Chronon's own guidance is the right trigger: "If your hottest keys don't exceed a few
 thousand events per day, the untiled approach may still be sufficient."
@@ -977,7 +984,7 @@ zero-downtime for large refreshes.
 
 The upgrade is double-buffered generations: write the new encoding under a new generation,
 flip a pointer atomically, then let the old generation expire via native field expiration.
-This is additive, because values are already self-describing and fields are already
+This is additive, because values already carry a schema tag and fields are already
 namespaced. It costs 2x peak storage during a refresh, which is why it is not the v1 default.
 
 ### Watermarks as a last resort
@@ -1170,12 +1177,13 @@ warehouse one.
    holds the store, and materialization runs in or beside it. The ceiling is that process's
    memory, and the staleness bound is the refresh interval.
 3. **Scale-out.** `[valkey]` is configured, and an online read in this position goes to Valkey.
-   Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled Deployment behind
-   gRPC and REST; materialization runs as resource-isolated Kubernetes Jobs on a schedule or on
-   demand.
+   Valkey runs as a StatefulSet, and materialization runs as resource-isolated Kubernetes Jobs
+   on a schedule or on demand, against the same Valkey.
 
-The Helm charts and Kustomize manifests are not written yet. When they exist, this section
-should link to them rather than describe them.
+There is no API pod, no Helm chart, and no Kustomize manifest, and none is planned: the project
+ships a library. A team that wants an RPC surface over it builds that in its own service. The
+read path is a single in-process call, so such a surface would wrap it rather than reimplement
+it.
 
 ---
 
@@ -1375,15 +1383,6 @@ It costs three full copies on the write path and 80% of read execution time in F
 requires the whole dataset in memory. Arrow is already the internal representation, so
 encoding directly from Arrow batches removes a format rather than adding one.
 
-### Arrow Flight as the serving transport
-
-**Rejected:** protobuf over gRPC, and JSON over REST.
-
-Flight is gRPC with Arrow IPC as the payload, so it keeps the transport while removing the
-serialization cost from the data path. Hopsworks shipped the same combination for a feature
-store and measured up to 45x throughput over their REST API. Feast's community requested the
-switch and it was not made ([#2013](https://github.com/feast-dev/feast/issues/2013)).
-
 ### Serialize at vector granularity, not per cell
 
 **Rejected:** protobuf per feature value, and Arrow IPC per feature value.
@@ -1445,7 +1444,8 @@ distinction is real.
 
 Two items remain open. Two further capabilities are deferred with triggers rather than left
 open, and they are documented where they belong: approximate aggregates in "Tile encoding",
-and incremental materialization in "Watermarks as a last resort".
+and incremental materialization in "Watermarks as a last resort". A third note records the
+transport for whoever builds an RPC surface, which this project does not ship.
 
 ### Needs a product decision
 
@@ -1477,4 +1477,19 @@ and incremental materialization in "Watermarks as a last resort".
   The last two are the failure modes that are otherwise silent, so they matter more than the
   latency numbers. Prometheus text exposition, optional OTLP traces.
 
-  Trigger for revisiting: the first working read path.
+  The trigger has fired: the read path and the refresh are built and measured. What is missing is
+  the instrumentation, not the reason to add it.
+
+### For whoever builds an RPC surface
+
+This project ships no server, so a team that wants one builds it. Recorded here so the research
+is not lost. The transport that keeps the data path Arrow-native is Arrow Flight, which is gRPC
+with Arrow IPC as the payload, so it keeps a mainstream RPC transport while keeping protobuf out
+of the data path. Hopsworks shipped that combination for a feature store and reported up to 45x
+throughput over their REST API, and independent benchmarks put Flight up to 30x over ODBC. Feast's
+community requested the switch and it was not made
+([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments).
+
+Such a surface should wrap the in-process read rather than reimplement it. It would also need a
+resolved field set per request, which is the point at which the `FeatureService` name stops being
+decorative and starts being an interface.

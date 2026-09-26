@@ -69,8 +69,8 @@ costs reclamation and never correctness." An in-process store therefore needs no
 which was the single feature that made the Redis family uniquely suitable.
 
 **The read path is already generic.** `read_entities<S: OnlineStore>` is the only caller in the
-serving path, so which store is behind it does not touch the Python surface, the serving API, or
-the offline path.
+serving path, so which store is behind it does not touch the Python surface or the offline
+path.
 
 ## What was built
 

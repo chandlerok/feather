@@ -13,10 +13,18 @@
 //! `convert_arrow_to_proto` serializes each cell independently at roughly 1e-5 s.
 //! Serializing per cell is the mistake; the format is almost incidental.
 //!
-//! Values are self-describing through `tag`, a stable hash of the view's field
-//! names, dtypes, and declaration order. A tag mismatch means the value is
+//! Values carry `tag`, a stable hash of the view's field names, dtypes, and
+//! declaration order. The tag verifies a schema rather than carrying one: the
+//! decoder is given the fields it expects, and a mismatch means the value is
 //! treated as missing rather than decoded, which is what turns a dtype change
 //! into a null window instead of silent corruption.
+//!
+//! The hash is specified rather than incidental, so it is stable across releases and
+//! reproducible by another implementation, which is what keeps a persisted tag
+//! meaningful. It covers names, dtypes, and order, and does not cover `ttl_days`:
+//! two declarations that agree on fields and disagree on the TTL produce the same tag,
+//! which is harmless while one declaration exists, because the read-time check uses
+//! that one.
 //!
 //! `flags` is reserved and written as zero. It exists so an encoding-level change
 //! has somewhere to announce itself without changing the layout.
