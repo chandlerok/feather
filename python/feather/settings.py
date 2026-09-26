@@ -116,7 +116,10 @@ class L1Cache(pydantic.BaseModel):
 
 
 class Valkey(pydantic.BaseModel):
-    """The Valkey connection. The only online store, so nothing discriminates it."""
+    """The Valkey connection.
+
+    The only online store that can be configured, so nothing discriminates it.
+    """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
 

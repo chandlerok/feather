@@ -80,9 +80,9 @@ pub struct ValkeyStore {
 impl ValkeyStore {
     /// Connect and enable RESP3.
     ///
-    /// RESP3 is not optional: client-side caching and its invalidation pushes
-    /// only work over it. A URL without `?protocol=resp3` is upgraded rather
-    /// than silently falling back to RESP2.
+    /// The store asks for RESP3 so an `HGETALL` reply is a map. The client-side caching
+    /// that also needs it is prospective: #25 holds that design. A URL without
+    /// `?protocol=resp3` is upgraded rather than silently falling back to RESP2.
     pub async fn connect(url: &str) -> Result<Self> {
         let url = if url.contains("protocol=") {
             url.to_owned()
@@ -131,6 +131,8 @@ impl ValkeyStore {
     /// `CLIENT TRACKING` is issued here rather than left to the client library:
     /// broadcasting mode with a prefix is what keeps server memory flat, and the
     /// library's own cache helper does not use it.
+    ///
+    /// Nothing calls this: it is the landing pad for the L1 cache spike in #25.
     pub async fn connect_tracking<S>(url: &str, prefix: &str, sender: S) -> Result<Self>
     where
         S: redis::aio::AsyncPushSender + Send + Sync + 'static,

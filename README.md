@@ -23,9 +23,9 @@ engine over Arrow.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a table in a configured database. No separate compute
   cluster is required for local or medium-scale workloads.
-- **Valkey-backed online reads.** Online serving reads Valkey directly over async `tokio`
-  I/O, with a read-time TTL check. The serving figures in the architecture document are
-  measured, on a stated container.
+- **Valkey-backed online reads.** In a deployment, online serving reads Valkey directly
+  over async `tokio` I/O, with a read-time TTL check. The serving figures in the
+  architecture document are measured, on a stated container.
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.
