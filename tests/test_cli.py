@@ -1,0 +1,320 @@
+"""The `feather` command: the tree it writes, and the path it has to make runnable.
+
+The generated project is the README's example, so the two are pinned against each
+other rather than against a copy of the expected text. A change to either that
+breaks the other fails here instead of in a newcomer's terminal.
+"""
+
+import contextlib
+import importlib.util
+import os
+import re
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import polars as pl
+import pytest
+
+from feather import FeatureStore, load_settings
+from feather.cli import DEFINITION, SETTINGS_NAME, demo, init, main, project_name, refresh
+from feather.definitions import view_fields
+
+README = Path(__file__).resolve().parent.parent / "README.md"
+"""The document the generated project is written to match."""
+
+_CODE_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
+"""A fenced Python block, which is how the README writes every example."""
+
+DAY = 86_400_000_000
+"""Microseconds in a day, which the demo data is laid out in."""
+
+
+def readme_example(marker: str) -> str:
+    """Return the first Python block the README puts after `marker`.
+
+    Args:
+        marker: The sentence introducing the block.
+
+    Returns:
+        The block's body, without the fence.
+
+    Raises:
+        AssertionError: If the marker is gone, or the block that followed it is not
+            there any more, which is itself the drift this exists to catch.
+    """
+    text = README.read_text(encoding="utf-8")
+    _, _, rest = text.partition(marker)
+    assert rest, f"the README no longer introduces an example with {marker!r}"
+    block = _CODE_BLOCK.search(rest)
+    assert block is not None, f"the README has no Python block after {marker!r}"
+    return block.group(1)
+
+
+@contextlib.contextmanager
+def inside(project: Path) -> Iterator[None]:
+    """Run the body with `project` as the working directory.
+
+    A source is declared as a path relative to the working directory, so a project
+    is read from its own root, which is what the CLI and the README both do.
+
+    Args:
+        project: The directory to make current.
+
+    Yields:
+        Nothing. The working directory is restored on the way out.
+    """
+    previous = Path.cwd()
+    os.chdir(project)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def generated_view(project: Path) -> Any:
+    """Load the view class out of the module `init` wrote.
+
+    Loaded by path, the way the store loads it, so the test reads the file the CLI
+    produced rather than a name the test made up itself.
+
+    Args:
+        project: The project directory.
+
+    Returns:
+        The generated `UserClicks` class.
+    """
+    path = project / DEFINITION
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.UserClicks
+
+
+@pytest.fixture
+def project(tmp_path: Path) -> Path:
+    """A generated project with the demo data written into it.
+
+    Args:
+        tmp_path: The pytest temp directory.
+
+    Returns:
+        The project directory.
+    """
+    generated = tmp_path / "store"
+    init(generated)
+    demo(generated)
+    return generated
+
+
+def source_rows(project: Path) -> dict[tuple[int, int], tuple[int, int]]:
+    """Index the feature table by user and event timestamp.
+
+    Args:
+        project: The project directory.
+
+    Returns:
+        Each row's click and purchase counts, keyed by the user and the timestamp
+        of the row.
+    """
+    table = pl.read_parquet(project / "data" / "user_stats.parquet")
+    return {
+        (row["user_id"], row["event_timestamp"]): (row["click_count"], row["purchase_count"])
+        for row in table.iter_rows(named=True)
+    }
+
+
+def test_init_writes_exactly_the_tree_the_readme_documents(tmp_path: Path) -> None:
+    generated = tmp_path / "my_feature_store"
+    init(generated)
+    written = {str(path.relative_to(generated)) for path in generated.rglob("*") if path.is_file()}
+    assert written == {SETTINGS_NAME, DEFINITION}
+
+
+def test_the_generated_module_is_the_readme_example(tmp_path: Path) -> None:
+    generated = tmp_path / "store"
+    init(generated)
+    assert (generated / DEFINITION).read_text(encoding="utf-8") == readme_example(
+        f"Define features in `{DEFINITION}`."
+    )
+
+
+def test_the_generated_settings_are_valid(tmp_path: Path) -> None:
+    generated = tmp_path / "store"
+    init(generated)
+    settings = load_settings(generated / SETTINGS_NAME)
+    assert settings.project == "store"
+    assert list(settings.definitions) == [DEFINITION]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("my_feature_store", "my_feature_store"),
+        ("my store", "my_store"),
+        ("a.b", "a_b"),
+        ("UPPER", "UPPER"),
+        ("!!!", "___"),
+    ],
+)
+def test_a_project_name_survives_an_awkward_directory(
+    tmp_path: Path, name: str, expected: str
+) -> None:
+    directory = tmp_path / name
+    directory.mkdir()
+    assert project_name(directory) == expected
+
+
+def test_a_name_that_sanitizes_to_nothing_still_writes_a_project() -> None:
+    """The root directory is the one that has no name to work from.
+
+    An empty `project` key is rejected by the core, so there is a fallback rather
+    than a settings file that fails to load.
+    """
+    assert project_name(Path("/")) == "feather_project"
+
+
+def test_init_refuses_to_overwrite_and_force_does_not(tmp_path: Path) -> None:
+    generated = tmp_path / "store"
+    init(generated)
+    (generated / SETTINGS_NAME).write_text("# mine\n", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="--force"):
+        init(generated)
+    init(generated, force=True)
+    assert "# mine" not in (generated / SETTINGS_NAME).read_text(encoding="utf-8")
+
+
+def test_init_leaves_the_rest_of_the_directory_alone(tmp_path: Path) -> None:
+    generated = tmp_path / "store"
+    generated.mkdir()
+    (generated / "notes.md").write_text("mine\n", encoding="utf-8")
+    init(generated, force=True)
+    assert (generated / "notes.md").read_text(encoding="utf-8") == "mine\n"
+
+
+def test_main_reports_a_failure_as_a_message_and_a_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    generated = tmp_path / "store"
+    init(generated)
+    code = main(["init", str(generated)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.startswith("feather init: ")
+    assert "Traceback" not in captured.err
+
+
+def test_the_quickstart_runs_as_the_readme_writes_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with inside(tmp_path):
+        assert main(["init", "my_feature_store"]) == 0
+    with inside(tmp_path / "my_feature_store"):
+        assert main(["demo"]) == 0
+    assert (tmp_path / "my_feature_store" / "data" / "user_stats.parquet").is_file()
+
+
+def test_demo_refuses_to_overwrite_and_force_does_not(project: Path) -> None:
+    written = sorted(path.name for path in (project / "data").iterdir())
+    assert written == ["training_labels.parquet", "user_stats.parquet"]
+    with pytest.raises(FileExistsError, match="--force"):
+        demo(project)
+    demo(project, force=True)
+
+
+def test_the_demo_files_hold_the_columns_the_generated_view_declares(project: Path) -> None:
+    features = pl.read_parquet(project / "data" / "user_stats.parquet")
+    labels = pl.read_parquet(project / "data" / "training_labels.parquet")
+    assert features.columns == ["user_id", "event_timestamp", "click_count", "purchase_count"]
+    assert labels.columns == ["user_id", "event_timestamp", "label"]
+    # Microseconds as an integer, which is the form the bundled DuckDB build
+    # compares with, having no date arithmetic.
+    assert features.schema["event_timestamp"] == pl.Int64
+    assert features.height > labels.height
+
+
+def test_the_demo_target_is_the_day_after_the_row_a_label_reads(project: Path) -> None:
+    """A label is half a day after the features it carries, and a day before its target."""
+    features = source_rows(project)
+    labels = pl.read_parquet(project / "data" / "training_labels.parquet")
+    targets = set()
+    for row in labels.iter_rows(named=True):
+        read_at = row["event_timestamp"] - DAY // 2
+        target_at = read_at + DAY
+        assert (row["user_id"], read_at) in features
+        assert (row["user_id"], target_at) in features
+        assert row["label"] == int(features[(row["user_id"], target_at)][1] > 0)
+        targets.add(row["label"])
+    # Both classes, or the target is a constant and nothing was demonstrated.
+    assert targets == {0, 1}
+
+
+def test_refresh_writes_the_demo_values_into_the_online_store(project: Path) -> None:
+    refresh(project, [])
+    view = generated_view(project)
+    with inside(project):
+        store = FeatureStore(SETTINGS_NAME)
+        entities = pl.DataFrame({"user_id": [1, 2, 3]})
+        read = pl.DataFrame(store.get_online_features(entities, [view.click_count]))
+    assert read.columns == ["user_id", "click_count"]
+    assert read["click_count"].null_count() == 0
+
+
+def test_refresh_takes_one_view_by_name(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    refresh(project, ["user_clicks"])
+    assert "refreshed user_clicks" in capsys.readouterr().out
+
+
+def test_refresh_of_an_unknown_view_is_a_message_not_a_traceback(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["refresh", str(project), "not_a_view"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("feather refresh: ")
+    assert "Traceback" not in captured.err
+
+
+def test_the_generated_project_reaches_a_training_set_on_its_own(project: Path) -> None:
+    """The ten-minute path, end to end: init, demo, then the README's join.
+
+    Every label row has to carry the values of the newest feature row at or before
+    it, which for this data is that morning's row rather than yesterday's or
+    tomorrow's. The demo dates from today so the generated view's 30-day TTL still
+    holds, and each label sits half a day after a feature row, so a null or a
+    neighbouring day's value means one of those two facts stopped being true.
+    """
+    view = generated_view(project)
+    labels = pl.read_parquet(project / "data" / "training_labels.parquet")
+    with inside(project):
+        store = FeatureStore(SETTINGS_NAME)
+        joined = pl.DataFrame(
+            store.get_historical_features(entity_df=labels, features=list(view_fields(view)))
+        )
+    assert joined.columns == [
+        "user_id",
+        "event_timestamp",
+        "label",
+        "click_count",
+        "purchase_count",
+    ]
+    assert joined.height == labels.height
+
+    features = source_rows(project)
+    for row in joined.iter_rows(named=True):
+        assert (row["click_count"], row["purchase_count"]) == features[
+            (row["user_id"], row["event_timestamp"] - DAY // 2)
+        ]
+
+
+def test_help_works_without_the_compiled_extension(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`feather --help` is the one thing that has to work on a broken install."""
+    monkeypatch.setitem(sys.modules, "feather._core", None)
+    with pytest.raises(SystemExit) as exit:
+        main(["--help"])
+    assert exit.value.code == 0
+    assert "feather" in capsys.readouterr().out

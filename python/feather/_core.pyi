@@ -13,6 +13,27 @@ from typing import Protocol
 
 __version__: str
 
+def write_demo_data(directory: str) -> list[str]:
+    """Write the demo project's two Parquet files into ``directory/data``.
+
+    The feature table is one row per user per day for the last two weeks, and the
+    label set is five rows per user, each half a day after a feature row, with a
+    target taken from the following day. Both carry timestamps as int64
+    microseconds since the epoch, relative to the current day rather than fixed
+    dates, so the generated view's 30-day TTL still holds whenever it is run.
+
+    Args:
+        directory: The project directory, created if it does not exist. ``data``
+            is created inside it.
+
+    Returns:
+        The paths written, the feature table first.
+
+    Raises:
+        OSError: If a directory or file cannot be created.
+    """
+    ...
+
 class ArrowStreamExportable(Protocol):
     """An object that exports Arrow data through the PyCapsule interface.
 

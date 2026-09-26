@@ -217,3 +217,90 @@ jobs:
       - name: services down
         if: always()
         run: docker compose down -v
+
+  # The publishable artifact, and the README's first block run against it. The
+  # wheel is what a user installs, so the source tree is not what this job
+  # checks: it builds the wheel, asserts it is the one file it is supposed to be,
+  # installs it into a venv that has no Rust toolchain and no build step, and
+  # runs init, demo, refresh, and the join from there.
+  wheel:
+    name: wheel
+    runs-on: ubuntu-latest
+    steps:
+      # renovate: datasource=github-tags depName=actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # renovate: datasource=github-tags depName=jdx/mise-action
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      # astral-sh/setup-uv, pinned at v10.2.0
+      # renovate: datasource=github-tags depName=astral-sh/setup-uv
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      # Same key as the python job, on purpose: both build the extension with the
+      # dev profile and the same features, so the entry the python job's `uv sync`
+      # writes is exactly the one that makes this build quick. The repository has a
+      # 10GB budget shared across cache entries and a bundled DuckDB entry is
+      # gigabytes, so a third copy under this job's own id would be the wrong
+      # trade. Saving is left to main, for the reason the rust job gives.
+      # renovate: datasource=github-tags depName=Swatinem/rust-cache
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: python
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Debug, not release: this job checks that the artifact installs and the
+      # quickstart runs, and a release build of bundled DuckDB would dominate the
+      # job's time for a difference no step here can observe. The release profile
+      # is what a publish job would use, and that is a separate issue.
+      - name: build the wheel
+        run: maturin build --out dist
+      # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
+      # a property of the filename. A wheel that stopped being abi3 would install
+      # on one interpreter and 404 on the rest, and nothing else in CI would say
+      # so, because the python job tests the source tree.
+      - name: one wheel, and it is the abi3 one
+        run: |
+          ls -l dist
+          wheels=(dist/*.whl)
+          [ "${#wheels[@]}" -eq 1 ] || { echo "expected one wheel, got ${#wheels[@]}" >&2; exit 1; }
+          case "${wheels[0]}" in
+            *-cp311-abi3-*) ;;
+            *) echo "${wheels[0]} is not a cp311-abi3 wheel" >&2; exit 1 ;;
+          esac
+      # A venv with the interpreter and the wheel, and nothing else. uv does not
+      # build here because the argument is a wheel file, which is the property
+      # under test: the user needs no compiler. Each step is its own shell, so the
+      # wheel is named by the glob again rather than carried over.
+      - name: a clean install
+        run: |
+          uv venv --python 3.14 /tmp/quickstart
+          VIRTUAL_ENV=/tmp/quickstart uv pip install dist/*.whl polars
+      - name: the README's first block
+        run: |
+          export PATH="/tmp/quickstart/bin:$PATH"
+          mkdir -p /tmp/run
+          cd /tmp/run
+          feather init my_feature_store
+          cd my_feature_store
+          feather demo
+          feather refresh
+      - name: the README's join, on the data demo wrote
+        run: |
+          cd /tmp/run/my_feature_store
+          /tmp/quickstart/bin/python - <<'PY'
+          import polars as pl
+          from feather import FeatureStore
+          from definitions.user_clicks import UserClicks
+
+          store = FeatureStore("feather.toml")
+          entity_df = pl.read_parquet("data/training_labels.parquet")
+
+          training_data = pl.DataFrame(
+              store.get_historical_features(
+                  entity_df=entity_df,
+                  features=[UserClicks.click_count, UserClicks.purchase_count],
+              )
+          )
+          assert training_data.height == entity_df.height, "a label row was dropped"
+          assert training_data.null_count() == 0, training_data
+          print(training_data.head())
+          PY

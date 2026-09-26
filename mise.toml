@@ -23,6 +23,10 @@ dprint = "latest"
 description = "Install Python deps and the git hook"
 run = ["uv sync --all-groups", "hk install --mise"]
 
+[tasks."build:wheel"]
+description = "Build the wheel into dist/, the artifact a user installs"
+run = ["maturin build --out dist"]
+
 # ---------------------------------------------------------------- formatting
 
 [tasks.format]

@@ -46,7 +46,7 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 # Only for the input-mechanism comparison, which needs to write an Arrow batch to
 # Parquet to represent the temp-file route.
-parquet = { version = "58", default-features = false, features = ["arrow"] }
+parquet.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
