@@ -1498,7 +1498,7 @@ put Flight up to 30x over ODBC. Feast's community requested the switch and it wa
 
 The research also found that `arrow-flight` tracks the workspace's Arrow major and brings
 `tonic` and `prost` with it, and that this crate ships no auth handler. A serving surface would
-add both rather than inherit them, and neither is a dependency here today.
+add an auth handler rather than inherit one, and none of the three is a dependency here today.
 
 Such a surface wraps the in-process read rather than reimplementing it. It also needs a resolved
 field set per request, which is where the `FeatureService` name stops being decorative and starts

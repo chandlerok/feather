@@ -29,7 +29,7 @@ the same trade SQLite and Postgres present.
 ## Why one copy deletes work
 
 The previous design was a `moka` L1 in front of a Valkey L2, with the L1 kept correct by server
-pushed invalidation. That is a correct design, and most of the machinery around it exists only
+pushed invalidation. That is a correct design, and most of the machinery around it existed only
 because there are two copies:
 
 - a dedicated RESP3 redirect connection that this project implemented itself, because
