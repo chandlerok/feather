@@ -36,7 +36,7 @@ SECOND_DEFINITION = """\
 from feather import Entity, FeatureView, Field, FileSource, feature_view
 from feather.types import Int64
 
-other_entity = Entity(name="user_id", join_key="user_id")
+other_entity = Entity(name="user_session", join_key="user_id")
 other_source = FileSource(path="data/user_stats.parquet")
 
 
@@ -47,9 +47,16 @@ other_source = FileSource(path="data/user_stats.parquet")
     ttl_days=30,
 )
 class UserTotals(FeatureView):
-    click_count = Field(Int64)
+    purchase_count = Field(Int64)
 """
-"""A second view over the same source, so a refresh has something to leave out."""
+"""A second view over the same source, so a refresh has something to leave out.
+
+The entity name and the field are both deliberately different from the
+generated module's. A second view redeclaring `user_id` as an entity, or
+`click_count` as a field, would be testing the store's duplicate handling rather
+than the refresh's view selection, and would make these two tests fail for a
+reason that has nothing to do with what they claim to pin.
+"""
 
 _BLOCK_EXTENSION = """
 import sys
