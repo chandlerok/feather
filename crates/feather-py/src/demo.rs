@@ -137,15 +137,16 @@ fn timestamp_of(anchor: i64, day: usize) -> i64 {
 }
 
 /// One non-null int64 column per entry, in the order given.
+///
+/// Single pass over the columns, because a `DataType` is not `Copy` and a second
+/// borrow of the input would have to clone one per column to move it out.
 fn batch(columns: Vec<(&str, DataType, Vec<i64>)>) -> RecordBatch {
-    let fields: Vec<Field> = columns
-        .iter()
-        .map(|(name, dtype, _)| Field::new(*name, *dtype, false))
-        .collect();
-    let arrays: Vec<ArrayRef> = columns
-        .into_iter()
-        .map(|(_, _, values)| Arc::new(Int64Array::from(values)) as ArrayRef)
-        .collect();
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (name, dtype, values) in columns {
+        fields.push(Field::new(name, dtype, false));
+        arrays.push(Arc::new(Int64Array::from(values)) as ArrayRef);
+    }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .expect("the demo columns are non-null and the same length")
 }
