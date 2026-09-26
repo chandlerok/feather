@@ -237,11 +237,10 @@ jobs:
       # renovate: datasource=github-tags depName=astral-sh/setup-uv
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
       # The runner image carries tens of gigabytes of SDKs this job never
-      # touches, and it needs the room more than the rust job does: a debug
-      # build of bundled DuckDB plus the 2.3GB cargo entry is what filled the
-      # disk on the first run of this job, and `uv pip install` died writing the
-      # extension out of the wheel. Same deletion, measured at 82s against 127s
-      # for the sequential form in the rust job.
+      # touches, and it needs the room more than the rust job does: on the first
+      # run of this job the disk filled during the build and `uv pip install` died
+      # writing the extension out of the wheel. Same deletion, measured at 82s
+      # against 127s for the sequential form in the rust job.
       - name: free disk space
         run: |
           pids=()
@@ -273,16 +272,17 @@ jobs:
       # only makes the build's interpreter explicit.
       - name: an interpreter to build against
         run: uv python install 3.14 && uv venv --python 3.14 /tmp/build
-      # Debug, not release: this job checks that the artifact installs and the
-      # quickstart runs, and a release build of bundled DuckDB would dominate the
-      # job's time for a difference no step here can observe. The release profile
-      # is what a publish job would use, and that is a separate issue.
+      # Release, not debug, and deliberately so: this job builds the artifact a
+      # publish job uploads, so it has to be the profile that artifact is built
+      # from. A debug wheel would install and run the quickstart just as well and
+      # would tell us nothing about the file that ships.
       #
-      # `--strip` is the one thing that is not incidental, because the wheel is
-      # almost entirely DuckDB's symbol table: 255MB unstripped, 24MB stripped,
-      # and PyPI refuses a file over 100MB. So a wheel that skipped this would not
-      # upload, rather than merely being large. The next step prints the size, so
-      # the number stays on the record instead of being re-derived.
+      # `--strip` is the one flag here that is not incidental, because the wheel
+      # is almost entirely DuckDB's symbol table: 255MB unstripped, 24MB
+      # stripped, and PyPI refuses a file over 100MB. So a wheel that skipped
+      # this would not upload, rather than merely being large. The next step
+      # prints the size, so the number stays on the record instead of being
+      # re-derived.
       - name: build the wheel
         run: maturin build --strip --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
