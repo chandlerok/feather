@@ -282,7 +282,7 @@ fn conninfo_value(value: &str) -> String {
 
 /// The Valkey connection.
 ///
-/// Valkey is the only online store that can be configured, so no `type` discriminates it.
+/// Valkey is the only _shared_ store that can be configured, so no `type` discriminates it.
 /// `tls` has no default: a security flag guessed wrong is worse than one an operator had to
 /// write down.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -302,7 +302,7 @@ pub struct Valkey {
 ///
 /// Unknown keys are rejected, so a typo is a load error rather than a silently
 /// ignored setting. An absent `valkey` is local mode: an in-process DuckDB over
-/// local files, with no online store configured.
+/// local files, served from the in-process online store.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {

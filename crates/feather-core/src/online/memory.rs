@@ -3,11 +3,12 @@
 //! Local mode runs on this: `feather.toml` with no `[valkey]` table. It is the default rather
 //! than a fallback, so it is written to be served from rather than merely to be correct.
 //!
-//! Shape: one allocation per entity, its fields in name order. A request asks for one or two
-//! fields per view on one entity, so the fields of an entity being adjacent to each other is the
-//! access pattern that matters, and a walk over a handful of names beats a hash per name. The
-//! field names appear once, which the previous two-map layout did not manage: it held the entity
-//! key and every field name twice, once for values and once for expiries.
+//! Shape: one allocation for the entity's field index, its entries in name order; the values are
+//! still one allocation each. A request asks for one or two fields per view on one entity, so
+//! searching that entity's index is the access pattern that matters, and a binary search over the
+//! names beats a hash per name. The field names appear once, which the previous two-map layout
+//! did not manage: it held the entity key and every field name twice, once for values and once
+//! for expiries.
 //!
 //! A field's expiry is remembered and never acted on: this store has no clock and reclaims
 //! nothing, and the read-time TTL check is the authoritative path in any case. Keeping the

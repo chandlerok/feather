@@ -11,8 +11,10 @@ materialization, which computes a view's values from its source and writes them 
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
 is design only for the source kinds with no reader. Arrow Flight serving is design only, and so
 is the deployment machinery under "Materialization" — per-view parallelism,
-the schedule, and the lock — none of which the refresh implements itself. Figures that are
-measurements say so and carry their hardware and cardinality; the rest are targets.
+the schedule, and the lock — none of which the refresh implements itself. The serving figures
+are measured against a shared Valkey, the position a deployment graduates to, so the in-process
+default carries no published figure yet. Figures that are measurements say so and carry their
+hardware and cardinality; the rest are targets.
 
 ---
 
@@ -439,8 +441,10 @@ max_staleness = refresh_interval
 ```
 
 - `refresh_interval` is the deployment's schedule, so this number is per deployment rather
-  than a constant. An in-process read sees the published generation, so it is as stale as that
-  interval; in a deployment a read goes to Valkey, so it sees the newest materialized value.
+  than a constant. Both stores return the newest value materialized into them, so both are as
+  stale as that interval; they differ in whose writes they can see, since an in-process read
+  sees only what this process's refresh wrote and, in a deployment, a Valkey read sees any
+  process's.
 - TTL expiry caps staleness by construction: an expired value reads as missing rather than as
   a stale value.
 
@@ -466,12 +470,14 @@ the offline path, and choosing between them is configuration.
 
 Two things differ, and both matter:
 
-- **Where writes land.** In-process publishes a new generation; Valkey mutates shared state in
-  place. Both satisfy `write` and `delete_fields`, but a generation writer appends into a
-  generation under construction and its `delete_fields` is a no-op.
-- **How stale a read can be.** In-process serves the published generation, so staleness is
-  bounded by the refresh interval. A swap is atomic, so this is not a fixed TTL, but it is not
-  zero either.
+- **Where writes land.** In-process writes into the one map this process holds; Valkey writes
+  into shared state. Both satisfy `write` and `delete_fields`, and both are mutated where they
+  stand: a refresh is not staged into a copy and swapped in.
+- **How stale a read can be.** In-process serves what the last refresh in this process wrote, so
+  staleness is bounded by the refresh interval. Writes take `&mut self` and reads take `&self`,
+  and the Python binding holds its store behind one lock for a whole refresh, so a read sees a
+  completed refresh rather than a partial one. That is exclusion rather than an atomic swap, so
+  the bound is the interval and not zero.
 
 The store is not responsible for expiry. `OnlineStore::write` documents that a store which
 cannot honour an expiry "writes the value anyway: the read-time TTL check in `read_entities` is
@@ -1248,7 +1254,7 @@ always-on fallback TTL. All of that exists because there are two copies of the d
 Inverting the tiers removes it. With one copy there is nothing to invalidate, the store need not
 be Redis-family at all, and `OnlineStore::write` already permits a store that ignores expiry,
 because the read-time TTL check is the authoritative path. The cost is that memory becomes a
-per-process ceiling and a read can be as stale as the last generation, which is why a shared
+per-process ceiling and a read can be as stale as the refresh interval, which is why a shared
 store is a separate position rather than the default.
 
 Evidence, and the gated next step: [`embedded-online-store.md`](./embedded-online-store.md).

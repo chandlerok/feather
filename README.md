@@ -1,8 +1,8 @@
 # Feather
 
 An opinionated feature store with a Rust core and a native Python API. Online serving reads
-from Valkey over async `tokio` I/O. Historical point-in-time joins run in an embedded DuckDB
-engine over Arrow.
+from an in-process store, or from Valkey over async `tokio` I/O to share one across processes.
+Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
 > and the online serving layer are built and measured, and materialization writes a view's
@@ -24,9 +24,10 @@ engine over Arrow.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a table in a configured database. No separate compute
   cluster is required for local or medium-scale workloads.
-- **Valkey-backed online reads.** In a deployment, online serving reads Valkey directly
-  over async `tokio` I/O, with a read-time TTL check. The serving figures in the
-  architecture document are measured, on a stated container.
+- **In-process online reads by default.** Online serving reads an in-process store, or Valkey
+  over async `tokio` I/O in a deployment, when one writable store needs to be shared across
+  processes, with a read-time TTL check. The serving figures in the architecture document are
+  measured against Valkey, on a stated container.
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.

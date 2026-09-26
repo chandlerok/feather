@@ -46,6 +46,11 @@ because there are two copies:
 With one copy of the data there is nothing to invalidate. All five go away, and so does the
 requirement that the store be Redis-family, which is what made the store choice hard.
 
+That design is rejected as the default rather than deleted: [issue
+#25](https://github.com/chandlerok/feather/issues/25) stays open as an unprioritized spike for
+the shared tier, triggered by a measured serving latency floor the Valkey read path cannot meet,
+and it is the record for those five items.
+
 ## What the store has to do
 
 The seam already existed and it is small. From `crates/feather-core/src/online/mod.rs`:
@@ -70,21 +75,28 @@ the offline path.
 ## What was built
 
 `MemoryStore` was promoted rather than joined by a second in-process store, because two
-implementations of the same semantics drift and the drift is invisible. Its own behaviour is
-pinned against a real Valkey by
-`rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in `tests/valkey_integration.rs`,
-and that is now the only in-process store to keep honest.
+implementations of the same semantics drift and the drift is invisible. What it mirrors is the
+server's `HSET` behaviour, which
+`rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pins against a real Valkey in
+`tests/valkey_integration.rs`. That test never constructs `MemoryStore`: it observes the server's
+own reclamation, and the mirror of the one rule the two share is
+`a_write_without_an_expiry_clears_a_recorded_one` in
+`crates/feather-core/src/online/memory.rs`. That store is the only in-process implementation
+there is to keep honest.
 
 The representation changed from `HashMap<Vec<u8>, HashMap<String, Vec<u8>>>` plus a second map
-for expiries, to one sorted slice per entity:
+for expiries, to one sorted slice of entries per entity. Every value is still its own allocation,
+so what the change buys is the index rather than the value bytes:
 
-- **One allocation per entity** instead of one per field, so an entity's fields sit next to each
-  other. A request asks for one or two fields per view on one entity, which is that access
-  pattern.
+- **One allocation for the field index per entity** instead of a `HashMap` per entity, with the
+  entries ordered by name. A request asks for one or two fields per view on one entity, and that
+  index is the structure it searches.
 - **Field names are stored once.** The old layout held the entity key and every field name
   twice, once for values and once for expiries.
-- **A read is a walk over a handful of names** rather than a hash per name, and the entries are
-  kept in name order so the walk is a binary search.
+- **A read is a binary search over the names** rather than a hash per name, which is why the
+  entries are kept in name order. At the few fields an entity holds this is reasoning rather
+  than a measurement: a couple of string comparisons against one hash is a trade nobody here has
+  timed, so the win is asserted rather than shown.
 
 ## The next step, gated on a measurement
 
@@ -115,11 +127,14 @@ read latency that page faults rather than lookups explain.
 A configuration change, because `read_entities` is generic over the trait. Two things differ, and
 both are documented in the architecture document:
 
-- **Where writes land.** In-process publishes a new generation; Valkey mutates shared state in
-  place. Both satisfy `write` and `delete_fields`.
-- **How stale a read can be.** In-process serves the published generation, so staleness is
-  bounded by the refresh interval. A swap is atomic, so this is not the fixed TTL the two-tier
-  cache design rejected, but it is not zero either.
+- **Where writes land.** In-process writes into the one map this process holds, under the
+  store's own `&mut self`; Valkey writes into shared state. Both satisfy `write` and
+  `delete_fields`: fields a batch does not mention are left alone, and a delete removes.
+- **How stale a read can be.** In-process serves what the last refresh in this process wrote, so
+  staleness is bounded by the refresh interval. Writes take `&mut self` and reads take `&self`,
+  and the Python binding holds its store behind one lock for a whole refresh, so a read sees a
+  completed refresh rather than a partial one. That is exclusion rather than an atomic swap, so
+  the bound is the interval and not zero.
 
 ## The assumption it rests on
 
