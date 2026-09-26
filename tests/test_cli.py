@@ -274,6 +274,20 @@ def test_main_reports_a_failure_as_a_message_and_a_code(
     assert "Traceback" not in captured.err
 
 
+def test_an_argument_argparse_rejects_is_still_its_own_exit_code() -> None:
+    """The catch around a command is broad, and argparse's exit has to stay outside it.
+
+    `main` parses before it enters the try, so an argument it rejects is
+    argparse's own SystemExit(2) rather than a reported failure. This pins that
+    separation: widening the catch to cover a user's definition module must not
+    turn a mistyped flag into exit 1 with a message, which is what would happen
+    if parsing moved inside the try or SystemExit were caught.
+    """
+    with pytest.raises(SystemExit) as exit:
+        main(["refresh", "--no-such-flag"])
+    assert exit.value.code == 2
+
+
 def test_the_quickstart_runs_as_the_readme_writes_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -254,13 +254,13 @@ jobs:
           done
           df -h /
       # A key of its own, not the python job's. That job's `uv sync` builds the
-      # extension with the dev profile into target/debug, and this one builds
-      # target/release, so a restored entry from either is the wrong profile and
-      # makes neither build quick. Sharing the key was also a write conflict: on
-      # main both jobs would restore and save one entry over different profile
-      # subtrees, and the repository has a 10GB budget across entries, where a
-      # bundled DuckDB entry is gigabytes. Saving is left to main, for the
-      # reason the rust job gives.
+      # extension with the dev profile into target/debug and this one builds
+      # target/release, so an entry restored from either is the wrong profile and
+      # makes neither build quick; sharing a key across two profiles buys a
+      # partial hit and a confusing one. The repository has a 10GB budget across
+      # entries and a bundled DuckDB entry is gigabytes, so a third copy under
+      # this job's own id would be the wrong trade either way. Saving is left to
+      # main, for the reason the rust job gives.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

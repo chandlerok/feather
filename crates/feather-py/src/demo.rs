@@ -249,11 +249,18 @@ mod tests {
 
     #[test]
     fn every_row_lands_inside_the_thirty_day_ttl() {
-        // The anchor is the one `write_demo_data` builds its tables from rather
-        // than a constant this test declares, because the claim is that a
-        // generated row is inside the view's 30-day TTL whenever the demo is
-        // run, and a hard-coded anchor here would hold that for a 2023 date and
-        // say nothing about today.
+        // What this pins: `tables` lays its rows out relative to the anchor it is
+        // given, and every one of them lands inside the view's 30-day TTL. The
+        // anchor is the expression `write_demo_data` itself builds from, rather
+        // than a constant this test declares, so the arithmetic is checked
+        // against the same midnight the writer would use.
+        //
+        // What this does not pin: that `write_demo_data` supplies that anchor. It
+        // never calls the writer, so reverting the generator to a fixed date
+        // leaves this green. What fails then is
+        // `test_the_refreshed_values_are_served_from_the_same_store`, which reads
+        // the values back and counts nulls, and a demo dated outside the TTL
+        // produces nulls.
         let anchor = midnight_micros(now_micros().expect("the clock is set after 1970"));
         let (features, labels) = tables(anchor);
         for table in [&features, &labels] {
