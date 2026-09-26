@@ -40,11 +40,6 @@ secret = "shhh"
 endpoint = "valkey-cluster.internal.svc:6379"
 tls = true
 field_expiration = true
-
-[l1_cache]
-enabled = true
-max_capacity_mb = 2048
-fallback_ttl_seconds = 30
 """
 
 
@@ -85,7 +80,6 @@ def test_local_mode_needs_nothing_but_a_project(tmp_path: Path) -> None:
     assert settings.definitions == ["definitions/user_clicks.py"]
     assert settings.connections == {}
     assert settings.valkey is None
-    assert settings.l1_cache is None
 
 
 def test_a_full_file_arrives_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,10 +102,6 @@ def test_a_full_file_arrives_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert settings.valkey.tls is True
     assert settings.valkey.field_expiration is True
 
-    assert settings.l1_cache is not None
-    assert settings.l1_cache.max_capacity_mb == 2048
-    assert settings.l1_cache.fallback_ttl_seconds == 30
-
 
 def test_secrets_are_not_leaked_by_repr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SNOWFLAKE_PASSWORD", "hunter2")
@@ -121,15 +111,6 @@ def test_secrets_are_not_leaked_by_repr(tmp_path: Path, monkeypatch: pytest.Monk
     assert "hunter2" not in rendered
     assert "shhh" not in rendered
     assert "AKIAEXAMPLE" in rendered
-
-
-def test_the_l1_cache_is_configured_without_valkey(tmp_path: Path) -> None:
-    settings = load_settings(write(tmp_path, LOCAL + "\n[l1_cache]\nmax_capacity_mb = 512\n"))
-
-    assert settings.valkey is None
-    assert settings.l1_cache is not None
-    assert settings.l1_cache.max_capacity_mb == 512
-    assert settings.l1_cache.enabled is True
 
 
 def test_a_postgres_connection_arrives_typed(

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use redis::RedisResult;
-use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use redis::aio::ConnectionManager;
 
 use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, WrittenField};
 use crate::error::Result;
@@ -123,49 +123,6 @@ impl ValkeyStore {
     /// How this store expires a hash field on the server it is connected to.
     pub fn field_expiry(&self) -> FieldExpiry {
         self.field_expiry
-    }
-
-    /// Connect with a push sender for invalidation messages, and register a
-    /// broadcasting prefix so the server reports changes under it.
-    ///
-    /// `CLIENT TRACKING` is issued here rather than left to the client library:
-    /// broadcasting mode with a prefix is what keeps server memory flat, and the
-    /// library's own cache helper does not use it.
-    ///
-    /// Nothing calls this: it is the landing pad for the L1 cache spike in #25.
-    pub async fn connect_tracking<S>(url: &str, prefix: &str, sender: S) -> Result<Self>
-    where
-        S: redis::aio::AsyncPushSender + Send + Sync + 'static,
-    {
-        let url = if url.contains("protocol=") {
-            url.to_owned()
-        } else if url.contains('?') {
-            format!("{url}&protocol=resp3")
-        } else {
-            format!("{url}?protocol=resp3")
-        };
-
-        let client = redis::Client::open(url)?;
-        let config = ConnectionManagerConfig::new().set_push_sender(sender);
-        let mut connection = client.get_connection_manager_with_config(config).await?;
-
-        // No two prefixes may overlap; Valkey rejects `foo` and `foob` together
-        // because both would match `foobar`.
-        let mut command = redis::cmd("CLIENT");
-        command
-            .arg("TRACKING")
-            .arg("ON")
-            .arg("BCAST")
-            .arg("PREFIX")
-            .arg(prefix);
-        let _: RedisResult<()> = command.query_async(&mut connection).await?;
-
-        let field_expiry = detect_field_expiry(&mut connection).await;
-        Ok(Self {
-            connection,
-            chunk: DEFAULT_CHUNK,
-            field_expiry,
-        })
     }
 }
 
