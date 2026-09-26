@@ -446,3 +446,24 @@ def test_the_generated_project_reaches_a_training_set_on_its_own(project: Path) 
         assert (row["click_count"], row["purchase_count"]) == features[
             (row["user_id"], row["event_timestamp"] - DAY // 2)
         ]
+
+
+def test_help_works_without_the_compiled_extension(tmp_path: Path) -> None:
+    """`feather --help` is the one thing that has to work on a broken install.
+
+    A subprocess, because this session imported the extension at collection time
+    and an in-process check would be reading a module the session put in
+    sys.modules itself. The blocker makes the extension unimportable whether or
+    not a build left a binary beside the sources, so the test fails if the import
+    ever moves back to the top of cli.py, and stays green because the command
+    genuinely does not need it.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _BLOCK_EXTENSION],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(README.parent / "python")},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "feather" in result.stdout
