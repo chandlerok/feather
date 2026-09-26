@@ -236,6 +236,24 @@ jobs:
       # astral-sh/setup-uv, pinned at v10.2.0
       # renovate: datasource=github-tags depName=astral-sh/setup-uv
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+      # The runner image carries tens of gigabytes of SDKs this job never
+      # touches, and it needs the room more than the rust job does: a debug
+      # build of bundled DuckDB plus the 2.3GB cargo entry is what filled the
+      # disk on the first run of this job, and `uv pip install` died writing the
+      # extension out of the wheel. Same deletion, measured at 82s against 127s
+      # for the sequential form in the rust job.
+      - name: free disk space
+        run: |
+          pids=()
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup; do
+            sudo rm -rf "$dir" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid" || exit 1
+          done
+          df -h /
       # Same key as the python job, on purpose: both build the extension with the
       # dev profile and the same features, so the entry the python job's `uv sync`
       # writes is exactly the one that makes this build quick. The repository has a
@@ -257,15 +275,20 @@ jobs:
       # quickstart runs, and a release build of bundled DuckDB would dominate the
       # job's time for a difference no step here can observe. The release profile
       # is what a publish job would use, and that is a separate issue.
+      #
+      # `--strip` is the one thing that is not incidental, because the wheel is
+      # mostly DuckDB's symbol table: 255MB unstripped, and PyPI refuses a file
+      # over 100MB. The next step prints the size, so the number is on the record
+      # rather than guessed at.
       - name: build the wheel
-        run: maturin build --interpreter /tmp/build/bin/python --out dist
+        run: maturin build --strip --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
       # a property of the filename. A wheel that stopped being abi3 would install
       # on one interpreter and 404 on the rest, and nothing else in CI would say
       # so, because the python job tests the source tree.
       - name: one wheel, and it is the abi3 one
         run: |
-          ls -l dist
+          ls -lh dist
           wheels=(dist/*.whl)
           [ "${#wheels[@]}" -eq 1 ] || { echo "expected one wheel, got ${#wheels[@]}" >&2; exit 1; }
           case "${wheels[0]}" in
