@@ -520,14 +520,9 @@ mod tests {
     fn stored_count(store: &MemoryStore, view: &FeatureView, entity: &[u8]) -> Option<i64> {
         let blob = store
             .fields(&key_of(entity))?
-            .get(&value_field(&view.name))?
-            .clone();
-        let columns = decode_batch(
-            &view.features,
-            SchemaTag::of(&view.features),
-            &[blob.as_slice()],
-        )
-        .expect("decode");
+            .get(&value_field(&view.name))?;
+        let columns =
+            decode_batch(&view.features, SchemaTag::of(&view.features), &[blob]).expect("decode");
         let counts = columns[0].as_any().downcast_ref::<Int64Array>()?;
         Some(counts.value(0))
     }
@@ -536,8 +531,7 @@ mod tests {
     fn stored_freshness(store: &MemoryStore, entity: &[u8]) -> Option<i64> {
         let bytes = store
             .fields(&key_of(entity))?
-            .get(&freshness_field("clicks"))?
-            .clone();
+            .get(&freshness_field("clicks"))?;
         let array: [u8; 8] = bytes.try_into().ok()?;
         Some(i64::from_le_bytes(array))
     }
@@ -768,7 +762,10 @@ mod tests {
         let registry = store
             .fields(&views_registry_key("ads"))
             .expect("the refresh writes the registry");
-        assert_eq!(registry.get("clicks"), Some(&encode_freshness(900)));
+        assert_eq!(
+            registry.get("clicks"),
+            Some(encode_freshness(900).as_slice())
+        );
     }
 
     #[tokio::test]
@@ -790,8 +787,14 @@ mod tests {
 
         // Both views stay declared, so neither is an orphan and neither leaves the registry.
         let registry = store.fields(&views_registry_key("ads")).expect("registry");
-        assert_eq!(registry.get("clicks"), Some(&encode_freshness(100)));
-        assert_eq!(registry.get("stats"), Some(&encode_freshness(100)));
+        assert_eq!(
+            registry.get("clicks"),
+            Some(encode_freshness(100).as_slice())
+        );
+        assert_eq!(
+            registry.get("stats"),
+            Some(encode_freshness(100).as_slice())
+        );
     }
 
     /// A store that counts the keyspace walks a refresh performs, to pin that a refresh with
