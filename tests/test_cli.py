@@ -255,8 +255,12 @@ def test_the_demo_target_is_the_day_after_the_row_a_label_reads(project: Path) -
 def test_refresh_reports_what_it_wrote(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
     refresh(project, [])
     out = capsys.readouterr().out
-    assert "refreshed user_clicks" in out
-    assert "0 rows" not in out
+    written = re.search(r"refreshed user_clicks: (\d+) rows", out)
+    assert written is not None, out
+    # One row per entity, because a refresh takes the newest source row for each
+    # key. The demo has 250 users and 14 days each, so 3500 here would mean it
+    # wrote a day that the join can no longer reach.
+    assert int(written.group(1)) == 250
 
 
 def test_refresh_takes_one_view_by_name(project: Path, capsys: pytest.CaptureFixture[str]) -> None:

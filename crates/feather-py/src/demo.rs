@@ -204,16 +204,23 @@ mod tests {
     #[test]
     fn a_label_reads_the_features_of_its_own_day() {
         let (features, labels) = tables(ANCHOR);
-        let features = column(&features, "event_timestamp");
-        let labels = column(&labels, "event_timestamp");
-        for (row, label) in labels.iter().enumerate() {
-            let at = row * USERS as usize;
+        let users = column(&features, "user_id");
+        let timestamps = column(&features, "event_timestamp");
+        let rows: HashSet<(i64, i64)> = (0..users.len())
+            .map(|row| (users.value(row), timestamps.value(row)))
+            .collect();
+        let label_users = column(&labels, "user_id");
+        let label_times = column(&labels, "event_timestamp");
+        for row in 0..label_times.len() {
+            let user = label_users.value(row);
             // Half a day after a feature row, so that day's row is the newest one
-            // at or before the label.
-            assert_eq!(
-                features.value(at),
-                label.expect("a label timestamp") - 12 * MICROS_PER_HOUR
-            );
+            // at or before the label. The next one for this user being a day later
+            // is what makes that the newest: nothing sits in between.
+            assert!(rows.contains(&(user, label_times.value(row) - 12 * MICROS_PER_HOUR)));
+            assert!(rows.contains(&(
+                user,
+                label_times.value(row) - 12 * MICROS_PER_HOUR + MICROS_PER_DAY
+            )));
         }
     }
 
