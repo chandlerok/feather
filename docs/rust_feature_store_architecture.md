@@ -500,7 +500,7 @@ not yet defined; see "Open design questions".
 
 Historical queries are routed between two execution tiers. Both execute in the local DuckDB
 engine; they differ in where the source data lives and how it is reached. The engine choice and
-the format rules are recorded, with the measurements behind them, in
+the format rules are recorded, with the evidence behind them, in
 [`engine-and-format-decisions.md`](./engine-and-format-decisions.md).
 
 #### Tier 1: local files and database tables
@@ -591,9 +591,10 @@ there is no registry"). Validating on every read is too expensive for a warehous
 - Validate **once per process per source** at startup, and cache the resolved schema.
 - Re-validate on a schedule in long-lived processes.
 - Record the source's snapshot identity alongside the result, where the source has one: a
-  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or a warehouse table
-  version. A warehouse reached through its Iceberg REST catalog yields a snapshot id from
-  `iceberg_snapshots(...)`, so it is the same mechanism rather than a vendor-specific one.
+  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or — for a warehouse with no
+  Iceberg surface — a warehouse table version. A warehouse reached through its Iceberg REST
+  catalog would yield a snapshot id from `iceberg_snapshots(...)`, so it is the same mechanism
+  rather than a vendor-specific one.
   That is the closest thing to a source pin available without a registry, and it is what
   makes a drift report actionable rather than just "something changed".
 
@@ -1086,7 +1087,7 @@ support; Secondary ones are best-effort, still bugfixed and shipped with each re
 `parquet`, `httpfs`, `icu` and `json` are Primary. `iceberg`, `delta`, `ducklake`, `postgres`,
 `azure`, `mysql`, `sqlite` and `unity_catalog` are Secondary, and `vortex`, `lance` and
 `motherduck` are third-party maintained. Parquet on object storage is therefore the only fully
-supported read path, and the only format this project defaults to.
+supported read path in DuckDB's tiers, and the only file format this project defaults to.
 
 The cost of that design is the same one the warehouse extensions carry: an extension is built for
 one DuckDB version and one platform, and the path it lives at names both. An extension that lags
@@ -1143,7 +1144,9 @@ published.
 
 ## Recorded decisions and rejected alternatives
 
-Recorded so they are not re-litigated. Each cites the evidence that drove it.
+Recorded so they are not re-litigated. Each cites the evidence that drove it. The engine and
+format calls, and the alternatives rejected for them, are in
+[`engine-and-format-decisions.md`](./engine-and-format-decisions.md).
 
 ### The core validates, not the binding
 

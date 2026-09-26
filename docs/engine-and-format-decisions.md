@@ -6,21 +6,22 @@ numbers behind each call, so the same ground is not covered twice. The design it
 rules that follow from it.
 
 Everything here is dated. DuckDB, the extension tiers, and the newer formats all move, so a
-claim below carries the version it was checked against.
+claim below carries the version it was checked against, or says it comes from documentation
+rather than a check here.
 
 ## The engine stays DuckDB
 
-Four alternatives were taken far enough to run feather's own conformance cases: the twelve in
-the architecture document's "Conformance" section, plus the materialization reduction and a
-Parquet source read.
+Three alternatives were taken far enough to run feather's own conformance cases, the seven the
+architecture document's "Conformance" section names. DataFusion was not built; its row is
+assessed from its issue tracker, release notes, and published crate metadata.
 
-| Option                           | Cases    | Verdict                                         |
-| -------------------------------- | -------- | ----------------------------------------------- |
-| DuckDB (current)                 | 12 of 12 | Kept.                                           |
-| Apache DataFusion                | not run  | `ASOF JOIN` is unreleased.                      |
-| Polars 0.55.2                    | 21 of 21 | Rejected: no arrow-rs boundary.                 |
-| Embedded ClickHouse (chDB 4.4.0) | 22 of 22 | Rejected: size, no Delta, experimental binding. |
-| Hand-rolled join over Arrow      | 23 of 23 | Viable, not adopted.                            |
+| Option                           | Cases   | Verdict                                         |
+| -------------------------------- | ------- | ----------------------------------------------- |
+| DuckDB (current)                 | 7 of 7  | Kept.                                           |
+| Apache DataFusion                | not run | `ASOF JOIN` is unreleased.                      |
+| Polars 0.55.2                    | 7 of 7  | Rejected: no arrow-rs boundary.                 |
+| Embedded ClickHouse (chDB 4.4.0) | 7 of 7  | Rejected: size, no Delta, experimental binding. |
+| Hand-rolled join over Arrow      | 7 of 7  | Viable, not adopted.                            |
 
 ### Apache DataFusion
 
@@ -77,8 +78,8 @@ The join is smaller than expected. Two dependencies (`arrow` and `parquet`), a 1
 binary, and 241 lines covering source preparation, the merge, the point-in-time join, and the
 materialization reduction.
 
-Measured on the same machine and the same shape as `examples/duckdb_input.rs` (500k labels
-against a 2M-row feature table):
+Measured on an Apple M2 with 8 cores and 8 GiB, the same machine and shape as
+`examples/duckdb_input.rs` (500k labels against a 2M-row feature table):
 
 |                                                        | Time    |
 | ------------------------------------------------------ | ------- |
@@ -111,7 +112,8 @@ architecture document ever shrinks on purpose.
 
 DuckDB publishes a support tier per core extension. Primary extensions are covered by community
 support; Secondary extensions are best-effort, still bugfixed and shipped with each release. The
-tier is what makes a format safe to default to, more than any benchmark.
+tier is what makes a format safe to default to, more than any benchmark. The table below is
+taken from DuckDB's published extension documentation rather than checked here.
 
 | Tier                   | Extensions                                                                                                              |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -119,16 +121,20 @@ tier is what makes a format safe to default to, more than any benchmark.
 | Secondary              | `postgres`, `iceberg`, `delta`, `ducklake`, `azure`, `mysql`, `sqlite`, `unity_catalog`, `avro`, `vss`, `tpch`, `tpcds` |
 | Third-party maintained | `vortex`, `lance`, `motherduck`                                                                                         |
 
-So **Parquet on object storage, `parquet` plus `httpfs`, is the only fully supported read path**,
-and it is the default for anything feather writes or suggests. Every other format is offered,
-but marked for what it is.
+So within DuckDB's tiers, **Parquet on object storage, `parquet` plus `httpfs`, is the only
+fully supported read path**, and it is the default for anything feather writes or suggests.
+Parquet is also the only format feather itself reads today — a `File` source is a Parquet file,
+`Settings` has no format field, and the Postgres reader is a table scan rather than a file
+format (see "Backend coverage" in the architecture document) — and the rules above are why the
+rest are not defaults. A per-source format choice is intended follow-up work (#36).
 
 ### Layout beats format
 
 Sort and partition a feature source by `(entity key, event_timestamp)`. That is what lets DuckDB
 skip row groups, or storage segments under Vortex, for the key range instead of scanning
-everything. **A sorted Parquet beats an unsorted Vortex.** This costs nothing in dependencies,
-is format-independent, and is the highest-leverage change available without changing engines.
+everything. **A sorted Parquet should beat an unsorted Vortex.** This is reasoning rather than a
+measurement — verifying it is open work in #36 — but it costs nothing in dependencies, is
+format-independent, and is the highest-leverage change available without changing engines.
 
 If feather recommends one thing to users about how to land feature data, it should be this.
 
@@ -170,11 +176,16 @@ multimodal data rather than key-and-timestamp scans.
 
 ## Warehouses are read as Iceberg
 
-Snowflake, BigQuery, Databricks, Amazon S3 Tables and Fabric all expose an **Iceberg REST
-catalog** now, so a warehouse is reached through the open table format rather than a
+**Status: intended, not built.** No warehouse reader exists today: `Source` has `File` and
+`Postgres`, no Iceberg feature is compiled, and the architecture document's "Backend coverage"
+paragraph is the record of what is built. What follows is the intended mechanism, written in
+the future tense.
+
+Snowflake, BigQuery, Databricks and Amazon S3 Tables all expose an **Iceberg REST catalog**
+now, so a warehouse would be reached through the open table format rather than a
 vendor-specific driver.
 
-### One integration, not three
+### One integration, not four
 
 ```sql
 INSTALL iceberg;
@@ -192,7 +203,7 @@ ATTACH 'warehouse' AS my_catalog (
 SELECT count(*) FROM my_catalog.default.events;
 ```
 
-The catalog then behaves like any other DuckDB database. The endpoints that matter:
+The catalog would then behave like any other DuckDB database. The endpoints that matter:
 
 - **BigQuery**: the BigLake metastore speaks the REST catalog protocol and is generally
   available at `https://biglake.googleapis.com/iceberg/v1/restcatalog`.
@@ -200,14 +211,14 @@ The catalog then behaves like any other DuckDB database. The endpoints that matt
   Catalog), plus catalog-linked databases that sync namespaces and tables from a remote catalog.
 - **Amazon S3 Tables**: `ATTACH '<arn>' AS cat (TYPE iceberg, ENDPOINT_TYPE s3_tables)`.
 
-A single source kind, `Source::Iceberg { endpoint, secret_ref, table }`, covers all of them
-instead of three vendor-shaped kinds. It is also the integration tier 2 already needs.
+A single source kind, `Source::Iceberg { endpoint, secret_ref, table }`, would cover all of them
+instead of four vendor-shaped kinds. It is also the integration tier 2 already needs.
 
 ### What it gives us
 
-`iceberg_snapshots(my_catalog.default.events)` works on catalog tables, so a warehouse source
-can record a snapshot id like every other source. That closes the one source kind that had no
-pin, which is the requirement issue #2 already states.
+`iceberg_snapshots(my_catalog.default.events)` would work on catalog tables, so a warehouse
+source could record a snapshot id like every other source. That would close the one source kind
+that had no pin, which is the requirement issue #2 already states.
 
 ### The performance play
 
@@ -216,20 +227,20 @@ ATTACH 'ducklake:my_ducklake.ducklake' AS my_ducklake;
 CALL iceberg_to_ducklake('my_catalog', 'my_ducklake');
 ```
 
-`iceberg_to_ducklake` is a metadata-only copy of an attached Iceberg catalog into a DuckLake
-catalog. No data moves. The warehouse's tables become queryable as DuckLake tables, so repeated
-reads inherit DuckLake's statistics-based filter pushdown and snapshot semantics instead of
-paying the remote catalog's latency on every request.
+`iceberg_to_ducklake` would be a metadata-only copy of an attached Iceberg catalog into a
+DuckLake catalog. No data would move. The warehouse's tables would become queryable as DuckLake
+tables, so repeated reads would inherit DuckLake's statistics-based filter pushdown and snapshot
+semantics instead of paying the remote catalog's latency on every request.
 
-The shape is: warehouse is the system of record, Iceberg is the wire, DuckLake is the local
-read path.
+The shape would be: warehouse as the system of record, Iceberg as the wire, DuckLake as the
+local read path.
 
 ### Fallbacks
 
-The vendor extensions remain, for warehouses and tables with no Iceberg surface: `snowflake`
-through ADBC, `bigquery`, `onelake` for Fabric, and the generic `adbc` extension for anything
-with an ADBC driver. All of them are **community extensions**, so they are rebuilt per DuckDB
-release and only the latest release is listed. An extension that lags fails to load.
+The vendor extensions would remain, for warehouses and tables with no Iceberg surface:
+`snowflake` through ADBC, `bigquery`, `onelake` for Fabric, and the generic `adbc` extension for
+anything with an ADBC driver. All of them are **community extensions**, so they are rebuilt per
+DuckDB release and only the latest release is listed. An extension that lags fails to load.
 
 One concrete gotcha to document: DuckDB against Snowflake Open Catalog requires credential
 vending to be enabled, or `ACCESS_DELEGATION_MODE 'none'` plus an S3 secret of your own.

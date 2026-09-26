@@ -8,9 +8,10 @@ engine over Arrow.
 > and the online serving layer are built and measured, and materialization writes a view's
 > values into the online store from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
-> refresh, and the online read to Python. Snowflake sources and Arrow Flight serving are
-> design only. There is no published package and no Helm chart yet, so the install and `init`
-> steps below describe the intended interface; the code after them runs.
+> refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
+> catalog and Arrow Flight serving are design only. There is no published package and no Helm
+> chart yet, so the install and `init` steps below describe the intended interface; the code
+> after them runs.
 
 ## Design goals
 
