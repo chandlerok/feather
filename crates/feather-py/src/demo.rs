@@ -100,7 +100,7 @@ fn tables(anchor: i64) -> (RecordBatch, RecordBatch) {
             ordered.push(bought);
         }
     }
-    let features = batch(&[
+    let features = batch(vec![
         ("user_id", DataType::Int64, user_ids),
         ("event_timestamp", DataType::Int64, timestamps),
         ("click_count", DataType::Int64, clicks),
@@ -123,7 +123,7 @@ fn tables(anchor: i64) -> (RecordBatch, RecordBatch) {
             labels.push(i64::from(*bought > 0));
         }
     }
-    let labels = batch(&[
+    let labels = batch(vec![
         ("user_id", DataType::Int64, user_ids),
         ("event_timestamp", DataType::Int64, timestamps),
         ("label", DataType::Int64, labels),
@@ -137,14 +137,14 @@ fn timestamp_of(anchor: i64, day: usize) -> i64 {
 }
 
 /// One non-null int64 column per entry, in the order given.
-fn batch(columns: &[(&str, DataType, Vec<i64>)]) -> RecordBatch {
+fn batch(columns: Vec<(&str, DataType, Vec<i64>)>) -> RecordBatch {
     let fields: Vec<Field> = columns
         .iter()
         .map(|(name, dtype, _)| Field::new(*name, *dtype, false))
         .collect();
     let arrays: Vec<ArrayRef> = columns
-        .iter()
-        .map(|(_, _, values)| Arc::new(Int64Array::from(values.as_slice())) as ArrayRef)
+        .into_iter()
+        .map(|(_, _, values)| Arc::new(Int64Array::from(values)) as ArrayRef)
         .collect();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .expect("the demo columns are non-null and the same length")
