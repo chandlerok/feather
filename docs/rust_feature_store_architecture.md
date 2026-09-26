@@ -8,8 +8,8 @@ Scope note: this is a design document with a partial implementation. The definit
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
 materialization, which computes a view's values from its source and writes them to the online
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
-is design only for the source kinds with no reader. Arrow Flight serving and the L1 cache are
-design only, and so is the deployment machinery under "Materialization" — per-view parallelism,
+is design only for the source kinds with no reader. Arrow Flight serving is design only, and so
+is the deployment machinery under "Materialization" — per-view parallelism,
 the schedule, and the lock — none of which the refresh implements itself. Figures that are
 measurements say so and carry their hardware and cardinality; the rest are targets.
 
@@ -32,10 +32,10 @@ offline engine) and low-latency feature lookup (the online serving layer).
      └────────┬─────────────────────────────────────┬───────────────┘
               │ offline                             │ online
 ┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
-│  DuckDB                        │    │  L1: moka, invalidated by         │
-│  Parquet / S3 / Iceberg        │    │      Valkey CLIENT TRACKING       │
-│  warehouse sources (community  │    │  L2: Valkey, one hash per entity  │
-│  extensions)                   │    │      field per feature view       │
+│  DuckDB                        │    │  Valkey, one hash per entity      │
+│  Parquet / S3 / Iceberg        │    │  one field per feature view       │
+│  warehouse sources (community  │    │  one HMGET per entity             │
+│  extensions)                   │    │  read-time TTL check              │
 │  ASOF join, Arrow out          │    │                                   │
 └────────────────────────────────┘    └───────────────────────────────────┘
 ```
@@ -62,7 +62,7 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No streaming ingestion or real-time feature computation. Features are materialized in
   batches.
 - No Spark or Flink execution backend.
-- No pluggable online store interface. Valkey is the only L2.
+- No pluggable online store interface. Valkey is the only online store.
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -430,70 +430,23 @@ the mask; a caller that reads present values does not.
 What the store promises:
 
 ```text
-max_staleness = refresh_interval + invalidation_propagation
+max_staleness = refresh_interval
 ```
 
 - `refresh_interval` is the deployment's schedule, so this number is per deployment rather
-  than a constant.
-- `invalidation_propagation` is sub-second on a healthy tracking connection.
-- The L1 fallback TTL is the hard worst case, and TTL expiry caps staleness by construction:
-  an expired value reads as missing rather than as a stale value.
+  than a constant. A read goes to Valkey, so it sees the newest materialized value.
+- TTL expiry caps staleness by construction: an expired value reads as missing rather than as
+  a stale value.
 
 The store exposes observed lag per view, derived from `f:{view}`, so consumers alert on
 reality rather than on the formula. The metric is the alert signal; the formula is what gets
 written down.
 
-#### Two-tier cache
+#### Serving measurements
 
-- **L1, in-process.** A `moka` cache in the Rust client. The default `moka` eviction policy
-  is TinyLFU, which suits skewed key popularity. L1 hits avoid all network I/O.
-- **L2, distributed.** Valkey, over non-blocking I/O on the `tokio` runtime.
-
-L1 invalidation uses **Valkey client-side caching** in broadcasting mode:
-`CLIENT TRACKING on REDIRECT <id> BCAST PREFIX <project>:`. The server pushes invalidation
-messages when a tracked key changes, so invalidation is exact and push-based rather than
-TTL-bounded.
-
-Broadcasting is chosen over the default per-key mode for three reasons:
-
-- **No server-side invalidation table.** Valkey's own guidance is to "use the BCAST mode that
-  consumes no memory at all on the Valkey side", whereas per-key tracking costs memory
-  "proportional both to the number of keys tracked and the number of clients requesting such
-  keys". A feature store has few serving clients and a very large keyspace, which is exactly
-  the wrong shape for per-key tracking.
-- **Server cost scales with clients times prefixes**, not with keyspace size.
-- **It avoids four open server bugs in the per-key path**, all concerning the invalidation
-  table that this mode does not have:
-  [#4143](https://github.com/valkey-io/valkey/issues/4143) (table not cleaned after client
-  disconnect), [#4736](https://github.com/valkey-io/valkey/issues/4736) and
-  [#4775](https://github.com/valkey-io/valkey/issues/4775) (unbounded eviction effort), and
-  [#4416](https://github.com/valkey-io/valkey/issues/4416) (redirect client not notified when
-  the tracking source disconnects).
-
-Constraint to respect: **no two prefixes may overlap.** Valkey rejects `foo` and `foob`
-together because both would match `foobar`. One prefix per project is sufficient.
-
-Operational requirements, all owned by the Rust core: RESP3, a dedicated redirect connection
-for invalidation pushes, and a full L1 flush on reconnect, since the client cannot know what
-changed while it was disconnected.
-
-This is a work item, not a configuration flag. valkey-glide implements client-side caching
-for Node, Python, Go, and Java, but not for Rust
-([#6918](https://github.com/valkey-io/valkey-glide/issues/6918) is still open), so Feather
-implements RESP3 push handling and reconnect logic itself.
-
-**The fallback TTL is always on, not conditional on tracking being unavailable.** Push
-invalidation is the fast path; the TTL is the guarantee. A bug in push handling then degrades
-staleness to a bounded interval instead of silently breaking invalidation, which is the
-hardest class of failure to notice. This costs a few lines and removes the whole
-"invalidation quietly stopped working" incident.
-
-Subscription detail: invalidations arrive on `__valkey__:invalidate`. Valkey renamed it from
-`__redis__:invalidate` and keeps the old name only for Redis 7.2 compatibility, so subscribe
-to the Valkey name.
-
-Measured, on a container limited to 2 CPUs and 512MiB with `maxmemory` 384MiB and
-`allkeys-lru`, over 100k entities across 4 views of 8 features each, with 66-byte vectors:
+Measured against Valkey directly, on a container limited to 2 CPUs and 512MiB with `maxmemory`
+384MiB and `allkeys-lru`, over 100k entities across 4 views of 8 features each, with 66-byte
+vectors:
 
 | Measurement                  | Result                                    |
 | ---------------------------- | ----------------------------------------- |
@@ -845,10 +798,10 @@ function of its inputs, and it is the only part of it that is not.
 
 Full refresh cost scales with total entity-view pairs, not new data. With one hash per entity
 and one field per view, a refresh writes `entities x views` field values. Measured at 386k
-field writes per second on the constrained container described under "Two-tier cache", tens of
-millions of entity-view pairs is about a minute and low hundreds of millions is minutes. The
-earlier estimate in this document, which said hours for the second case, was several times too
-pessimistic.
+field writes per second on the constrained container described under "Serving measurements",
+tens of millions of entity-view pairs is about a minute and low hundreds of millions is
+minutes. The earlier estimate in this document, which said hours for the second case, was
+several times too pessimistic.
 
 That is the v1 ceiling, and it is deliberate. See "Scalability" for the documented path past
 it.
@@ -1037,13 +990,6 @@ tls = true
 # Redis 8.0 one. A server with neither falls back to the read-time TTL check, which is the
 # authoritative path either way.
 field_expiration = true
-
-[l1_cache]
-enabled = true
-max_capacity_mb = 2048
-# Always on, not conditional on push invalidation. It is the staleness
-# contract when an invalidation message is missed.
-fallback_ttl_seconds = 30
 ```
 
 An `endpoint` is what makes the entry an S3-compatible store rather than AWS, and it brings
@@ -1067,7 +1013,7 @@ Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
   so there is no deployment-wide offline store to name. See "Offline engine".
-- **No `type` on `[valkey]`.** Valkey is the only L2, and a pluggable online store is a
+- **No `type` on `[valkey]`.** Valkey is the only online store, and a pluggable one is a
   non-goal. The table name carries the kind, so a key that could only hold one value is not
   written down.
 - **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
@@ -1148,7 +1094,7 @@ database still need their keys specified before they can be documented.
 ## Deployment
 
 1. **Local development.** `pip install feather-py`. Everything runs in-process: local
-   Parquet, an in-memory DuckDB, and the L1 memory cache. No external services.
+   Parquet and an in-memory DuckDB. No external services, and an online read needs a Valkey.
 2. **Production.** Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled
    Deployment behind gRPC and REST; materialization runs as resource-isolated Kubernetes
    Jobs on a schedule or on demand.
@@ -1360,15 +1306,6 @@ The fix is granularity. Feather serializes one vector per entity per view, or be
 a batch of vectors into a single buffer and slices it per entity. The existing layout already
 turns N x M x F cell serializations into N x M vector serializations.
 
-### Broadcasting mode for client-side caching
-
-**Rejected:** per-key `CLIENT TRACKING`, and TTL-only invalidation.
-
-Per-key tracking costs server memory proportional to keys times clients, which is the wrong
-shape for a large keyspace with few clients, and it carries four open server bugs. TTL-only
-invalidation reintroduces the staleness window that exact invalidation removes. See
-"Two-tier cache".
-
 ### Partial aggregates in tiles
 
 **Rejected:** storing final aggregate values per tile.
@@ -1437,9 +1374,8 @@ and incremental materialization in "Watermarks as a last resort".
 - **Observability.** The metric set is named here so that instrumentation lands with the code
   rather than after it. The backend and any dashboards are not chosen.
 
-  Read latency histogram split by resolution tier (L1 hit, L2 hit, missing); L1 hit rate and
-  entry count; invalidation messages received and L1 flushes; refresh duration, rows written,
-  and failures; freshness lag per view as a gauge; decode errors and schema-tag mismatches.
+  Read latency histogram split by outcome (hit, missing); refresh duration, rows written, and
+  failures; freshness lag per view as a gauge; decode errors and schema-tag mismatches.
 
   The last two are the failure modes that are otherwise silent, so they matter more than the
   latency numbers. Prometheus text exposition, optional OTLP traces.

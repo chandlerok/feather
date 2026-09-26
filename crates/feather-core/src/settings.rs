@@ -212,9 +212,9 @@ impl Connection {
     }
 }
 
-/// The in-process cache in front of Valkey.
+/// Reserved for a possible in-process cache in front of Valkey.
 ///
-/// Configured whether or not Valkey is, because local mode has an L1 and no L2.
+/// Parsed and validated so a project can declare it, but no code path reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct L1Cache {
@@ -281,7 +281,7 @@ fn conninfo_value(value: &str) -> String {
 
 /// The Valkey connection.
 ///
-/// Valkey is the only L2, so no `type` discriminates it. `tls` has no default: a
+/// Valkey is the only online store, so no `type` discriminates it. `tls` has no default: a
 /// security flag guessed wrong is worse than one an operator had to write down.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -299,8 +299,8 @@ pub struct Valkey {
 /// A validated `feather.toml`.
 ///
 /// Unknown keys are rejected, so a typo is a load error rather than a silently
-/// ignored setting. `valkey` and `l1_cache` absent is local mode: an in-process
-/// DuckDB over local files, and the engine's own cache defaults.
+/// ignored setting. An absent `valkey` is local mode: an in-process DuckDB over
+/// local files, with no online store configured.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {

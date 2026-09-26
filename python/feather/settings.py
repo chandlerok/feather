@@ -103,9 +103,9 @@ Connection = Annotated[
 
 
 class L1Cache(pydantic.BaseModel):
-    """The in-process cache in front of Valkey.
+    """Reserved for a possible in-process cache in front of Valkey.
 
-    Present whether or not Valkey is, because local mode has an L1 and no L2.
+    Parsed and validated so a project can declare it, but no code path reads it.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
@@ -116,7 +116,7 @@ class L1Cache(pydantic.BaseModel):
 
 
 class Valkey(pydantic.BaseModel):
-    """The Valkey connection. The only L2, so nothing discriminates it."""
+    """The Valkey connection. The only online store, so nothing discriminates it."""
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
 
@@ -128,8 +128,8 @@ class Valkey(pydantic.BaseModel):
 class FeatherSettings(pydantic.BaseModel):
     """A validated ``feather.toml``.
 
-    ``valkey`` and ``l1_cache`` absent is local mode: an in-process DuckDB over
-    local files, and the engine's own cache defaults.
+    An absent ``valkey`` is local mode: an in-process DuckDB over local files, with
+    no online store configured.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
