@@ -143,7 +143,8 @@ reads `feather.toml` and the definition modules are imported rather than applied
 anything. A full refresh overwrites every value, so a run that fails can simply be repeated,
 and a view a previous refresh declared and this one does not is retired by the run, which
 removes its fields from every entity that still carries them. Name views to refresh a
-subset: `feather refresh user_clicks`.
+subset: `feather refresh user_clicks`. That refreshes the project you are standing in, so
+from somewhere else pass `-C`: `feather refresh -C my_feature_store user_clicks`.
 
 A generated project declares no Valkey, so its online store is in-process and belongs to
 the `FeatureStore` that opened it: the values are there for the process that refreshed them

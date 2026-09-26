@@ -236,7 +236,18 @@ def _parser() -> argparse.ArgumentParser:
         "refresh",
         help="refresh feature values from their sources into the online store",
     )
-    materialized.add_argument("directory", type=Path, nargs="?", default=Path())
+    # The directory is an option and not a positional, because the README's
+    # sentence for this command is `feather refresh user_clicks`, and a
+    # positional directory in front of the views would bind that word to it. The
+    # project being refreshed is the one you are standing in, which is the common
+    # case, so it does not need to be typed.
+    materialized.add_argument(
+        "-C",
+        "--directory",
+        type=Path,
+        default=Path(),
+        help="the project directory; the current one if this is not given",
+    )
     materialized.add_argument(
         "views",
         nargs="*",

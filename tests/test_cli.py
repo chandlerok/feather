@@ -299,7 +299,7 @@ def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> N
 def test_refresh_of_an_unknown_view_is_a_message_not_a_traceback(
     project: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["refresh", str(project), "not_a_view"]) == 1
+    assert main(["refresh", "-C", str(project), "not_a_view"]) == 1
     captured = capsys.readouterr()
     assert captured.err.startswith("feather refresh: ")
     assert "Traceback" not in captured.err
