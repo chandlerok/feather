@@ -195,10 +195,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             demo(args.directory, force=args.force)
         else:
             refresh(args.directory, args.views)
-    except (OSError, ValueError, KeyError, ImportError) as error:
+    except Exception as error:
         # ConnectionError is an OSError, so a Valkey that cannot be reached is
-        # already covered. The rest are the failures these three commands can
-        # raise, and each carries a message worth reading rather than a traceback.
+        # already covered. The catch is broad because a definition module is the
+        # user's own Python, imported by exec_module, so a typo in it is a
+        # SyntaxError, a NameError or an AttributeError and none of those is an
+        # OSError or an ImportError. Every one of them carries a message worth
+        # reading, and the docstring above promises a traceback is not what a
+        # mistyped path produces.
         print(f"feather {args.command}: {error}", file=sys.stderr)
         return 1
     return 0

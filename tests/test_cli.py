@@ -305,6 +305,40 @@ def test_refresh_of_an_unknown_view_is_a_message_not_a_traceback(
     assert "Traceback" not in captured.err
 
 
+def test_a_mistyped_definition_module_is_a_message_not_a_traceback(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`init` writes a module the user then edits, so a typo in it is the likely first failure.
+
+    A definition module is the user's own Python and the store imports it with
+    exec_module, so a misspelled name or a missing colon reaches the command as a
+    SyntaxError or a NameError. Neither is an OSError, an ImportError or a
+    ValueError, so a narrow catch let it out as a raw traceback, against the
+    contract `main` documents.
+    """
+    (project / DEFINITION).write_text("class UserClicks(:\n    pass\n", encoding="utf-8")
+    assert main(["refresh", "-C", str(project)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("feather refresh: ")
+    assert "Traceback" not in captured.err
+
+
+def test_a_name_error_in_a_definition_module_is_a_message_not_a_traceback(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A module that parses but names something undefined, which is the other way a typo escapes."""
+    (project / DEFINITION).write_text(
+        "from feather import Entity, FeatureView, Field, feature_view\n"
+        "user_entity = Entity(name='user_id', join_key='user_id')\n"
+        "missing = Field(Int64)\n",
+        encoding="utf-8",
+    )
+    assert main(["refresh", "-C", str(project)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("feather refresh: ")
+    assert "Traceback" not in captured.err
+
+
 def test_the_generated_project_reaches_a_training_set_on_its_own(project: Path) -> None:
     """The ten-minute path, end to end: init, demo, then the README's join.
 
