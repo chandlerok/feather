@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -446,6 +447,25 @@ def test_the_generated_project_reaches_a_training_set_on_its_own(project: Path) 
         assert (row["click_count"], row["purchase_count"]) == features[
             (row["user_id"], row["event_timestamp"] - DAY // 2)
         ]
+
+
+def test_the_two_declared_versions_agree() -> None:
+    """pyproject.toml and the workspace Cargo.toml are both a place a version is written.
+
+    maturin builds the wheel from the Python metadata and the extension reports
+    the Cargo one, so a release that bumped only one of them would publish a
+    package whose `feather.__version__` and `feather._core.__version__` disagree,
+    and nothing in CI compared them.
+    """
+    root = README.parent
+    packaged = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    declared = packaged["project"]["version"]
+    assert workspace["workspace"]["package"]["version"] == declared
+
+    from feather import _core
+
+    assert _core.__version__ == declared
 
 
 def test_help_works_without_the_compiled_extension(tmp_path: Path) -> None:

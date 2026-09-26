@@ -11,7 +11,7 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
 > catalog are design only. There is no served API yet, and the `feather` command is not on
-> PyPI either, so `pip install feather-py` is a line that will work rather than one that
+> PyPI either, so `pip install feather-py polars` is a line that will work rather than one that
 > works today; everything after it runs.
 
 ## Design goals
