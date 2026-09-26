@@ -1257,7 +1257,9 @@ because the read-time TTL check is the authoritative path. The cost is that memo
 per-process ceiling and a read can be as stale as the refresh interval, which is why a shared
 store is a separate position rather than the default.
 
-Evidence, and the gated next step: [`embedded-online-store.md`](./embedded-online-store.md).
+Evidence, and the gated next step: [`embedded-online-store.md`](./embedded-online-store.md). The
+rejected cache design is retained, unprioritized, in
+[#25](https://github.com/chandlerok/feather/issues/25).
 
 ### Spill is local, capped, and private
 

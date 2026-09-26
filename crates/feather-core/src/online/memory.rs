@@ -6,7 +6,8 @@
 //! Shape: one allocation for the entity's field index, its entries in name order; each field's
 //! name and value are still separate allocations, as they were. A request asks for one or two
 //! fields per view on one entity, so searching that entity's index is the access pattern that
-//! matters, and a binary search over the names beats a hash per name. A field name appears once,
+//! matters, and a binary search over the names is expected to beat a hash per name, a win
+//! asserted rather than shown. A field name appears once,
 //! which the previous two-map layout did not manage for a field written with an expiry: the
 //! expiries map held that name a second time, and the entity key with it.
 //!

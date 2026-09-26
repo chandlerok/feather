@@ -79,7 +79,7 @@ implementations of the same semantics drift and the drift is invisible. What it 
 server's `HSET` behaviour, which
 `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pins against a real Valkey in
 `tests/valkey_integration.rs`. That test never constructs `MemoryStore`: it observes the server's
-own reclamation, and the mirror of the one rule the two share is
+own reclamation, and the mirror of the one rule the two tests share is
 `a_write_without_an_expiry_clears_a_recorded_one` in
 `crates/feather-core/src/online/memory.rs`. That store is the only in-process implementation
 there is to keep honest.

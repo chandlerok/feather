@@ -5,8 +5,9 @@ from an in-process store, or from Valkey over async `tokio` I/O to share one acr
 Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
-> and the online serving layer are built and measured, and materialization writes a view's
-> values into the online store from its source. The point-in-time join is built over local
+> and the online serving layer are built and measured against Valkey, the position a
+> deployment graduates to, and materialization writes a view's values into the online store
+> from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
 > catalog and Arrow Flight serving are design only. There is no published package and no Helm
