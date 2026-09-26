@@ -251,3 +251,27 @@ implementation.
 
 **No warehouse as a default source.** Every warehouse path is Secondary or community tier, so a
 warehouse source is best-effort, with the snapshot id recorded and a metadata-only drift check.
+
+## Reproducing these
+
+Each spike was a scratch crate or virtualenv outside the repository, so none of them are
+committed. They are small enough to rebuild when a claim needs rechecking.
+
+- **DuckDB**: in this repository, `ENTITIES=500000 cargo run --release -p feather-core
+  --features offline --example duckdb_input`. That is where the 34.4 ms figure comes from.
+- **Hand-rolled join**: a crate depending only on `arrow` 58 and `parquet` 58, with the merge as
+  a single monotonic cursor over a source sorted by `(key, ts, created)`. The `arrow` API details
+  that cost the most time were `lexsort_to_indices(&[SortColumn], limit)` and the fact that
+  `take` treats a null index as a null row.
+- **Polars**: a crate depending on `polars` 0.55.2 with the `lazy`, `asof_join`, `streaming` and
+  `parquet` features, running the cases through `join_asof_by(..., AsofStrategy::Backward,
+  tolerance, allow_eq, check_sortedness)`. `DataFrame::unique` needs a turbofish because its
+  generic parameters are unused; `unique_stable` does not.
+- **chDB**: `pip install chdb` (4.4.0, engine 26.7.2), with each case as a query over the
+  `values(...)` table function and `SETTINGS join_use_nulls = 1` on every one.
+- **DataFusion**: not built, and the row above says so. That finding comes from the tracker, the
+  release notes, and the published crate metadata rather than from a run.
+
+The extension tiers, the Vortex TPC-H result, and the Iceberg REST endpoints all come from
+DuckDB's and the vendors' own documentation, not from a measurement here, and they are the parts
+most likely to have moved. Recheck them against the release actually pinned.
