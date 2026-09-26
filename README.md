@@ -10,7 +10,7 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 > from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
-> catalog are design only. There is no served API and no published package yet, so the install
+> catalog are design only. There is no served API yet and no published package, so the install
 > and `init` steps below describe the intended interface; the code after them runs.
 
 ## Design goals
@@ -33,8 +33,10 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
   drift.
 - **A library, not a service.** There is no served API to operate. The language that defines
   the features is the language that reads them, in the same process, which is what makes this a
-  good fit for a monolith and why nothing here runs a server. A team that wants an RPC surface
-  for another language builds one over the defining process.
+  good fit for a monolith and why nothing here runs a server. One is planned after 1.0, and the
+  read path stays a single in-process call so that a server is a thin wrapper over that call
+  rather than a second implementation. Until then, a team that wants an RPC surface for another
+  language builds one over the defining process.
 
 ## Quickstart
 

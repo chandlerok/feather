@@ -9,8 +9,8 @@ Scope note: this is a design document with a partial implementation. The definit
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
 materialization, which computes a view's values from its source and writes them to the online
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
-is design only for the source kinds with no reader. There is no served API: the library runs in
-the caller's process, so the deployment machinery under "Materialization", the per-view
+is design only for the source kinds with no reader. There is no served API yet: the library runs
+in the caller's process, so the deployment machinery under "Materialization", the per-view
 parallelism, the schedule, and the lock, is design only, none of which the refresh implements
 itself. The serving figures are measured against a shared Valkey, the position a deployment
 graduates to, so the in-process default carries no published figure yet. Figures that are
@@ -70,9 +70,11 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No pluggable online store interface. There are two positions, in-process and Valkey, and
   which one a deployment runs is configuration rather than a plugin. See "Online serving
   layer".
-- No feature server. The library runs in the caller's process and reads Valkey directly. A
-  team that wants an RPC surface over it builds that in its own service; this project ships no
-  server, no HTTP endpoint, and no deployment manifests.
+- No feature server before 1.0. The library runs in the caller's process and reads Valkey
+  directly, and that is the shape this project ships. A server is planned after 1.0
+  ([issue #5](https://github.com/chandlerok/feather/issues/5)), so the read path stays one
+  in-process call and a server is a thin wrapper over it rather than a second implementation.
+  Until it lands, a team that wants an RPC surface builds one over the defining process.
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -253,13 +255,14 @@ per language.
 
 That is also the fastest arrangement available: a read is a call in the same process, with no
 server to reach and no hop to pay for. Serving from a separate process would add one, which is
-why there is no such process here.
+why the library is the shape this project ships and why a server comes after 1.0 rather than
+first.
 
-Reading from another language is therefore a build-your-own path rather than a supported one. A
+Reading from another language is therefore a build-your-own path until that server lands. A
 project that wants, say, a Go service to read features the defining language declared builds a
-gRPC, HTTP, or Arrow Flight surface over the defining process and owns it. This project ships no
-server, and the note under "Open design questions" records the transport research for whoever
-builds one.
+gRPC, HTTP, or Arrow Flight surface over the defining process and owns it. [Issue
+#5](https://github.com/chandlerok/feather/issues/5) tracks the server, and "The RPC surface,
+after 1.0" records the transport research.
 
 One thing is worth knowing if a surface is ever built over a _second_ declaration of the same
 fields, rather than over the defining process. The schema tag covers field names, dtypes, and
@@ -1180,10 +1183,10 @@ warehouse one.
    Valkey runs as a StatefulSet, and materialization runs as resource-isolated Kubernetes Jobs
    on a schedule or on demand, against the same Valkey.
 
-There is no API pod, no Helm chart, and no Kustomize manifest, and none is planned: the project
-ships a library. A team that wants an RPC surface over it builds that in its own service. The
-read path is a single in-process call, so such a surface would wrap it rather than reimplement
-it.
+There is no API pod, no Helm chart, and no Kustomize manifest, and there will not be one before
+1.0: this project ships a library. A server is planned after 1.0, and the read path is kept as a
+single in-process call so that it wraps that call rather than reimplementing it. Until it lands,
+a team that wants an RPC surface builds one over the defining process.
 
 ---
 
@@ -1445,7 +1448,7 @@ distinction is real.
 Two items remain open. Two further capabilities are deferred with triggers rather than left
 open, and they are documented where they belong: approximate aggregates in "Tile encoding",
 and incremental materialization in "Watermarks as a last resort". A third note records the
-transport for whoever builds an RPC surface, which this project does not ship.
+transport for the RPC surface planned after 1.0, which this project does not ship yet.
 
 ### Needs a product decision
 
@@ -1480,16 +1483,17 @@ transport for whoever builds an RPC surface, which this project does not ship.
   The trigger has fired: the read path and the refresh are built and measured. What is missing is
   the instrumentation, not the reason to add it.
 
-### For whoever builds an RPC surface
+### The RPC surface, after 1.0
 
-This project ships no server, so a team that wants one builds it. Recorded here so the research
-is not lost. The transport that keeps the data path Arrow-native is Arrow Flight, which is gRPC
-with Arrow IPC as the payload, so it keeps a mainstream RPC transport while keeping protobuf out
-of the data path. Hopsworks shipped that combination for a feature store and reported up to 45x
-throughput over their REST API, and independent benchmarks put Flight up to 30x over ODBC. Feast's
-community requested the switch and it was not made
+A server is planned for after 1.0, and it is deliberately not part of this design yet: the core
+is a library, and the language that defines the features is the language that reads them.
+Recorded here so the transport research is not lost. Arrow Flight is the transport that keeps the
+data path Arrow-native, being gRPC with Arrow IPC as the payload, so it keeps a mainstream RPC
+transport while keeping protobuf out of the data path. Hopsworks shipped that combination for a
+feature store and reported up to 45x throughput over their REST API, and independent benchmarks
+put Flight up to 30x over ODBC. Feast's community requested the switch and it was not made
 ([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments).
 
-Such a surface should wrap the in-process read rather than reimplement it. It would also need a
-resolved field set per request, which is the point at which the `FeatureService` name stops being
-decorative and starts being an interface.
+Such a surface wraps the in-process read rather than reimplementing it. It also needs a resolved
+field set per request, which is where the `FeatureService` name stops being decorative and starts
+being an interface. Tracked as [issue #5](https://github.com/chandlerok/feather/issues/5).
