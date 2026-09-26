@@ -249,11 +249,17 @@ mod tests {
 
     #[test]
     fn every_row_lands_inside_the_thirty_day_ttl() {
-        let (features, labels) = tables(ANCHOR);
+        // The anchor is the one `write_demo_data` builds its tables from rather
+        // than a constant this test declares, because the claim is that a
+        // generated row is inside the view's 30-day TTL whenever the demo is
+        // run, and a hard-coded anchor here would hold that for a 2023 date and
+        // say nothing about today.
+        let anchor = midnight_micros(now_micros().expect("the clock is set after 1970"));
+        let (features, labels) = tables(anchor);
         for table in [&features, &labels] {
             for value in column(table, "event_timestamp").iter().flatten() {
-                assert!(value <= ANCHOR);
-                assert!(value > ANCHOR - 30 * MICROS_PER_DAY);
+                assert!(value <= anchor);
+                assert!(value > anchor - 30 * MICROS_PER_DAY);
             }
         }
     }
