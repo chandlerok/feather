@@ -1182,8 +1182,8 @@ warehouse one.
    holds the store, and materialization runs in or beside it. The ceiling is that process's
    memory, and the staleness bound is the refresh interval.
 3. **Scale-out.** `[valkey]` is configured, and an online read in this position goes to Valkey.
-   Valkey runs as a StatefulSet, and materialization runs as resource-isolated Kubernetes Jobs
-   on a schedule or on demand, against the same Valkey.
+   Valkey would run as a StatefulSet, and materialization would run as resource-isolated
+   Kubernetes Jobs on a schedule or on demand, against the same Valkey.
 
 There is no API pod, no Helm chart, and no Kustomize manifest, and there will not be one before
 v1: this project ships a library. A server is planned after v1, and the read path is kept as a
@@ -1260,9 +1260,9 @@ scan, and the row order is the thing that keeps labels and features aligned.
 front of it.
 
 A two-tier design has to keep the L1 correct, which for Valkey means client-side caching in
-broadcasting mode, a RESP3 redirect connection implemented here because valkey-glide has no Rust
-support, reconnect handling with a full flush, a non-overlapping-prefix constraint, and an
-always-on fallback TTL. All of that exists because there are two copies of the data.
+broadcasting mode, a RESP3 redirect connection that was implemented here because valkey-glide has
+no Rust support, reconnect handling with a full flush, a non-overlapping-prefix constraint, and
+an always-on fallback TTL. All of that existed because there are two copies of the data.
 
 Inverting the tiers removes it. With one copy there is nothing to invalidate, the store need not
 be Redis-family at all, and `OnlineStore::write` already permits a store that ignores expiry,
@@ -1495,6 +1495,10 @@ transport while keeping protobuf out of the data path. Hopsworks shipped that co
 feature store and reported up to 45x throughput over their REST API, and independent benchmarks
 put Flight up to 30x over ODBC. Feast's community requested the switch and it was not made
 ([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments).
+
+The research also found that `arrow-flight` tracks the workspace's Arrow major and brings
+`tonic` and `prost` with it, and that this crate ships no auth handler. A serving surface would
+add both rather than inherit them, and neither is a dependency here today.
 
 Such a surface wraps the in-process read rather than reimplementing it. It also needs a resolved
 field set per request, which is where the `FeatureService` name stops being decorative and starts

@@ -32,7 +32,7 @@ The previous design was a `moka` L1 in front of a Valkey L2, with the L1 kept co
 pushed invalidation. That is a correct design, and most of the machinery around it exists only
 because there are two copies:
 
-- a dedicated RESP3 redirect connection that this project implements itself, because
+- a dedicated RESP3 redirect connection that this project implemented itself, because
   valkey-glide has no Rust client-side caching (its
   [#6918](https://github.com/valkey-io/valkey-glide/issues/6918) is open);
 - reconnect handling and a full L1 flush on reconnect, since a client cannot know what changed

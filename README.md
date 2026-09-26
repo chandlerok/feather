@@ -33,7 +33,7 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
   drift.
 - **A library, not a service.** There is no served API to operate. The language that defines
   the features is the language that reads them, in the same process, which is what makes this a
-  good fit for a monolith and why nothing here runs a server. One is planned after 1.0, and the
+  good fit for a monolith and why nothing here runs a server. One is planned after v1, and the
   read path stays a single in-process call so that a server is a thin wrapper over that call
   rather than a second implementation. Until then, a team that wants an RPC surface for another
   language builds one over the defining process.
