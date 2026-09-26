@@ -247,12 +247,18 @@ jobs:
         with:
           shared-key: python
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # maturin needs an interpreter to build against, and whether a bare `python`
+      # is on a runner's PATH is not something to depend on. The version does not
+      # decide the wheel's tag, because abi3 reads it off the pyo3 feature, so this
+      # only makes the build's interpreter explicit.
+      - name: an interpreter to build against
+        run: uv python install 3.14 && uv venv --python 3.14 /tmp/build
       # Debug, not release: this job checks that the artifact installs and the
       # quickstart runs, and a release build of bundled DuckDB would dominate the
       # job's time for a difference no step here can observe. The release profile
       # is what a publish job would use, and that is a separate issue.
       - name: build the wheel
-        run: maturin build --out dist
+        run: maturin build --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
       # a property of the filename. A wheel that stopped being abi3 would install
       # on one interpreter and 404 on the rest, and nothing else in CI would say
