@@ -80,8 +80,8 @@ pub struct ValkeyStore {
 impl ValkeyStore {
     /// Connect and enable RESP3.
     ///
-    /// The store asks for RESP3 so an `HGETALL` reply is a map. The client-side caching
-    /// that also needs it is prospective: #25 holds that design. A URL without
+    /// RESP3 is requested for the client-side caching #25 holds the design for, not for the
+    /// read path: `hash_fields` reads a RESP2 reply into the same map. A URL without
     /// `?protocol=resp3` is upgraded rather than silently falling back to RESP2.
     pub async fn connect(url: &str) -> Result<Self> {
         let url = if url.contains("protocol=") {

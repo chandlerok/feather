@@ -225,8 +225,8 @@ pub struct L1Cache {
     pub max_capacity_mb: Option<NonZeroU64>,
     /// `None` leaves the interval to the engine's default.
     ///
-    /// With no cache and no invalidation, nothing falls back to this. The value's own
-    /// TTL is what caps staleness: a read-time check makes an expired value read as
+    /// With no cache and no invalidation, nothing falls back to this. The view's declared
+    /// `ttl_days` is what caps staleness: a read-time check makes an expired value read as
     /// missing rather than as a stale one.
     #[serde(default)]
     pub fallback_ttl_seconds: Option<NonZeroU64>,

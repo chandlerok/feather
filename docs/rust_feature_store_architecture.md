@@ -50,8 +50,8 @@ for the evidence behind it.
    with no per-row Python and no serialization format on the hot path.
 2. **Zero-infrastructure local mode.** Point-in-time joins and online lookups work out of
    the box with no external services.
-3. **Opinionated simplification.** One online store (Valkey), one local compute engine
-   (DuckDB), one internal representation (Arrow).
+3. **Opinionated simplification.** One configurable online store (Valkey), one local compute
+   engine (DuckDB), one internal representation (Arrow).
 4. **Additive upgrade paths.** Every capability deferred from v1 has a documented retrofit
    that does not require changing the storage format or the serving path.
 
@@ -675,7 +675,8 @@ row alignment.
 
 ## Materialization
 
-Materialization computes feature values from offline sources and writes them to Valkey.
+Materialization computes feature values from offline sources and writes them to the online
+store (Valkey in a deployment, the in-process store in local mode).
 
 ### Full refresh, no watermarks
 
@@ -712,7 +713,7 @@ Re-materialization is the migration.
 The write path never leaves Arrow and never builds a row-oriented intermediate:
 
 1. DuckDB computes the values and streams Arrow record batches out.
-2. Each batch is encoded directly into Valkey write commands.
+2. In a deployment, each batch is encoded directly into Valkey write commands.
 3. Commands are pipelined, one flush per 1024 commands (`DEFAULT_CHUNK` in
    `online/valkey.rs`). The bound is a command count rather than a byte budget: large enough
    to amortise the round trip, small enough that one flush does not hold a multi-megabyte
