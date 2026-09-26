@@ -2,7 +2,8 @@
 
 This document describes the intended architecture for an opinionated, high-performance
 open-source alternative to Feast. It strips out multi-provider abstraction and specializes
-on a native Rust core, with DuckDB for historical computation and Valkey for online serving.
+on a native Rust core, with DuckDB for historical computation and an in-process online store
+that scales out to Valkey.
 
 Scope note: this is a design document with a partial implementation. The definition layer,
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
@@ -10,8 +11,10 @@ materialization, which computes a view's values from its source and writes them 
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
 is design only for the source kinds with no reader. Arrow Flight serving is design only, and so
 is the deployment machinery under "Materialization" — per-view parallelism,
-the schedule, and the lock — none of which the refresh implements itself. Figures that are
-measurements say so and carry their hardware and cardinality; the rest are targets.
+the schedule, and the lock — none of which the refresh implements itself. The serving figures
+are measured against a shared Valkey, the position a deployment graduates to, so the in-process
+default carries no published figure yet. Figures that are measurements say so and carry their
+hardware and cardinality; the rest are targets.
 
 ---
 
@@ -32,11 +35,12 @@ offline engine) and low-latency feature lookup (the online serving layer).
      └────────┬─────────────────────────────────────┬───────────────┘
               │ offline                             │ online
 ┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
-│  DuckDB                        │    │  Valkey, one hash per entity      │
-│  Parquet / S3 / Iceberg        │    │  one field per feature view       │
-│  warehouse sources (Iceberg    │    │  one HMGET per entity             │
-│  REST catalogs)                │    │  read-time TTL check              │
-│  ASOF join, Arrow out          │    │                                   │
+│  DuckDB                        │    │  In-process store by default,     │
+│  Parquet / S3 / Iceberg        │    │  or Valkey to share               │
+│  warehouse sources (Iceberg    │    │  one hash per entity, one         │
+│  REST catalogs)                │    │  field per feature view           │
+│  ASOF join, Arrow out          │    │  one HMGET per entity             │
+│                                │    │  read-time TTL check              │
 └────────────────────────────────┘    └───────────────────────────────────┘
 ```
 
@@ -50,8 +54,9 @@ for the evidence behind it.
    with no per-row Python and no serialization format on the hot path.
 2. **Zero-infrastructure local mode.** Point-in-time joins and online lookups work out of
    the box with no external services.
-3. **Opinionated simplification.** One configurable online store (Valkey), one local compute
-   engine (DuckDB), one internal representation (Arrow).
+3. **Opinionated simplification.** One configurable online store, in-process by default and
+   Valkey when a deployment needs it shared, one local compute engine (DuckDB), one internal
+   representation (Arrow).
 4. **Additive upgrade paths.** Every capability deferred from v1 has a documented retrofit
    that does not require changing the storage format or the serving path.
 
@@ -62,7 +67,9 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No streaming ingestion or real-time feature computation. Features are materialized in
   batches.
 - No Spark or Flink execution backend.
-- No pluggable online store interface. Valkey is the only online store that can be configured.
+- No pluggable online store interface. There are two positions, in-process and Valkey, and
+  which one a deployment runs is configuration rather than a plugin. See "Online serving
+  layer".
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -434,14 +441,53 @@ max_staleness = refresh_interval
 ```
 
 - `refresh_interval` is the deployment's schedule, so this number is per deployment rather
-  than a constant. In a deployment a read goes to Valkey, so it sees the newest
-  materialized value.
+  than a constant. Both stores return the newest value materialized into them, so both are as
+  stale as that interval; they differ in whose writes they can see, since an in-process read
+  sees only what this process's refresh wrote and, in a deployment, a Valkey read sees any
+  process's.
 - TTL expiry caps staleness by construction: an expired value reads as missing rather than as
   a stale value.
 
 The store exposes observed lag per view, derived from `f:{view}`, so consumers alert on
 reality rather than on the formula. The metric is the alert signal; the formula is what gets
 written down.
+
+#### Where the store lives
+
+The store is in-process by default. `feather.toml` with no `[valkey]` table serves from an
+in-process store, and Valkey is what a deployment adds when one process is no longer enough:
+when the dataset outgrows one process, or when several processes need to share one writable
+store.
+
+The relationship is substitution rather than layering. The in-process store is not a cache in
+front of Valkey, and Valkey is not a store with a local copy in front of it: a deployment picks
+one. It is the trade SQLite and Postgres present, where the embedded store is the default and the
+server is what a project graduates to.
+
+Both positions are the same trait. `read_entities<S: OnlineStore>` is the only caller in the
+serving path, so which store is behind it does not touch the Python surface, the serving API, or
+the offline path, and choosing between them is configuration.
+
+Two things differ, and both matter:
+
+- **Where writes land.** In-process writes into the one map this process holds; Valkey writes
+  into shared state. Both satisfy `write` and `delete_fields`, and both are mutated where they
+  stand: a refresh is not staged into a copy and swapped in.
+- **How stale a read can be.** In-process serves what the last refresh in this process wrote, so
+  staleness is bounded by the refresh interval. Writes take `&mut self` and reads take `&self`,
+  and the Python binding holds its store behind one lock for a whole refresh, so a read sees a
+  completed refresh rather than a partial one. That is exclusion rather than an atomic swap, so
+  the bound is the interval and not zero.
+
+The store is not responsible for expiry. `OnlineStore::write` documents that a store which
+cannot honour an expiry "writes the value anyway: the read-time TTL check in `read_entities` is
+what decides whether a value is served, so an unexpired leftover costs reclamation and never
+correctness". An in-process store therefore needs no per-field TTL, which is the one feature that
+made Valkey uniquely suitable.
+
+The default is `MemoryStore`, once a test double. It was promoted rather than joined by a second
+in-process store, so that there is one implementation of these semantics to keep honest. See
+[`embedded-online-store.md`](./embedded-online-store.md).
 
 #### Serving measurements
 
@@ -1024,9 +1070,10 @@ Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
   so there is no deployment-wide offline store to name. See "Offline engine".
-- **No `type` on `[valkey]`.** Valkey is the only online store that can be configured, and
-  a pluggable one is a non-goal. The table name carries the kind, so a key that could only
-  hold one value is not written down.
+- **No `type` on `[valkey]`.** Valkey is the only shared store that can be configured, and a
+  pluggable one is a non-goal. The table name carries the kind, so a key that could only hold
+  one value is not written down. Its absence is a position rather than an omission: no
+  `[valkey]` table means the in-process store, which is the default.
 - **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
   prefix, and a database table differ only in how the source is declared, not in what
   executes it.
@@ -1117,11 +1164,15 @@ warehouse one.
 ## Deployment
 
 1. **Local development.** `pip install feather-py`. Everything runs in-process: local
-   Parquet, an in-memory DuckDB, and an in-memory online store, so nothing external is
-   needed. In a deployment an online read needs a Valkey.
-2. **Production.** Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled
-   Deployment behind gRPC and REST; materialization runs as resource-isolated Kubernetes
-   Jobs on a schedule or on demand.
+   Parquet, an in-memory DuckDB, and the in-process online store, so nothing external is
+   needed.
+2. **Single-process production.** The same shape as local, with no `[valkey]` table: the process
+   holds the store, and materialization runs in or beside it. The ceiling is that process's
+   memory, and the staleness bound is the refresh interval.
+3. **Scale-out.** `[valkey]` is configured, and an online read in this position goes to Valkey.
+   Valkey runs as a StatefulSet; Rust API pods run as a horizontally scaled Deployment behind
+   gRPC and REST; materialization runs as resource-isolated Kubernetes Jobs on a schedule or on
+   demand.
 
 The Helm charts and Kustomize manifests are not written yet. When they exist, this section
 should link to them rather than describe them.
@@ -1189,6 +1240,26 @@ scan is read through the Arrow path.
 The cost is materializing the result. The ordering is applied to the scan rather than at
 materialization, because a sort performed while building the table would not order a later
 scan, and the row order is the thing that keeps labels and features aligned.
+
+### The online store is in-process by default
+
+**Rejected:** Valkey as the only store, with the in-process `moka` cache as an optimization in
+front of it.
+
+A two-tier design has to keep the L1 correct, which for Valkey means client-side caching in
+broadcasting mode, a RESP3 redirect connection implemented here because valkey-glide has no Rust
+support, reconnect handling with a full flush, a non-overlapping-prefix constraint, and an
+always-on fallback TTL. All of that exists because there are two copies of the data.
+
+Inverting the tiers removes it. With one copy there is nothing to invalidate, the store need not
+be Redis-family at all, and `OnlineStore::write` already permits a store that ignores expiry,
+because the read-time TTL check is the authoritative path. The cost is that memory becomes a
+per-process ceiling and a read can be as stale as the refresh interval, which is why a shared
+store is a separate position rather than the default.
+
+Evidence, and the gated next step: [`embedded-online-store.md`](./embedded-online-store.md). The
+rejected cache design is retained, unprioritized, in
+[#25](https://github.com/chandlerok/feather/issues/25).
 
 ### Spill is local, capped, and private
 

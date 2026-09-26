@@ -118,7 +118,7 @@ class L1Cache(pydantic.BaseModel):
 class Valkey(pydantic.BaseModel):
     """The Valkey connection.
 
-    The only online store that can be configured, so nothing discriminates it.
+    The only shared store that can be configured, so nothing discriminates it.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
@@ -131,8 +131,8 @@ class Valkey(pydantic.BaseModel):
 class FeatherSettings(pydantic.BaseModel):
     """A validated ``feather.toml``.
 
-    An absent ``valkey`` is local mode: an in-process DuckDB over local files, with
-    no online store configured.
+    An absent ``valkey`` is local mode: an in-process DuckDB over local files, served
+    from the in-process online store.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
