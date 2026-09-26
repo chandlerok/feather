@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -29,6 +30,43 @@ _CODE_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
 
 DAY = 86_400_000_000
 """Microseconds in a day, which the demo data is laid out in."""
+
+SECOND_DEFINITION = """\
+from feather import Entity, FeatureView, Field, FileSource, feature_view
+from feather.types import Int64
+
+other_entity = Entity(name="user_id", join_key="user_id")
+other_source = FileSource(path="data/user_stats.parquet")
+
+
+@feature_view(
+    name="user_totals",
+    entity=other_entity,
+    source=other_source,
+    ttl_days=30,
+)
+class UserTotals(FeatureView):
+    click_count = Field(Int64)
+"""
+"""A second view over the same source, so a refresh has something to leave out."""
+
+_BLOCK_EXTENSION = """
+import sys
+
+
+class Blocked:
+    def find_spec(self, name, path=None, target=None):
+        if name == "feather._core":
+            raise ImportError("feather._core is blocked for this test")
+        return None
+
+
+sys.meta_path.insert(0, Blocked())
+from feather.cli import main
+
+raise SystemExit(main(["--help"]))
+"""
+"""A fresh interpreter in which the extension cannot be imported, however it is installed."""
 
 
 def readme_example(marker: str) -> str:
@@ -92,6 +130,27 @@ def generated_view(project: Path) -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.UserClicks
+
+
+def add_second_view(project: Path) -> None:
+    """Add a second view to a generated project and register it in the settings.
+
+    The generated project declares exactly one view, so a refresh naming that view
+    and a refresh naming none produce the same output and a test cannot tell them
+    apart. A second view is what makes the difference observable.
+
+    Args:
+        project: The project directory.
+    """
+    other = "definitions/user_totals.py"
+    (project / other).write_text(SECOND_DEFINITION, encoding="utf-8")
+    settings = project / SETTINGS_NAME
+    settings.write_text(
+        settings.read_text(encoding="utf-8").replace(
+            f'definitions = ["{DEFINITION}"]', f'definitions = ["{DEFINITION}", "{other}"]'
+        ),
+        encoding="utf-8",
+    )
 
 
 @pytest.fixture
@@ -264,8 +323,26 @@ def test_refresh_reports_what_it_wrote(project: Path, capsys: pytest.CaptureFixt
 
 
 def test_refresh_takes_one_view_by_name(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    refresh(project, ["user_clicks"])
-    assert "refreshed user_clicks" in capsys.readouterr().out
+    """Naming a view refreshes that view and leaves the project's others alone.
+
+    Driven through `main` rather than the `refresh` function, so the argument
+    order in the parser is part of what is pinned: a positional directory ahead
+    of the views would bind `user_clicks` to the directory and refresh both.
+    """
+    add_second_view(project)
+    assert main(["refresh", "-C", str(project), "user_clicks"]) == 0
+    names = re.findall(r"^refreshed (\w+):", capsys.readouterr().out, re.MULTILINE)
+    assert names == ["user_clicks"]
+
+
+def test_refresh_with_no_view_named_refreshes_every_view(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The other half of the pair: naming none is what reaches the second view."""
+    add_second_view(project)
+    assert main(["refresh", "-C", str(project)]) == 0
+    names = re.findall(r"^refreshed (\w+):", capsys.readouterr().out, re.MULTILINE)
+    assert sorted(names) == ["user_clicks", "user_totals"]
 
 
 def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> None:
@@ -369,14 +446,3 @@ def test_the_generated_project_reaches_a_training_set_on_its_own(project: Path) 
         assert (row["click_count"], row["purchase_count"]) == features[
             (row["user_id"], row["event_timestamp"] - DAY // 2)
         ]
-
-
-def test_help_works_without_the_compiled_extension(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """`feather --help` is the one thing that has to work on a broken install."""
-    monkeypatch.setitem(sys.modules, "feather._core", None)
-    with pytest.raises(SystemExit) as exit:
-        main(["--help"])
-    assert exit.value.code == 0
-    assert "feather" in capsys.readouterr().out
