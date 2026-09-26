@@ -569,12 +569,12 @@ the format rules are recorded, with the evidence behind them, in
 - **Consequence.** Compute runs locally, so there is no warehouse compute charge. Metadata
   operations (manifest reads, snapshot resolution) still hit the catalog and are the usual
   source of latency on high-file-count tables.
-- **Warehouses.** A warehouse is read through its Iceberg REST catalog rather than a
-  vendor-specific driver, so Snowflake, BigQuery, Databricks and Amazon S3 Tables are one
-  source kind instead of four. `iceberg_snapshots(...)` then supplies the source pin, and
-  `iceberg_to_ducklake(...)` makes a metadata-only copy into a DuckLake catalog so repeated
-  reads get DuckLake's filter pushdown without copying data. The vendor extensions
-  (`snowflake`, `bigquery`, `onelake`) stay as fallbacks for warehouses with no Iceberg
+- **Warehouses.** A warehouse will be read through its Iceberg REST catalog rather than a
+  vendor-specific driver, so Snowflake, BigQuery, Databricks and Amazon S3 Tables would be one
+  source kind instead of four. `iceberg_snapshots(...)` would then supply the source pin, and
+  `iceberg_to_ducklake(...)` would make a metadata-only copy into a DuckLake catalog so
+  repeated reads would get DuckLake's filter pushdown without copying data. The vendor extensions
+  (`snowflake`, `bigquery`, `onelake`) would stay as fallbacks for warehouses with no Iceberg
   surface, and are community extensions. Azure is Blob Storage filesystem access plus Iceberg
   or ADBC, not a Synapse connector.
 - **What is not a default.** `ducklake` is the recommendation for a source currently held in

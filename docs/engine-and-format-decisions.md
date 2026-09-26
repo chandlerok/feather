@@ -15,13 +15,13 @@ Three alternatives were taken far enough to run feather's own conformance cases,
 architecture document's "Conformance" section names. DataFusion was not built; its row is
 assessed from its issue tracker, release notes, and published crate metadata.
 
-| Option                           | Cases   | Verdict                                         |
-| -------------------------------- | ------- | ----------------------------------------------- |
-| DuckDB (current)                 | 7 of 7  | Kept.                                           |
-| Apache DataFusion                | not run | `ASOF JOIN` is unreleased.                      |
-| Polars 0.55.2                    | 7 of 7  | Rejected: no arrow-rs boundary.                 |
-| Embedded ClickHouse (chDB 4.4.0) | 7 of 7  | Rejected: size, no Delta, experimental binding. |
-| Hand-rolled join over Arrow      | 7 of 7  | Viable, not adopted.                            |
+| Option                                          | Cases   | Verdict                                         |
+| ----------------------------------------------- | ------- | ----------------------------------------------- |
+| DuckDB (current, the pinned `duckdb` 1.10505.0) | 7 of 7  | Kept.                                           |
+| Apache DataFusion                               | not run | `ASOF JOIN` is unreleased.                      |
+| Polars 0.55.2                                   | 7 of 7  | Rejected: no arrow-rs boundary.                 |
+| Embedded ClickHouse (chDB 4.4.0)                | 7 of 7  | Rejected: size, no Delta, experimental binding. |
+| Hand-rolled join over Arrow                     | 7 of 7  | Viable, not adopted.                            |
 
 ### Apache DataFusion
 
@@ -56,7 +56,7 @@ binary, and about 9.5 minutes cold.
 
 ### Embedded ClickHouse (chDB)
 
-chDB passes everything, including the materialization reduction and a Parquet read.
+chDB passes all seven, and was also run on the materialization reduction and a Parquet read.
 
 Two problems. **`join_use_nulls` defaults to 0**, so an unmatched `ASOF LEFT JOIN` column comes
 back as the type default. An unmatched label silently becomes `0` rather than `NULL`, which for
@@ -122,7 +122,7 @@ taken from DuckDB's published extension documentation rather than checked here.
 | Third-party maintained | `vortex`, `lance`, `motherduck`                                                                                         |
 
 So within DuckDB's tiers, **Parquet on object storage, `parquet` plus `httpfs`, is the only
-fully supported read path**, and it is the default for anything feather writes or suggests.
+fully supported read path**, and it is the format this project defaults to.
 Parquet is also the only format feather itself reads today — a `File` source is a Parquet file,
 `Settings` has no format field, and the Postgres reader is a table scan rather than a file
 format (see "Backend coverage" in the architecture document) — and the rules above are why the
@@ -248,7 +248,7 @@ Namespace depth, AWS region and secret URL-encoding are all fiddly.
 
 ### Azure
 
-The weakest of the three and worth being plain about. The `azure` extension is Blob Storage
+Worth being plain about. The `azure` extension is Blob Storage
 filesystem access, which makes `az://` paths work, and it is not a warehouse. Synapse and
 Databricks on Azure go through Iceberg or ADBC. Fabric goes through the `onelake` community
 extension. Azure support therefore means ADLS paths plus Iceberg, not a Synapse connector.
