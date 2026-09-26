@@ -91,8 +91,9 @@ so what the change buys is the index rather than the value bytes:
 - **One allocation for the field index per entity** instead of a `HashMap` per entity, with the
   entries ordered by name. A request asks for one or two fields per view on one entity, and that
   index is the structure it searches.
-- **Field names are stored once.** The old layout held the entity key and every field name
-  twice, once for values and once for expiries.
+- **Field names are stored once.** The old layout held a name twice, in the values map and in the
+  expiries map, but only for fields written with an expiry, and it held the entity key twice
+  wherever that happened.
 - **A read is a binary search over the names** rather than a hash per name, which is why the
   entries are kept in name order. At the few fields an entity holds this is reasoning rather
   than a measurement: a couple of string comparisons against one hash is a trade nobody here has

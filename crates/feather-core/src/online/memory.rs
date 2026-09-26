@@ -3,12 +3,12 @@
 //! Local mode runs on this: `feather.toml` with no `[valkey]` table. It is the default rather
 //! than a fallback, so it is written to be served from rather than merely to be correct.
 //!
-//! Shape: one allocation for the entity's field index, its entries in name order; the values are
-//! still one allocation each. A request asks for one or two fields per view on one entity, so
-//! searching that entity's index is the access pattern that matters, and a binary search over the
-//! names beats a hash per name. The field names appear once, which the previous two-map layout
-//! did not manage: it held the entity key and every field name twice, once for values and once
-//! for expiries.
+//! Shape: one allocation for the entity's field index, its entries in name order; each field's
+//! name and value are still separate allocations, as they were. A request asks for one or two
+//! fields per view on one entity, so searching that entity's index is the access pattern that
+//! matters, and a binary search over the names beats a hash per name. A field name appears once,
+//! which the previous two-map layout did not manage for a field written with an expiry: the
+//! expiries map held that name a second time, and the entity key with it.
 //!
 //! A field's expiry is remembered and never acted on: this store has no clock and reclaims
 //! nothing, and the read-time TTL check is the authoritative path in any case. Keeping the
@@ -112,9 +112,11 @@ impl MemoryStore {
 impl OnlineStore for MemoryStore {
     async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
         for batch in batches {
-            // Taken out and put back so the fields can be re-sorted in place. A batch carries
-            // every field of one entity, so this is one merge per entity per batch rather than
-            // per field.
+            // Taken out and put back so the fields can be re-sorted in place: one merge per
+            // batch, not one per field. A batch names one entity but may carry only some of that
+            // entity's fields, which is what `materialize` does when it writes one batch per row
+            // per view, because `OnlineStore::write` leaves the fields a batch does not mention
+            // alone.
             let mut entries = match self.hashes.remove(batch.key.as_slice()) {
                 Some(fields) => fields.entries.into_vec(),
                 None => Vec::new(),
@@ -294,5 +296,69 @@ mod tests {
         );
         assert_eq!(fields.get("v:zeta"), Some(b"z2".as_slice()));
         assert_eq!(fields.get("v:alpha"), Some(b"a".as_slice()));
+    }
+
+    /// A batch with no fields still leaves a hash, which is a deliberate divergence: the server
+    /// queues nothing at all for an empty batch. `materialize` leans on this store creating the
+    /// hash for every key it is handed when it decides not to write an empty registry, so what
+    /// is pinned here is the hash being there rather than the fields being absent.
+    #[tokio::test]
+    async fn an_empty_batch_still_leaves_a_hash() {
+        let key = b"ads:user_id:2:u1".to_vec();
+        let mut store = MemoryStore::new();
+
+        store
+            .write(&[WriteBatch {
+                key: key.clone(),
+                fields: Vec::new(),
+            }])
+            .await
+            .expect("a write with no fields");
+
+        assert_eq!(store.hash_count(), 1, "the key is a hash all the same");
+        let fields = store.fields(&key).expect("the key is a hash all the same");
+        assert!(fields.is_empty(), "and that hash holds no fields");
+    }
+
+    /// Deleting an entity's last field drops the entity rather than leaving an empty hash, which
+    /// is what the server does when the last field of a key is deleted. The hash count is per
+    /// entity and `scan_entity_keys` walks the same map, so an empty hash left behind would be a
+    /// key the server does not have.
+    #[tokio::test]
+    async fn deleting_the_last_field_drops_the_entity() {
+        let key = b"ads:user_id:2:u1".to_vec();
+        let mut store = MemoryStore::new();
+
+        store
+            .write(&[WriteBatch {
+                key: key.clone(),
+                fields: vec![
+                    WrittenField::new("v:clicks", b"one".to_vec(), None),
+                    WrittenField::new("v:views", b"two".to_vec(), None),
+                ],
+            }])
+            .await
+            .expect("a two-field write");
+
+        store
+            .delete_fields(&[(key.clone(), vec!["v:clicks".to_owned()])])
+            .await
+            .expect("a delete that leaves one field");
+        assert!(
+            store.fields(&key).is_some_and(|fields| fields.len() == 1),
+            "one field is left, so the entity stays"
+        );
+
+        store
+            .delete_fields(&[(key.clone(), vec!["v:views".to_owned()])])
+            .await
+            .expect("a delete of the last field");
+
+        assert_eq!(
+            store.hash_count(),
+            0,
+            "the entity's hash went with its last field"
+        );
+        assert!(store.fields(&key).is_none(), "so the entity is gone");
     }
 }
