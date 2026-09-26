@@ -34,8 +34,8 @@ offline engine) and low-latency feature lookup (the online serving layer).
 ┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
 │  DuckDB                        │    │  Valkey, one hash per entity      │
 │  Parquet / S3 / Iceberg        │    │  one field per feature view       │
-│  warehouse sources (community  │    │  one HMGET per entity             │
-│  extensions)                   │    │  read-time TTL check              │
+│  warehouse sources (Iceberg    │    │  one HMGET per entity             │
+│  REST catalogs)                │    │  read-time TTL check              │
 │  ASOF join, Arrow out          │    │                                   │
 └────────────────────────────────┘    └───────────────────────────────────┘
 ```
@@ -500,9 +500,11 @@ not yet defined; see "Open design questions".
 ### 4. Offline engine (query routing)
 
 Historical queries are routed between two execution tiers. Both execute in the local DuckDB
-engine; they differ in where the source data lives and how it is reached.
+engine; they differ in where the source data lives and how it is reached. The engine choice and
+the format rules are recorded, with the evidence behind them, in
+[`engine-and-format-decisions.md`](./engine-and-format-decisions.md).
 
-#### Tier 1: local files and warehouse sources
+#### Tier 1: local files and database tables
 
 - **Engine.** Local DuckDB via the `duckdb` Rust crate.
 - **Entity frame input.** The caller's entity frame is an Arrow record batch. It is appended to
@@ -532,15 +534,6 @@ engine; they differ in where the source data lives and how it is reached.
 
   `crates/feather-core/examples/duckdb_input.rs` runs the comparison:
   `ENTITIES=500000 cargo run --release -p feather-core --features offline --example duckdb_input`.
-- **Mechanism.** DuckDB's `snowflake` and `bigquery` extensions read from those warehouses.
-  Both are **community extensions**: contributed and maintained outside DuckLabs, and
-  installed from the community repository (`INSTALL snowflake FROM community`). They are not
-  core extensions and are not covered by the core support tier. The Snowflake extension
-  connects through an Arrow ADBC driver.
-- **Operational consequence.** Community extensions are rebuilt per DuckDB release. Pin the
-  DuckDB version and the extension version together; an extension that lags the DuckDB
-  release will fail to load. DuckDB's generic `adbc` extension is an alternative for any
-  database with an ADBC driver.
 - **Spill behavior.** DuckDB spills automatically: temporary storage is on by default, and a
   query that exceeds `memory_limit` writes its intermediates to the temp directory rather than
   failing. It does not use swap. Spilling is a safety net and not a plan, and the ceiling is
@@ -577,6 +570,19 @@ engine; they differ in where the source data lives and how it is reached.
 - **Consequence.** Compute runs locally, so there is no warehouse compute charge. Metadata
   operations (manifest reads, snapshot resolution) still hit the catalog and are the usual
   source of latency on high-file-count tables.
+- **Warehouses.** A warehouse will be read through its Iceberg REST catalog rather than a
+  vendor-specific driver, so Snowflake, BigQuery, Databricks and Amazon S3 Tables would be one
+  source kind instead of four. `iceberg_snapshots(...)` would then supply the source pin, and
+  `iceberg_to_ducklake(...)` would make a metadata-only copy into a DuckLake catalog so
+  repeated reads would get DuckLake's filter pushdown without copying data. The vendor extensions
+  (`snowflake`, `bigquery`, `onelake`) would stay as fallbacks for warehouses with no Iceberg
+  surface, and are community extensions. Azure is Blob Storage filesystem access plus Iceberg
+  or ADBC, not a Synapse connector.
+- **What is not a default.** `ducklake` is the recommendation for a source currently held in
+  Postgres. `vortex` is a core extension with filters evaluated on compressed data, measured
+  by DuckDB at 18% ahead of Parquet v2 on TPC-H SF100, but it is third-party maintained and
+  pre-1.0, so it is opt-in. Only `parquet`, `httpfs`, `icu` and `json` are Primary tier, so
+  Parquet on object storage is the only fully supported read path.
 
 #### Source schema validation
 
@@ -586,7 +592,10 @@ there is no registry"). Validating on every read is too expensive for a warehous
 - Validate **once per process per source** at startup, and cache the resolved schema.
 - Re-validate on a schedule in long-lived processes.
 - Record the source's snapshot identity alongside the result, where the source has one: a
-  Parquet file's metadata, an Iceberg or Delta snapshot id, or a warehouse table version.
+  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or — for a warehouse with no
+  Iceberg surface — a warehouse table version. A warehouse reached through its Iceberg REST
+  catalog would yield a snapshot id from `iceberg_snapshots(...)`, so it is the same mechanism
+  rather than a vendor-specific one.
   That is the closest thing to a source pin available without a registry, and it is what
   makes a drift report actionable rather than just "something changed".
 
@@ -1075,6 +1084,13 @@ libraries, and a build cannot turn them on:
 - An image that cannot reach the extension repository bakes the files in and points
   `Limits::extension_directory` at them, so `INSTALL` is a no-op and `LOAD` finds them locally.
 
+Support tiers decide what may be a default. Primary extensions are covered by community
+support; Secondary ones are best-effort, still bugfixed and shipped with each release. Only
+`parquet`, `httpfs`, `icu` and `json` are Primary. `iceberg`, `delta`, `ducklake`, `postgres`,
+`azure`, `mysql`, `sqlite` and `unity_catalog` are Secondary, and `vortex`, `lance` and
+`motherduck` are third-party maintained. Parquet on object storage is therefore the only fully
+supported read path in DuckDB's tiers, and the only file format this project defaults to.
+
 The cost of that design is the same one the warehouse extensions carry: an extension is built for
 one DuckDB version and one platform, and the path it lives at names both. An extension that lags
 the engine fails to load rather than degrading.
@@ -1088,8 +1104,13 @@ case and a Postgres container for the table, because a reader that only ever mee
 known to work. The `file` kind is covered locally instead: it is the control inside both of those
 tests, so a file read and a server read are joined to the same rows and compared, and a local
 Parquet file is not a server to start. Snowflake declares a connection but has no reader yet, so
-nothing reads through it and no test does. BigQuery, Azure Blob Storage, and a local SQLite
-database still need their keys specified before they can be documented.
+nothing reads through it and no test does.
+
+The intended warehouse kind is Iceberg rather than one kind per vendor, since an Iceberg REST
+catalog reaches Snowflake, BigQuery, Databricks and Amazon S3 Tables through one attach. That
+would make a `bigquery` or `azure` connection kind unnecessary for reading a warehouse, and it
+narrows the open work in issue #7. Azure Blob Storage stays a filesystem concern rather than a
+warehouse one.
 
 ---
 
@@ -1126,7 +1147,9 @@ published.
 
 ## Recorded decisions and rejected alternatives
 
-Recorded so they are not re-litigated. Each cites the evidence that drove it.
+Recorded so they are not re-litigated. Each cites the evidence that drove it. The engine and
+format calls, and the alternatives rejected for them, are in
+[`engine-and-format-decisions.md`](./engine-and-format-decisions.md).
 
 ### The core validates, not the binding
 
