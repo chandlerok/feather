@@ -136,6 +136,12 @@ def demo(directory: Path, *, force: bool = False) -> None:
 def refresh(directory: Path, views: Sequence[str]) -> None:
     """Refresh the project's views into the online store.
 
+    A project with no Valkey in its settings is local mode, and its online store
+    is in-process and belongs to the store object that opened it. So the values
+    written here are served to this process and to nothing after it; a
+    deployment that serves from more than one process configures a Valkey, and
+    the same call writes to that.
+
     Args:
         directory: The project directory, holding ``feather.toml``.
         views: The views to refresh, by name, or empty for every view the project

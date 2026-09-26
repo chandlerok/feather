@@ -252,20 +252,44 @@ def test_the_demo_target_is_the_day_after_the_row_a_label_reads(project: Path) -
     assert targets == {0, 1}
 
 
-def test_refresh_writes_the_demo_values_into_the_online_store(project: Path) -> None:
+def test_refresh_reports_what_it_wrote(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
     refresh(project, [])
-    view = generated_view(project)
-    with inside(project):
-        store = FeatureStore(SETTINGS_NAME)
-        entities = pl.DataFrame({"user_id": [1, 2, 3]})
-        read = pl.DataFrame(store.get_online_features(entities, [view.click_count]))
-    assert read.columns == ["user_id", "click_count"]
-    assert read["click_count"].null_count() == 0
+    out = capsys.readouterr().out
+    assert "refreshed user_clicks" in out
+    assert "0 rows" not in out
 
 
 def test_refresh_takes_one_view_by_name(project: Path, capsys: pytest.CaptureFixture[str]) -> None:
     refresh(project, ["user_clicks"])
     assert "refreshed user_clicks" in capsys.readouterr().out
+
+
+def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> None:
+    """One store, not two.
+
+    A project with no Valkey in `feather.toml` is local mode, and the in-process
+    store belongs to the `FeatureStore` that opened it. So the values a refresh
+    writes are there for the object that wrote them, which is why this holds the
+    store rather than opening a second one.
+    """
+    view = generated_view(project)
+    entities = pl.DataFrame({"user_id": [1, 2, 3]})
+    with inside(project):
+        store = FeatureStore(SETTINGS_NAME)
+        before = pl.DataFrame(store.get_online_features(entities, [view.click_count]))
+        assert before["click_count"].null_count() == 3
+
+        store.materialize(None)
+
+        after = pl.DataFrame(store.get_online_features(entities, [view.click_count]))
+    assert after.columns == ["user_id", "click_count"]
+    assert after["click_count"].null_count() == 0
+
+    # The newest feature row for each user, which is a refresh's last write per
+    # key. Anything else would be a refresh that kept the wrong day's value.
+    features = source_rows(project)
+    newest = max(timestamp for _, timestamp in features)
+    assert after["click_count"].to_list() == [features[(user, newest)][0] for user in (1, 2, 3)]
 
 
 def test_refresh_of_an_unknown_view_is_a_message_not_a_traceback(

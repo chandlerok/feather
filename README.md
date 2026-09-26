@@ -145,6 +145,11 @@ and a view a previous refresh declared and this one does not is retired by the r
 removes its fields from every entity that still carries them. Name views to refresh a
 subset: `feather refresh user_clicks`.
 
+A generated project declares no Valkey, so its online store is in-process and belongs to
+the `FeatureStore` that opened it: the values are there for the process that refreshed them
+and for nothing after it. A deployment that serves from more than one process puts a
+Valkey in `feather.toml`, and the same command writes to that instead.
+
 ## Going to production
 
 The same code runs against remote stores; only `feather.toml` changes. The
