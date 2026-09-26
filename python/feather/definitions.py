@@ -232,9 +232,10 @@ def view_to_wire(view: type[FeatureView]) -> _wire.FeatureView:
 class FeatureService:
     """A named projection: a name and the features it exposes.
 
-    Accepts declared fields, or a whole view to mean every field on it. The name
-    is what a read names, so the field set resolves once at construction
-    rather than per read.
+    Accepts declared fields, or a whole view to mean every field on it. The
+    name is the projection's identity rather than a wire handle; nothing reads
+    it. The field set resolves here, at construction, and a read names fields,
+    not this.
 
     Deliberately not a registry object: it carries no entities, no version, and
     no infrastructure, because entities come from the referenced views.

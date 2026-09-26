@@ -259,9 +259,10 @@ server to reach and no hop to pay for. Serving from a separate process would add
 why the library is the shape this project ships and why a server comes after v1 rather than
 first.
 
-Reading from another language is therefore a build-your-own path until that server lands. A
-project that wants, say, a Go service to read features the defining language declared builds a
-gRPC, HTTP, or Arrow Flight surface over the defining process and owns it. [Issue
+Reading from another language is therefore a build-your-own path until a binding for that
+language exists or the server lands. A project that wants, say, a Go service to read features
+the defining language declared builds a gRPC, HTTP, or Arrow Flight surface over the defining
+process and owns it. [Issue
 #5](https://github.com/chandlerok/feather/issues/5) tracks the server, and "The RPC surface,
 after v1" records the transport research.
 
@@ -390,8 +391,8 @@ Rejected encodings, and why:
 - **A per-value length prefix on fixed-width columns.** Doubles the metadata for no benefit,
   since the view's schema already fixes the stride.
 
-Because the caller's declared views resolve the field set once, when they are constructed,
-decoding needs no per-value type dispatch. That is the point of the layout.
+Because the reader supplies the declared schema with each read, rather than the value carrying
+it, decoding needs no per-value type dispatch. That is the point of the layout.
 
 #### Read path
 
