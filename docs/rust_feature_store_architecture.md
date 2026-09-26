@@ -70,8 +70,8 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No pluggable online store interface. There are two positions, in-process and Valkey, and
   which one a deployment runs is configuration rather than a plugin. See "Online serving
   layer".
-- No feature server before 1.0. The library runs in the caller's process and reads Valkey
-  directly, and that is the shape this project ships. A server is planned after 1.0
+- No feature server before v1. The library runs in the caller's process and reads Valkey
+  directly, and that is the shape this project ships. A server is planned after v1
   ([issue #5](https://github.com/chandlerok/feather/issues/5)), so the read path stays one
   in-process call and a server is a thin wrapper over it rather than a second implementation.
   Until it lands, a team that wants an RPC surface builds one over the defining process.
@@ -255,14 +255,14 @@ per language.
 
 That is also the fastest arrangement available: a read is a call in the same process, with no
 server to reach and no hop to pay for. Serving from a separate process would add one, which is
-why the library is the shape this project ships and why a server comes after 1.0 rather than
+why the library is the shape this project ships and why a server comes after v1 rather than
 first.
 
 Reading from another language is therefore a build-your-own path until that server lands. A
 project that wants, say, a Go service to read features the defining language declared builds a
 gRPC, HTTP, or Arrow Flight surface over the defining process and owns it. [Issue
 #5](https://github.com/chandlerok/feather/issues/5) tracks the server, and "The RPC surface,
-after 1.0" records the transport research.
+after v1" records the transport research.
 
 One thing is worth knowing if a surface is ever built over a _second_ declaration of the same
 fields, rather than over the defining process. The schema tag covers field names, dtypes, and
@@ -1184,7 +1184,7 @@ warehouse one.
    on a schedule or on demand, against the same Valkey.
 
 There is no API pod, no Helm chart, and no Kustomize manifest, and there will not be one before
-1.0: this project ships a library. A server is planned after 1.0, and the read path is kept as a
+v1: this project ships a library. A server is planned after v1, and the read path is kept as a
 single in-process call so that it wraps that call rather than reimplementing it. Until it lands,
 a team that wants an RPC surface builds one over the defining process.
 
@@ -1448,7 +1448,7 @@ distinction is real.
 Two items remain open. Two further capabilities are deferred with triggers rather than left
 open, and they are documented where they belong: approximate aggregates in "Tile encoding",
 and incremental materialization in "Watermarks as a last resort". A third note records the
-transport for the RPC surface planned after 1.0, which this project does not ship yet.
+transport for the RPC surface planned after v1, which this project does not ship yet.
 
 ### Needs a product decision
 
@@ -1483,9 +1483,9 @@ transport for the RPC surface planned after 1.0, which this project does not shi
   The trigger has fired: the read path and the refresh are built and measured. What is missing is
   the instrumentation, not the reason to add it.
 
-### The RPC surface, after 1.0
+### The RPC surface, after v1
 
-A server is planned for after 1.0, and it is deliberately not part of this design yet: the core
+A server is planned for after v1, and it is deliberately not part of this design yet: the core
 is a library, and the language that defines the features is the language that reads them.
 Recorded here so the transport research is not lost. Arrow Flight is the transport that keeps the
 data path Arrow-native, being gRPC with Arrow IPC as the payload, so it keeps a mainstream RPC
