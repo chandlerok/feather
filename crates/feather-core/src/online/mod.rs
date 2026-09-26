@@ -4,8 +4,7 @@
 //! out of hashes. Encoding, TTL, and missingness live above it, so the same
 //! logic runs against the in-memory store and against Valkey.
 //!
-//! There is no cache in the store. L1 belongs in the serving layer where the
-//! invalidation stream can reach it.
+//! There is no cache in the store.
 
 pub mod memory;
 
