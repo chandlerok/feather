@@ -10,9 +10,8 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 > from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
-> catalog and Arrow Flight serving are design only. There is no published package and no Helm
-> chart yet, so the install and `init` steps below describe the intended interface; the code
-> after them runs.
+> catalog are design only. There is no served API yet and no published package, so the install
+> and `init` steps below describe the intended interface; the code after them runs.
 
 ## Design goals
 
@@ -32,6 +31,12 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.
+- **A library, not a service.** There is no served API to operate. The language that defines
+  the features is the language that reads them, in the same process, which is what makes this a
+  good fit for a monolith and why nothing here runs a server. One is planned after v1, and the
+  read path stays a single in-process call so that a server is a thin wrapper over that call
+  rather than a second implementation. Until then, a team that wants an RPC surface for another
+  language builds one over the defining process.
 
 ## Quickstart
 
@@ -119,8 +124,8 @@ experiment.
 ## Going to production
 
 The same code runs against remote stores; only `feather.toml` changes. The
-configuration schema, the query routing rules, and the deployment topology are described in
-[the architecture document](docs/rust_feature_store_architecture.md).
+configuration schema, the query routing rules, and the shape of a production deployment are
+described in [the architecture document](docs/rust_feature_store_architecture.md).
 
 ## Contributing
 

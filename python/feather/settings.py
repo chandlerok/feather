@@ -102,19 +102,6 @@ Connection = Annotated[
 """A named credential set, discriminated on ``type``."""
 
 
-class L1Cache(pydantic.BaseModel):
-    """Reserved for a possible in-process cache in front of Valkey.
-
-    Parsed and validated so a project can declare it, but no code path reads it.
-    """
-
-    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
-
-    enabled: bool = True
-    max_capacity_mb: Annotated[int, pydantic.Field(gt=0)] | None = None
-    fallback_ttl_seconds: Annotated[int, pydantic.Field(gt=0)] | None = None
-
-
 class Valkey(pydantic.BaseModel):
     """The Valkey connection.
 
@@ -141,7 +128,6 @@ class FeatherSettings(pydantic.BaseModel):
     definitions: Annotated[list[NonEmptyStr], pydantic.Field(min_length=1)]
     connections: dict[NonEmptyStr, Connection] = pydantic.Field(default_factory=dict)
     valkey: Valkey | None = None
-    l1_cache: L1Cache | None = None
 
 
 def load_settings(path: str | os.PathLike[str] = DEFAULT_PATH) -> FeatherSettings:
@@ -171,7 +157,6 @@ __all__ = [
     "DEFAULT_PATH",
     "Connection",
     "FeatherSettings",
-    "L1Cache",
     "PostgresConnection",
     "S3Connection",
     "SnowflakeConnection",

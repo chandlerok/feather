@@ -29,10 +29,10 @@ the same trade SQLite and Postgres present.
 ## Why one copy deletes work
 
 The previous design was a `moka` L1 in front of a Valkey L2, with the L1 kept correct by server
-pushed invalidation. That is a correct design, and most of the machinery around it exists only
+pushed invalidation. That is a correct design, and most of the machinery around it existed only
 because there are two copies:
 
-- a dedicated RESP3 redirect connection that this project implements itself, because
+- a dedicated RESP3 redirect connection that this project implemented itself, because
   valkey-glide has no Rust client-side caching (its
   [#6918](https://github.com/valkey-io/valkey-glide/issues/6918) is open);
 - reconnect handling and a full L1 flush on reconnect, since a client cannot know what changed
@@ -69,8 +69,8 @@ costs reclamation and never correctness." An in-process store therefore needs no
 which was the single feature that made the Redis family uniquely suitable.
 
 **The read path is already generic.** `read_entities<S: OnlineStore>` is the only caller in the
-serving path, so which store is behind it does not touch the Python surface, the serving API, or
-the offline path.
+serving path, so which store is behind it does not touch the Python surface or the offline
+path.
 
 ## What was built
 

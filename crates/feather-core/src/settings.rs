@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroU64;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -212,26 +211,9 @@ impl Connection {
     }
 }
 
-/// Reserved for a possible in-process cache in front of Valkey.
+/// The default for a boolean setting whose default is `true`.
 ///
-/// Parsed and validated so a project can declare it, but no code path reads it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct L1Cache {
-    #[serde(default = "enabled_by_default")]
-    pub enabled: bool,
-    /// `None` leaves the capacity to the engine's default.
-    #[serde(default)]
-    pub max_capacity_mb: Option<NonZeroU64>,
-    /// `None` leaves the interval to the engine's default.
-    ///
-    /// With no cache and no invalidation, nothing falls back to this. The view's declared
-    /// `ttl_days` is what caps staleness: a read-time check makes an expired value read as
-    /// missing rather than as a stale one.
-    #[serde(default)]
-    pub fallback_ttl_seconds: Option<NonZeroU64>,
-}
-
+/// Named so `serde` can reference it, since `#[serde(default)]` on a `bool` gives `false`.
 fn enabled_by_default() -> bool {
     true
 }
@@ -316,8 +298,6 @@ pub struct Settings {
     pub connections: BTreeMap<String, Connection>,
     #[serde(default)]
     pub valkey: Option<Valkey>,
-    #[serde(default)]
-    pub l1_cache: Option<L1Cache>,
 }
 
 impl Settings {
@@ -594,11 +574,6 @@ ssl_mode = "verify-full"
 endpoint = "valkey-cluster.internal.svc:6379"
 tls = true
 field_expiration = true
-
-[l1_cache]
-enabled = true
-max_capacity_mb = 2048
-fallback_ttl_seconds = 30
 "#;
 
     /// A lookup that resolves only `SNOWFLAKE_PASSWORD` and `POSTGRES_PASSWORD`.
@@ -625,7 +600,6 @@ fallback_ttl_seconds = 30
         assert_eq!(settings.definitions, ["definitions/user_clicks.py"]);
         assert!(settings.connections.is_empty());
         assert!(settings.valkey.is_none());
-        assert!(settings.l1_cache.is_none());
     }
 
     #[test]
@@ -672,34 +646,6 @@ fallback_ttl_seconds = 30
         assert_eq!(valkey.endpoint, "valkey-cluster.internal.svc:6379");
         assert!(valkey.tls);
         assert!(valkey.field_expiration);
-
-        let l1 = settings.l1_cache.expect("l1");
-        assert!(l1.enabled);
-        assert_eq!(l1.max_capacity_mb.map(NonZeroU64::get), Some(2048));
-        assert_eq!(l1.fallback_ttl_seconds.map(NonZeroU64::get), Some(30));
-    }
-
-    #[test]
-    fn the_l1_cache_is_configured_without_valkey() {
-        let settings = parse_settings(&format!("{LOCAL}\n[l1_cache]\nmax_capacity_mb = 512\n"))
-            .expect("valid");
-
-        assert!(settings.valkey.is_none());
-        assert_eq!(
-            settings
-                .l1_cache
-                .expect("l1")
-                .max_capacity_mb
-                .map(NonZeroU64::get),
-            Some(512)
-        );
-    }
-
-    #[test]
-    fn the_l1_cache_defaults_to_enabled() {
-        let settings = parse_settings(&format!("{LOCAL}\n[l1_cache]\n")).expect("valid");
-
-        assert!(settings.l1_cache.expect("l1").enabled);
     }
 
     #[test]
@@ -960,13 +906,6 @@ fallback_ttl_seconds = 30
         let error = parse_settings(&text).expect_err("must fail");
 
         assert_eq!(error.to_string(), "valkey.endpoint must not be empty");
-    }
-
-    #[test]
-    fn a_zero_capacity_is_rejected() {
-        let text = format!("{LOCAL}\n[l1_cache]\nmax_capacity_mb = 0\n");
-
-        assert!(parse_settings(&text).is_err());
     }
 
     #[test]

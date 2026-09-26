@@ -42,5 +42,5 @@ pub use online::{
     EntityRequest, Missing, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues,
     WriteBatch, WrittenField, read_entities,
 };
-pub use settings::{Connection, L1Cache, Secret, Settings, Valkey, load_settings, parse_settings};
+pub use settings::{Connection, Secret, Settings, Valkey, load_settings, parse_settings};
 pub use value::{EncodedBatch, SchemaTag, arrow_type, decode_batch, encode_batch};
