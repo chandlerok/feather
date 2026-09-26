@@ -247,11 +247,12 @@ configuration belongs.
 
 #### Other language bindings
 
-The language that defines the features is the language that reads them. A Go binding exists so a
-Go project can declare its views in Go and read them in its own process, the same way the Python
-binding does. It links this crate the way the PyO3 crate does, so the key encoding, the value
-codec, the TTL check, and the point-in-time join stay one implementation rather than becoming one
-per language.
+The language that defines the features is the language that reads them. A Go binding is what a
+Go project needs to declare its views in Go and read them in its own process, the same way the
+Python binding does. There is no Go binding yet: the workspace has two members, `feather-core`
+and `feather-py`, and no Go source. When one is written it will link this crate the way the PyO3
+crate does, so the key encoding, the value codec, the TTL check, and the point-in-time join stay
+one implementation rather than becoming one per language.
 
 That is also the fastest arrangement available: a read is a call in the same process, with no
 server to reach and no hop to pay for. Serving from a separate process would add one, which is
@@ -389,8 +390,8 @@ Rejected encodings, and why:
 - **A per-value length prefix on fixed-width columns.** Doubles the metadata for no benefit,
   since the view's schema already fixes the stride.
 
-Because the server resolves the schema once at startup, decoding needs no per-value type
-dispatch. That is the point of the layout.
+Because the caller's declared views resolve the field set once, when they are constructed,
+decoding needs no per-value type dispatch. That is the point of the layout.
 
 #### Read path
 
