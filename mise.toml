@@ -25,7 +25,10 @@ run = ["uv sync --all-groups", "hk install --mise"]
 
 [tasks."build:wheel"]
 description = "Build the wheel into dist/, the artifact a user installs"
-run = ["maturin build --out dist"]
+# --strip, because the wheel is almost entirely DuckDB's symbol table: 255MB
+# unstripped, 24MB stripped, and PyPI refuses a file over 100MB. CI builds the
+# artifact the same way, so a local build without it is not the file that ships.
+run = ["maturin build --strip --out dist"]
 
 # ---------------------------------------------------------------- formatting
 
