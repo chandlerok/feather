@@ -289,6 +289,12 @@ jobs:
           cd my_feature_store
           feather demo
           feather refresh
+      # The README's join, on the data demo wrote. The row count and the
+      # per-column null count are the two things a newcomer would look at: a
+      # training set that lost rows, or one full of nulls, is not the same as the
+      # one the README describes. `DataFrame.null_count()` is not a scalar in
+      # polars 1.44, so the count is summed over the two feature columns rather
+      # than compared on the frame.
       - name: the README's join, on the data demo wrote
         run: |
           cd /tmp/run/my_feature_store
@@ -307,6 +313,10 @@ jobs:
               )
           )
           assert training_data.height == entity_df.height, "a label row was dropped"
-          assert training_data.null_count() == 0, training_data
+          missing = sum(
+              training_data[column].null_count()
+              for column in ("click_count", "purchase_count")
+          )
+          assert missing == 0, f"{missing} nulls in the joined features"
           print(training_data.head())
           PY
