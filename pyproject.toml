@@ -13,9 +13,22 @@ authors = [{ name = "Chandler King" }]
 classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",
+  # The support range is a claim a classifier makes, so it is spelled out rather
+  # than left to requires-python. 3.14 is named here because the floor is what
+  # ruff's target-version can express and the ceiling is what this list is for.
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = ["pydantic>=2.9"]
+
+[project.scripts]
+# One command, the one the README's first block runs. It is pure Python and
+# imports the compiled extension only for the calls that need it, so `feather
+# --help` works on an install whose extension failed to load.
+feather = "feather.cli:main"
 
 [dependency-groups]
 dev = [
@@ -31,6 +44,15 @@ manifest-path = "crates/feather-py/Cargo.toml"
 module-name = "feather._core"
 python-source = "python"
 python-packages = ["feather"]
+# One wheel for 3.11 through 3.14. pyo3 carries `abi3-py311`, and maturin reads
+# that feature to name the artifact `cp311-abi3`, so a 3.14 install resolves the
+# same file rather than a per-minor one. Nothing in the bindings needs a symbol
+# outside the limited API, which is what makes that true; the wheel CI job
+# asserts the tag so a change to the pyo3 features cannot quietly make it false.
+# The wheel ships bundled DuckDB, so it is large. That is the price of the user
+# compiling nothing, and the alternative is a per-interpreter build at install
+# time.
+#
 # Deliberately no `features = ["pyo3/extension-module"]`. For PyO3 >= 0.27 maturin
 # sets PYO3_BUILD_EXTENSION_MODULE itself, and enabling the feature statically
 # breaks `cargo test` linking.

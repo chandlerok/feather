@@ -18,6 +18,8 @@ use feather_core::Error as CoreError;
 use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 
+mod demo;
+
 #[cfg(feature = "offline")]
 use std::collections::{BTreeMap, HashMap};
 #[cfg(feature = "offline")]
@@ -993,6 +995,7 @@ fn arrow_error(error: arrow::error::ArrowError) -> PyErr {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(load_settings, m)?)?;
+    m.add_function(wrap_pyfunction!(demo::write_demo_data, m)?)?;
     #[cfg(feature = "offline")]
     {
         m.add_class::<FeatureStore>()?;

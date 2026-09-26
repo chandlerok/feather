@@ -566,6 +566,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "feather-core",
+ "parquet",
  "pyo3",
  "pyo3-arrow",
  "serde",

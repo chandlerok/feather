@@ -10,8 +10,9 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 > from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
-> catalog are design only. There is no served API yet and no published package, so the install
-> and `init` steps below describe the intended interface; the code after them runs.
+> catalog are design only. There is no served API yet, and the `feather` command is not on
+> PyPI either, so `pip install feather-py polars` is a line that will work rather than one that
+> works today; everything after it runs.
 
 ## Design goals
 
@@ -41,9 +42,10 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 ## Quickstart
 
 ```bash
-pip install feather-py
+pip install feather-py polars
 feather init my_feature_store
 cd my_feature_store
+feather demo
 ```
 
 `feather init` generates this workspace:
@@ -54,6 +56,11 @@ my_feature_store/
 └── definitions/
     └── user_clicks.py      # entities, sources, and feature views
 ```
+
+`feather demo` writes the two Parquet files the view reads, into `data/`. It is a separate
+command because a project that shipped with data in it would have that data deleted before
+the real thing was loaded. Its rows are dated from today rather than fixed, since the view
+below expires values after 30 days.
 
 Define features in `definitions/user_clicks.py`. A field's dtype is a type argument and its
 name is the attribute it is assigned to, so a reference to a feature is a checked attribute
@@ -108,18 +115,41 @@ feature. `pl.DataFrame` above converts it. A label row whose value is missing or
 instead. Anything exporting Arrow buffers is accepted, which a pandas frame is not until it
 has been converted.
 
-Both files are yours to supply; `init` does not create sample data.
+Both files are yours to supply; `feather demo` writes one plausible set, and both are
+ordinary Parquet you can replace.
 
 - `data/user_stats.parquet` is the **feature table** the view reads: one row per user per
   timestamp, holding `click_count` and `purchase_count`.
 - `data/training_labels.parquet` is the **label set**: one row per user per timestamp you
   want features for, plus the column you are training on. Each label row takes the newest
-  feature row for the same `user_id` at or before its own timestamp.
+  feature row for the same `user_id` at or before its own timestamp. The demo's target is
+  whether the user purchased the next day, which is not one of the columns carried back,
+  so the join cannot trivially give it away.
 
 The source is declared on the view, next to the fields it feeds, and it is a Parquet file or
 a table in a Postgres database named in `feather.toml`. The label set decides which
 rows exist and carries the target, so it is passed per call and changes with every
 experiment.
+
+## Serving the project
+
+```bash
+feather refresh
+```
+
+That writes each view's values into the online store, where `get_online_features` reads
+them. It is a refresh and not an apply: there is no apply step to expose, because the core
+reads `feather.toml` and the definition modules are imported rather than applied to
+anything. A full refresh overwrites every value, so a run that fails can simply be repeated,
+and a view a previous refresh declared and this one does not is retired by the run, which
+removes its fields from every entity that still carries them. Name views to refresh a
+subset: `feather refresh user_clicks`. That refreshes the project you are standing in, so
+from somewhere else pass `-C`: `feather refresh -C my_feature_store user_clicks`.
+
+A generated project declares no Valkey, so its online store is in-process and belongs to
+the `FeatureStore` that opened it: the values are there for the process that refreshed them
+and for nothing after it. A deployment that serves from more than one process puts a
+Valkey in `feather.toml`, and the same command writes to that instead.
 
 ## Going to production
 

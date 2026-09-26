@@ -18,6 +18,10 @@ arrow.workspace = true
 # from source, so every build of the extension now pays what this crate used to
 # avoid. It also means the Python CI job can no longer skip the C++ build.
 feather-core = { path = "../feather-core" }
+# For `feather demo`, which writes the two Parquet files the generated project
+# reads. Same version as arrow, for the same reason: two Arrow majors in one
+# process do not share types.
+parquet.workspace = true
 # No `extension-module` feature here on purpose. maturin sets
 # PYO3_BUILD_EXTENSION_MODULE for PyO3 >= 0.27, and enabling the feature
 # statically would stop `cargo test` from linking.

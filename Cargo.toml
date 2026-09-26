@@ -14,6 +14,10 @@ rust-version = "1.85"
 # 0.17 depends on arrow ^58. Mixing Arrow majors produces two incompatible sets of
 # types at the FFI boundary, so the whole stack shares one version.
 arrow = { version = "58", default-features = false }
+# The `arrow` feature is what the Parquet writer needs to take a RecordBatch;
+# without the compression features the files are stored plain, which is small
+# enough for the demo project and keeps this out of every build's dependency set.
+parquet = { version = "58", default-features = false, features = ["arrow"] }
 pyo3-arrow = { version = "0.17", default-features = false }
 
 duckdb = { version = "~1.10505.0", default-features = false }
