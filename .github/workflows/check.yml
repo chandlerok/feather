@@ -254,16 +254,18 @@ jobs:
             wait "$pid" || exit 1
           done
           df -h /
-      # Same key as the python job, on purpose: both build the extension with the
-      # dev profile and the same features, so the entry the python job's `uv sync`
-      # writes is exactly the one that makes this build quick. The repository has a
-      # 10GB budget shared across cache entries and a bundled DuckDB entry is
-      # gigabytes, so a third copy under this job's own id would be the wrong
-      # trade. Saving is left to main, for the reason the rust job gives.
+      # A key of its own, not the python job's. That job's `uv sync` builds the
+      # extension with the dev profile into target/debug, and this one builds
+      # target/release, so a restored entry from either is the wrong profile and
+      # makes neither build quick. Sharing the key was also a write conflict: on
+      # main both jobs would restore and save one entry over different profile
+      # subtrees, and the repository has a 10GB budget across entries, where a
+      # bundled DuckDB entry is gigabytes. Saving is left to main, for the
+      # reason the rust job gives.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: python
+          shared-key: wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # maturin needs an interpreter to build against, and whether a bare `python`
       # is on a runner's PATH is not something to depend on. The version does not
