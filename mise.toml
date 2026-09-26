@@ -18,6 +18,7 @@ maturin = "latest"
 # Dockerfile. cargo owns Rust, ruff owns Python.
 dprint = "latest"
 "cargo:bacon" = "latest"
+graphite = "latest"
 
 [tasks.setup]
 description = "Install Python deps and the git hook"
