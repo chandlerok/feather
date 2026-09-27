@@ -6,6 +6,23 @@ members = ["crates/feather-core", "crates/feather-py"]
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
+# The thing users install is a wheel from PyPI, not a crate from crates.io, and
+# the two are not interchangeable: `cargo publish` would put `feather-core` on
+# crates.io under this project's name, where nothing has weighed the API it
+# publishes, while the wheel ships the Python package whose import name
+# (`feather`) collides with an existing PyPI project.
+#
+# An invariant rather than a setting, so it holds for a crate added later
+# without anyone remembering this comment: `[workspace.package]` is inherited
+# by every member, and a member cannot publish unless it says otherwise. The
+# first `cargo publish` should be a deliberate one-line change to this file,
+# taken at the point it is wanted, not a default that was merely not
+# overridden.
+#
+# `publish = false` is not an error to build with. maturin builds the wheel
+# from `crates/feather-py` through this workspace, and neither key touches
+# `cargo build`.
+publish = false
 repository = "https://github.com/chandlerok/feather"
 rust-version = "1.85"
 

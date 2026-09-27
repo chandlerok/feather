@@ -9,6 +9,8 @@ import contextlib
 import importlib.util
 import os
 import re
+import resource
+import signal
 import subprocess
 import sys
 import tomllib
@@ -161,6 +163,36 @@ def add_second_view(project: Path) -> None:
     )
 
 
+@contextlib.contextmanager
+def write_fails_past(limit: int) -> Iterator[None]:
+    """Make every write that would take a file past `limit` bytes fail.
+
+    RLIMIT_FSIZE is the one way to fail a write part-way through from outside
+    the process making it, and the extension is loaded in-process here, so there
+    is no second process to fill a disk for it. The failure is a real one rather
+    than a simulated one: the kernel returns the same EFBIG a full disk raises,
+    so the writer takes the path it would take there.
+
+    Past the limit the kernel also sends SIGXFSZ, whose default action is to
+    kill the process, so the signal is ignored for the duration. Ignoring it is
+    what leaves the error for the writer to report instead of a dead test run.
+
+    Args:
+        limit: The largest a file may get, in bytes.
+
+    Yields:
+        Nothing. The limit and the previous handler are put back on the way out.
+    """
+    previous = resource.getrlimit(resource.RLIMIT_FSIZE)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, previous[1]))
+    ignored = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGXFSZ, ignored)
+        resource.setrlimit(resource.RLIMIT_FSIZE, previous)
+
+
 @pytest.fixture
 def project(tmp_path: Path) -> Path:
     """A generated project with the demo data written into it.
@@ -304,6 +336,52 @@ def test_demo_refuses_to_overwrite_and_force_does_not(project: Path) -> None:
     with pytest.raises(FileExistsError, match="--force"):
         demo(project)
     demo(project, force=True)
+
+
+def test_a_demo_write_that_fails_leaves_no_partial_parquet(tmp_path: Path) -> None:
+    """A failed write leaves `data/` empty, because a file is renamed into place whole.
+
+    The writer used to create `user_stats.parquet` and then write into it, so a
+    disk that filled up part-way through left a truncated Parquet under the name
+    the generated view reads. That is the file the next `feather demo` refuses to
+    overwrite and the file a refresh cannot read, and a truncated Parquet is
+    indistinguishable from a project that was created wrong.
+    """
+    generated = tmp_path / "store"
+    init(generated)
+    # Well under the feature table, which is 14 days of 250 users, and well over
+    # the Parquet header, so the failure lands in the middle of the data rather
+    # than at the first byte.
+    with write_fails_past(limit=4096), pytest.raises(OSError):
+        demo(generated)
+    assert list((generated / "data").iterdir()) == []
+
+
+def test_a_demo_that_fails_on_its_second_file_keeps_the_first_one_whole(tmp_path: Path) -> None:
+    """The atomicity is per file, and this is what choosing that looks like.
+
+    Two files cannot be renamed as a pair, so a `demo` that fails on the label
+    set leaves the feature table written and the labels not there. That is the
+    trade `write_parquet` makes deliberately, and the temporary file is gone
+    either way, so the failure leaves no file the project would try to read.
+    """
+    generated = tmp_path / "store"
+    init(generated)
+    # A directory where the label file goes, so the write itself succeeds and
+    # the rename is what cannot land. That is the other failure the cleanup
+    # covers, and `demo` checks for the name before it writes anything, so this
+    # also takes the `--force` path.
+    (generated / "data" / "training_labels.parquet").mkdir(parents=True)
+    with pytest.raises(OSError):
+        demo(generated, force=True)
+    features = pl.read_parquet(generated / "data" / "user_stats.parquet")
+    # 14 days of 250 users, so a feature table the writer did not finish fails
+    # here rather than reading back as a valid file with fewer rows in it.
+    assert features.height == 250 * 14
+    assert sorted(path.name for path in (generated / "data").iterdir()) == [
+        "training_labels.parquet",
+        "user_stats.parquet",
+    ]
 
 
 def test_the_demo_files_hold_the_columns_the_generated_view_declares(project: Path) -> None:
