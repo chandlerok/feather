@@ -35,8 +35,11 @@ on building to decide whether a change is correct.
 ## Give each tree its own target directory
 
 This section does not say whether to use worktrees; it covers the builds either way. Two trees get
-two `target/` directories unless something tells cargo otherwise, and nothing here does: there is no
-`.cargo/config.toml` in the tree and no `[env]` table in `mise.toml`. Keep it that way. Pointing
+two `target/` directories unless something tells cargo otherwise, and nothing here does: no
+`.cargo/config.toml` in the tree sets a `[build]` `target-dir`, and `mise.toml` declares no
+`CARGO_TARGET_DIR`. A `.cargo/config.toml` that only carries an `[env]` table does not change
+this, because cargo reads a target directory from `[build]`, not from the environment it hands
+the build. Keep it that way. Pointing
 several trees at one `CARGO_TARGET_DIR` does share the expensive part, because `libduckdb-sys` is a
 registry dependency and its artifact name does not depend on where the tree is. It also merges the
 trees' own crates, and that is not safe. Cargo leaves the absolute path out of the metadata hash on
