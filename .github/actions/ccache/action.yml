@@ -3,6 +3,14 @@ description: >-
   Restore the ccache directory a bundled DuckDB build fills, under a key that
   moves when the compiler, ccache, or the engine does.
 
+inputs:
+  profile:
+    description: >-
+      The cargo profile this job compiles at, `dev` or `release`. It is a key
+      segment rather than an afterthought, because it is the one thing two jobs
+      in this workflow do not have in common.
+    required: true
+
 outputs:
   key:
     description: The key the entry was looked up under, for actions/cache/save.
@@ -35,6 +43,19 @@ runs:
     # `CC = "ccache gcc"`, so `cc` is never what compiles anything here; keying
     # on whatever `cc` resolves to on PATH would key the build on a compiler
     # this repository does not use.
+    #
+    # The profile sits between the OS and the version tail, which is where the
+    # restore prefix has to be able to see it. A suffix on the end would keep
+    # one prefix for both profiles, so a DuckDB bump would fall back to the
+    # *other* profile's entry: gigabytes of objects this build cannot hit.
+    # Splitting here means a version bump falls back to this profile's own
+    # previous entry, and cross-profile only ever happens on a first run after
+    # this change, when the profile-less entries are gone.
+    #
+    # Size, since a second profile is a second entry: two entries against the
+    # repository's 10GB, each bounded by `CCACHE_MAXSIZE` (3G) because ccache
+    # trims its own directory rather than because anything trims the archive.
+    # The wheel job's own comment carries the argument for two and not three.
     - id: name
       shell: bash
       run: |
@@ -49,7 +70,7 @@ runs:
           echo "no ccache version on PATH" >&2
           exit 1
         fi
-        key="ccache-${{ runner.os }}-$(gcc -dumpfullversion)-$(g++ -dumpfullversion)-$ccache_version-$duckdb"
+        key="ccache-${{ runner.os }}-${{ inputs.profile }}-$(gcc -dumpfullversion)-$(g++ -dumpfullversion)-$ccache_version-$duckdb"
         echo "Restoring ccache under $key"
         echo "key=$key" >>"$GITHUB_OUTPUT"
 
@@ -61,8 +82,10 @@ runs:
         # The prefix, so a new compiler or a new DuckDB starts from the previous
         # entry rather than from nothing. ccache is content addressed, so a
         # restored entry that no longer matches is inert bytes and a partial
-        # hit rate, never a wrong object.
-        restore-keys: ccache-${{ runner.os }}-
+        # hit rate, never a wrong object. Scoped to the profile, so a bump
+        # degrades to this profile's older objects rather than to the other
+        # profile's.
+        restore-keys: ccache-${{ runner.os }}-${{ inputs.profile }}-
 
     # What the restore left, because an empty directory and a full one mean
     # opposite things to the job that follows. A job that asserts on hit count

@@ -110,14 +110,20 @@ jobs:
       # translation units, which is the 45 minutes. ccache caches those objects
       # by content, so a cargo miss with a ccache hit is a relink.
       #
-      # The same directory is restored by all three jobs that build DuckDB, under
-      # one key, so a Python job benefits from objects the rust job compiled and
-      # the other way round: ccache's hash covers the source and the flags, not
-      # the crate that asked for them. The two save into the same key, and the
-      # second one is skipped rather than failing, which is actions/cache's
-      # behaviour on a key that already exists.
+      # The rust job and both python matrix entries share the `dev` half of
+      # that pair, because they compile the same C++ at the same profile and so
+      # produce the same objects: ccache's hash covers the source and the flags,
+      # not the crate that asked for them, so a Python job benefits from objects
+      # the rust job compiled and the other way round. Three runners therefore
+      # save the same dev key and only the first one's save lands, which is
+      # actions/cache skipping a key that already exists. That is safe here and
+      # only here: the entries that compete hold the same content, so which of
+      # them wins changes nothing. The wheel job is the case where that is not
+      # true, and it has a key of its own; see the argument there.
       - id: ccache
         uses: ./.github/actions/ccache
+        with:
+          profile: dev
       # clippy is a component of the toolchain rather than a tool, so mise does
       # not treat it as missing, and a mise-action cache hit can leave it
       # uninstalled: the first run died on `cargo-fmt` not being installed for
@@ -239,8 +245,31 @@ jobs:
       # ccache is here rather than only in the rust job: `uv sync` spent 1034s
       # and 1592s in the two matrix entries of the run recorded in the cold
       # build issue, all of it recompiling the C++ the manifest did not change.
+      # `dev` for the reason the rust job's comment gives: this job builds the
+      # same C++ at the same profile the rust job does, and the two matrix
+      # entries below are the same job at two interpreters, so all three
+      # compete for one key holding one set of objects and it does not matter
+      # which of them writes it.
       - id: ccache
         uses: ./.github/actions/ccache
+        with:
+          profile: dev
+      # After the restore, before anything compiles. ccache keeps its counters
+      # inside its cache directory, and that directory is the whole of what the
+      # action above archived and restored, so on a warm run the counters are
+      # the previous run's. The regression the assertion below exists to catch
+      # is `CC` failing to reach maturin's cargo: `uv sync` then recompiles all
+      # 1,500 C++ units with no wrapper at all, ccache sees nothing, and its
+      # totals are exactly the restored ones, which are non-zero. The
+      # assertion would pass on precisely the build it was written to fail, and
+      # a green run would be a lie about the one claim this branch makes.
+      #
+      # After the restore rather than before it, and that ordering is the point
+      # rather than a detail: zeroing earlier is undone by the restore that
+      # follows it. Objects are untouched, so the restored entries stay
+      # hittable and a warm run still owes itself a hit.
+      - name: start the counters from zero
+        run: ccache --zero-stats
       - name: sync
         run: uv sync
       # The claim this branch exists for is that `uv sync` stops recompiling
@@ -261,23 +290,57 @@ jobs:
       # defect and a warm run that recompiles everything passes on a build that
       # took twenty minutes. There is no `|| true`: a false claim that survives
       # a green build is the failure mode worth paying a red build for.
+      #
+      # The counters are this build's and not the restore's, because of the
+      # `ccache --zero-stats` step above, which sits after the restore for
+      # exactly that reason. Both numbers are read once, from the first matching
+      # line, and a parse that does not produce a single integer is a hard
+      # failure rather than a zero: `[ "$x" -eq 0 ]` on a multi-line value
+      # returns 2, `set -e` does not fire inside an `if` condition, and the
+      # guard that was supposed to catch a miss would pass instead.
       - name: ccache reached the extension build
         run: |
           set -euo pipefail
           stats=$(ccache --show-stats)
           printf '%s\n' "$stats"
-          restored=${{ steps.ccache.outputs.entries }}
-          cacheable=$(printf '%s\n' "$stats" | sed -n 's/^ *Cacheable calls: *\([0-9][0-9]*\).*/\1/p')
-          if [ -z "$cacheable" ]; then
-            echo "ccache --show-stats printed no Cacheable calls line" >&2
-            exit 1
-          fi
+          restored="${{ steps.ccache.outputs.entries }}"
+          # `0,/re/` rather than `/re/`, so the range ends at the first match and
+          # exactly one line is printed. ccache's stats carry an indented
+          # `Hits:` sub-line under more than one call category, and a `sed
+          # s///p` over the whole output would concatenate them.
+          # The number is anchored to the end of the line so that a format
+          # change, a thousands separator or a unit suffix, leaves the line
+          # unsubstituted and trips the case below rather than yielding a
+          # truncated count that reads as a real one.
+          cacheable=$(printf '%s\n' "$stats" \
+            | sed -n '0,/^ *Cacheable calls:/{s/^ *Cacheable calls: *\([0-9][0-9]*\)[[:space:]]*$/\1/p;}')
+          case "$restored" in
+            '' | *[!0-9]*)
+              echo "ccache action reported a file count that is not an integer" >&2
+              exit 1
+              ;;
+          esac
+          case "$cacheable" in
+            '' | *[!0-9]*)
+              echo "no single Cacheable calls integer in ccache --show-stats" >&2
+              printf '%s\n' "$stats" >&2
+              exit 1
+              ;;
+          esac
           if [ "$cacheable" -eq 0 ]; then
             echo "uv sync compiled nothing through ccache: CC did not reach maturin's cargo" >&2
             exit 1
           fi
-          hits=$(printf '%s\n' "$stats" | sed -n 's/^ *Hits: *\([0-9][0-9]*\).*/\1/p')
-          if [ "$restored" -ne 0 ] && [ "${hits:-0}" -eq 0 ]; then
+          hits=$(printf '%s\n' "$stats" \
+            | sed -n '0,/^ *Hits:/{s/^ *Hits: *\([0-9][0-9]*\)[[:space:]]*$/\1/p;}')
+          case "$hits" in
+            '' | *[!0-9]*)
+              echo "no single Hits integer in ccache --show-stats" >&2
+              printf '%s\n' "$stats" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$restored" -ne 0 ] && [ "$hits" -eq 0 ]; then
             echo "restored $restored ccache files and this build hit none" >&2
             exit 1
           fi
@@ -357,15 +420,36 @@ jobs:
         with:
           shared-key: wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # Release objects, so this job's share of the ccache directory is a
-      # different set from the two dev-profile jobs: it is the only producer of
-      # the release-profile objects, and without the save at the end of this job
-      # nobody would produce them. The three jobs share one directory and one
-      # key, and the objects coexist rather than collide, because ccache hashes
-      # content and the release and dev builds differ in the flags that go into
-      # it.
+      # Release objects, and this job is the whole of the `release` half of the
+      # two entries the workflow keeps. A ccache object is keyed on the
+      # preprocessed source and the compiler flags, and target/release and
+      # target/debug differ in the flags, so neither profile's objects are hits
+      # for the other: one entry holding both would restore gigabytes this
+      # build cannot use and evict the ones it can, so the profile is a key
+      # segment and the restore prefix is scoped to it.
+      #
+      # Two entries and not three is the deliberate choice. A suffix per job
+      # would be three, and three archives of a 3G directory against a 10GB
+      # repository budget is the trade this workflow has already refused once,
+      # for the cargo entries, on the record at this job's rust-cache step
+      # above. Serialising the jobs instead was rejected for a worse reason:
+      # `needs:` makes a failing rust job skip the python job entirely, so a
+      # broken toolchain would take the interpreter coverage with it rather than
+      # reporting both, and ordering alone does not make the save
+      # deterministic anyway, because actions/cache keeps the *first* writer of
+      # a key, which is the wrong job to be the one that publishes the release
+      # objects.
+      #
+      # What makes this deterministic instead is that there is exactly one
+      # writer of this key. The dev key is raced for by three runners, and
+      # that is safe only because the entries that race hold the same objects;
+      # here the release objects are produced by this job alone, so the entry
+      # the key names is this job's directory by construction rather than by
+      # whichever runner finished first.
       - id: ccache
         uses: ./.github/actions/ccache
+        with:
+          profile: release
       # maturin needs an interpreter to build against, and whether a bare `python`
       # is on a runner's PATH is not something to depend on. The version does not
       # decide the wheel's tag, because abi3 reads it off the pyo3 feature, so this
@@ -451,8 +535,10 @@ jobs:
       # pull request writes a directory that is then thrown away with the
       # runner, and the repository's cache budget is 10GB across everything. Not
       # `always()`, so a failed build does not save objects from a build that
-      # did not finish. The second save under this key is skipped rather than
-      # failing, which is actions/cache's behaviour on a key that exists.
+      # did not finish. Nothing else writes this key, so unlike the dev entry
+      # this save is not a race with another job that happens to be running:
+      # either this job ran to the end and the release objects are published, or
+      # the entry does not exist and the next run is simply cold.
       - if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
