@@ -762,8 +762,7 @@ impl Engine {
         // returned, which leaves the connection usable. `forced_fetch_failure` stands in for
         // the panic a real fetch raises, so this branch is covered. That closes the coverage
         // gap, not the issue: #26 stays open because `stream_arrow` still panics instead of
-        // yielding an error, so the write path has to survive a panic rather than be handed
-        // one.
+        // yielding an error, and its fix removes this shim rather than making it safe.
         if matches!(&result, Err(Error::StreamInterrupted { .. })) {
             self.discard_connection();
         }
