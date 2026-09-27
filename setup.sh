@@ -23,7 +23,9 @@ fi
 # never mentions trust. Sharing across worktrees usually makes this a no-op.
 mise trust
 
-# Installs rust 1.98.1 (with rustfmt and clippy), uv, hk, ruff, maturin, dprint, bacon.
+# Installs rust 1.98.1 (with rustfmt and clippy), ccache, uv, hk, ruff, maturin,
+# dprint, bacon. ccache is not optional: `.cargo/config.toml` points CC and CXX
+# at it, so a build without it fails.
 mise install
 
 # The two halves of `mise run setup`, except that the Python environment is

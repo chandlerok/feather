@@ -1,0 +1,24 @@
+# Bundled DuckDB is a C++ build of about 1,500 translation units, and it is most
+# of what a cold `cargo` invocation costs: around 45 minutes of the rust job's
+# cold run, and the whole of a Python job's `uv sync` after a Cargo.lock change.
+# ccache makes the second build of those units nearly free, and its directory at
+# `~/.cache/ccache` is per user rather than per worktree, so a worktree-per-agent
+# setup shares it without any of them sharing a target directory.
+#
+# Here rather than in the workflow's `env:`, and that is the whole reason for
+# the location. rust-cache folds every variable whose name starts with CARGO, CC,
+# CFLAGS, CXX, CMAKE or RUST into its cache key, so a job that set CC in its own
+# environment would miss the 2.3GB cargo entry it had already saved. A `[env]`
+# table is read by cargo and by the build scripts it runs, never by the action,
+# so the keys the existing entries were saved under do not move.
+#
+# Not `force = true`: an environment variable the developer or a script already
+# exported wins, which is how a one-off `CC=clang cargo test` still works.
+[env]
+CC = "ccache gcc"
+CXX = "ccache g++"
+# A budget rather than a size. CI uploads this directory to the repository's
+# Actions cache, which shares 10GB with the cargo entries, and a full bundled
+# build's objects are around a gigabyte. The measured size is in the cold-build
+# comment in the workflow.
+CCACHE_MAXSIZE = "3G"

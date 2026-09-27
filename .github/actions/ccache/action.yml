@@ -1,0 +1,47 @@
+name: ccache
+description: >-
+  Restore the ccache directory a bundled DuckDB build fills, under a key that
+  moves when the compiler or the engine does.
+
+outputs:
+  key:
+    description: The key the entry was looked up under, for actions/cache/save.
+    value: ${{ steps.name.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    # Nothing about this workspace's own manifests goes into the key, which is
+    # the point: a Cargo.lock change re-keys every cargo entry rust-cache owns,
+    # and re-keying this one is what makes a Python job spend twenty minutes
+    # inside `uv sync` compiling a DuckDB that has not changed.
+    #
+    # The compiler and the `libduckdb-sys` version are in it because ccache's own
+    # hash covers both, and because actions/cache skips the save on an exact key
+    # match. An entry written under a key that outlived its compiler would be
+    # all misses and would never be rewritten, so it would be stale for good
+    # rather than merely old. Reading the version out of Cargo.lock rather than
+    # writing it here means a dependency bump cannot forget this.
+    - id: name
+      shell: bash
+      run: |
+        set -euo pipefail
+        duckdb=$(sed -n '/^name = "libduckdb-sys"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)
+        if [ -z "$duckdb" ]; then
+          echo "no libduckdb-sys version in Cargo.lock" >&2
+          exit 1
+        fi
+        key="ccache-${{ runner.os }}-$(cc -dumpfullversion)-$(c++ -dumpfullversion)-$duckdb"
+        echo "Restoring ccache under $key"
+        echo "key=$key" >>"$GITHUB_OUTPUT"
+
+    # renovate: datasource=github-tags depName=actions/cache
+    - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.cache/ccache
+        key: ${{ steps.name.outputs.key }}
+        # The prefix, so a new compiler or a new DuckDB starts from the previous
+        # entry rather than from nothing. ccache is content addressed, so a
+        # restored entry that no longer matches is inert bytes and a partial
+        # hit rate, never a wrong object.
+        restore-keys: ccache-${{ runner.os }}-

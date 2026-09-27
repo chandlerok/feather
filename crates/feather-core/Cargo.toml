@@ -26,9 +26,19 @@ tracing.workspace = true
 # int64 microseconds and compared with integer arithmetic instead, which avoids
 # ICU entirely and is also faster.
 #
-# CI can skip the C++ build with DUCKDB_DOWNLOAD_LIB=1, which fetches a prebuilt
-# library; that requires NOT enabling `bundled` and needs the dylib on the
-# runtime search path.
+# `DUCKDB_DOWNLOAD_LIB=1` fetches a prebuilt library instead of compiling this
+# one, and it was measured rather than assumed, against the pinned 1.10505.0
+# (DuckDB 1.5.5). It does not work here. The build script emits a
+# `-Wl,-rpath` for the directory it downloaded into, but cargo does not
+# propagate `rustc-link-arg` to a dependent crate's link step, so the result has
+# `NEEDED libduckdb.so` and no RUNPATH at all: the binary and a dlopen'ed
+# extension both die with "cannot open shared object file" unless
+# `LD_LIBRARY_PATH` names the directory. `DUCKDB_STATIC=1` is worse, because the
+# `libduckdb_static.a` in the same archive references
+# `duckdb::ExtensionHelper::LoadAllExtensions` without defining it, so the link
+# fails. And the wheel has to stay self-contained, which rules the flag out
+# there whatever the loader does. The lever that works is caching the objects,
+# which is what `.cargo/config.toml` does.
 duckdb = { workspace = true, optional = true, features = [
   "bundled",
   "parquet",

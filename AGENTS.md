@@ -36,9 +36,14 @@ on building to decide whether a change is correct.
 
 This section does not say whether to use worktrees; it covers the builds either way. Two trees get
 two `target/` directories unless something tells cargo otherwise, so the bundled DuckDB build runs
-once per tree. Nothing overrides that today: there is no cargo configuration file in the tree and no
-`[env]` table in `mise.toml`. Set the shared path durably, in a committed `.cargo/config.toml` under
-`[build] target-dir` or in `mise.toml` under `[env]` as `CARGO_TARGET_DIR`; an `export` covers
+once per tree. The C++ objects inside those builds are shared now, which is most of what made the
+duplication expensive: `.cargo/config.toml` points `CC` and `CXX` at ccache, whose directory is per
+user rather than per tree, so a second tree relinks `libduckdb.a` rather than recompiling it. What
+is still duplicated is the 1.8GB archive and the Rust units around it. Nothing overrides the
+`target/` path today: the `.cargo/config.toml` in the tree carries an `[env]` table and no
+`[build]` one, and `mise.toml` declares no `CARGO_TARGET_DIR`. Set the shared path durably, in a
+committed `.cargo/config.toml` under `[build] target-dir` or in `mise.toml` under `[env]` as
+`CARGO_TARGET_DIR`; an `export` covers
 neither a subagent nor your next shell, and the path is machine-specific, so it is a
 repository-level change, not one a tree commits for itself. Whether sharing is safe across trees
 with different sources is unresolved; #43 settles it.
@@ -57,6 +62,11 @@ target=/path/to/a/shared/target
 pgrep -l cargo                                  # a build here means wait
 for p in debug release; do du -sh "$target/$p/build/libduckdb-sys-"*/ 2>/dev/null | sort -rh | tail -n +3 | cut -f2- | xargs rm -rf; done
 ```
+
+`DUCKDB_DOWNLOAD_LIB=1` is not the way out of any of this. It was measured on the pinned
+`libduckdb-sys` 1.10505.0 and the result is recorded in `crates/feather-core/Cargo.toml`: the
+prebuilt path leaves the binary with no RUNPATH, and the static archive in the same zip does not
+link. Read that comment before spending a run on it.
 
 ## Do not build locally to check a change; CI is the gate
 
@@ -90,10 +100,10 @@ Do not wait on a build or a CI run in the foreground; watch it in the background
 
 ## Pushing and the CI gate
 
-Push the branch and open the pull request; the four checks on it (`lint`, `rust`, `python 3.11`,
-`python 3.14`) are the gate. `check.yml` triggers on pushes to `main` only, which the pre-push hook
-blocks, so a push to a branch with no pull request runs nothing; a pull request runs against its
-merge ref, so it validates against current `main`. `main` takes no direct pushes; the
+Push the branch and open the pull request; the checks on it (`lint`, `rust`, `python 3.11`,
+`python 3.14`, and `wheel`) are the gate. `check.yml` triggers on pushes to `main` only, which the
+pre-push hook blocks, so a push to a branch with no pull request runs nothing; a pull request runs
+against its merge ref, so it validates against current `main`. `main` takes no direct pushes; the
 [README](README.md) "Contributing" section explains the hook. A new worktree's `mise.toml` is
 untrusted, so its `hk` pre-push hook fails with a mise error that never names mise until
 `mise trust` is run there once. Run `mise trust` in your own worktree, or push by sha from a tree

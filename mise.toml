@@ -8,6 +8,11 @@
 # lands and quietly turns the next run into a from-source DuckDB build. The
 # version is the one CI already resolved; bumping it is a deliberate cache reset.
 rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
+# Not a build tool cargo knows about: `.cargo/config.toml` points CC and CXX at
+# it, so a build with ccache is fast and a build without it fails outright.
+# Declared here so `mise install` covers it, which is also how CI gets it: the
+# runner image does not carry ccache, and apt would be the alternative.
+ccache = "latest"
 uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
 # from the schema it loads.

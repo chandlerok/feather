@@ -105,6 +105,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The other half of the cold build. This job's 2.3GB cargo entry holds the
+      # 1.8GB libduckdb.a, and a miss means recompiling about 1,500 C++
+      # translation units, which is the 45 minutes. ccache caches those objects
+      # by content, so a cargo miss with a ccache hit is a relink.
+      #
+      # The same directory is restored by all three jobs that build DuckDB, under
+      # one key, so a Python job benefits from objects the rust job compiled and
+      # the other way round: ccache's hash covers the source and the flags, not
+      # the crate that asked for them. The two save into the same key, and the
+      # second one is skipped rather than failing, which is actions/cache's
+      # behaviour on a key that already exists.
+      - id: ccache
+        uses: ./.github/actions/ccache
       # clippy is a component of the toolchain rather than a tool, so mise does
       # not treat it as missing, and a mise-action cache hit can leave it
       # uninstalled: the first run died on `cargo-fmt` not being installed for
@@ -140,6 +153,16 @@ jobs:
       - name: services down
         if: always()
         run: docker compose down -v
+      # After the build, and only from main, for the reason the restore's key
+      # gives: an entry written by a pull request is keyed on a compiler and a
+      # DuckDB that the next run may not have, and the repository's cache budget
+      # is 10GB across everything. Not `always()`, so a failed build does not
+      # save a directory full of objects from a build that did not finish.
+      - if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.key }}
 
   python:
     name: python ${{ matrix.python }}
@@ -193,6 +216,12 @@ jobs:
       # extension.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The job this one hurts most when a cache misses, so it is the reason
+      # ccache is here rather than only in the rust job: `uv sync` spent 1034s
+      # and 1592s in the two matrix entries of the run recorded in the cold
+      # build issue, all of it recompiling the C++ the manifest did not change.
+      - id: ccache
+        uses: ./.github/actions/ccache
       - name: sync
         run: uv sync
       # Gating, and not covered by pytest: tests/test_typing_contract.py pins
@@ -217,6 +246,11 @@ jobs:
       - name: services down
         if: always()
         run: docker compose down -v
+      - if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.key }}
 
   # The publishable artifact, and the README's first block run against it. The
   # wheel is what a user installs, so the source tree is not what this job
@@ -266,6 +300,10 @@ jobs:
         with:
           shared-key: wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Release objects, so this job's share of the ccache directory is a
+      # different set from the two dev-profile jobs and only this job fills it.
+      - id: ccache
+        uses: ./.github/actions/ccache
       # maturin needs an interpreter to build against, and whether a bare `python`
       # is on a runner's PATH is not something to depend on. The version does not
       # decide the wheel's tag, because abi3 reads it off the pyo3 feature, so this
@@ -346,3 +384,82 @@ jobs:
           assert missing == 0, f"{missing} nulls in the joined features"
           print(training_data.head())
           PY
+
+  # TEMPORARY. This job exists to put a number on the cold build, and it is
+  # deleted before the branch merges. It restores no cargo cache and manages its
+  # own target directory, because a cold number is the claim and a restored
+  # entry would quietly turn the job into a warm one.
+  #
+  # Three builds, each into an empty target/, all of them the rust job's own two
+  # commands:
+  #
+  #   1. ccache disabled. What a cache miss costs on the workflow as it stands.
+  #      `CCACHE_DISABLE=1` leaves the compiler wrapper in place and stops it
+  #      caching, so the compiler, the flags and the feature set are exactly
+  #      what the rust job runs today, and the cost of the wrapper itself is not
+  #      folded into the baseline.
+  #   2. ccache enabled and empty. The same work, and the price of the entry
+  #      being missing: this is what a fork's first run and an evicted cache pay
+  #      after this change.
+  #   3. ccache enabled and populated, target/ empty. A cargo cache miss with
+  #      the objects still there, which is the case this change is for.
+  #
+  # `cargo test --no-run` rather than `cargo test`, because no service is
+  # started here and the build is what the number is about. The suites' own
+  # runtime is a few minutes and does not move with any of this.
+  cold-measure:
+    name: cold measure
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "1"
+    steps:
+      # renovate: datasource=github-tags depName=actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # renovate: datasource=github-tags depName=jdx/mise-action
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+      - name: free disk space
+        run: |
+          pids=()
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup; do
+            sudo rm -rf "$dir" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid" || exit 1
+          done
+          df -h /
+      - name: the three builds
+        run: |
+          set -euo pipefail
+
+          clippy_and_build() {
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+            cargo test --workspace --all-features --no-run
+          }
+
+          # $1 labels the phase, $2 is `disabled` for the baseline. The size and
+          # the counters after each phase are what set CCACHE_MAXSIZE and show
+          # whether the third build really hit.
+          phase() {
+            local label="$1" start
+            if [ "${2:-}" = disabled ]; then
+              export CCACHE_DISABLE=1
+            else
+              unset CCACHE_DISABLE
+            fi
+            rm -rf target
+            start=$SECONDS
+            clippy_and_build
+            echo "RESULT $label: $(( SECONDS - start ))s"
+            du -sh ~/.cache/ccache
+            ccache --show-stats | grep -Ei 'hit|miss|direct|cacheable' || true
+            df -h /
+          }
+
+          ccache --version
+          phase "cold, ccache disabled" disabled
+          phase "cold, ccache empty"
+          phase "cold target, ccache warm"
