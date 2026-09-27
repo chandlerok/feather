@@ -987,8 +987,8 @@ fn next_batch(rows: &mut Arrow<'_>, view: &str) -> Result<Option<RecordBatch>> {
     })
 }
 
-/// The [`next_batch`] call to fail on, counted from the first. `0` disables it, which is what
-/// every test in this file but the ones that ask for a failure sees.
+// The [`next_batch`] call to fail on, counted from the first. `0` disables it, which is what
+// every test in this file but the ones that ask for a failure sees.
 #[cfg(test)]
 thread_local! {
     static FORCED_FETCH_FAILURE: Cell<u32> = const { Cell::new(0) };
