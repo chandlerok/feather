@@ -179,13 +179,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # No disk cleanup here, unlike the rust job. It was added for the 2267MB
-      # entry this job restored while the two jobs shared one cargo cache key,
-      # and that is what filled the disk: the runner died with "No space left on
-      # device" writing its own diagnostic log, part way through the restore,
-      # which is also why the job's log was missing rather than showing an
-      # error. The keys are separate again and this job's entry is 326MB, so the
-      # cleanup stays where it belongs.
+      # Disk cleanup here again, unlike before this branch and like the rust and
+      # wheel jobs. It was removed because this job's own cargo entry is 326MB
+      # and used to be the largest thing on the disk, after a run died with "No
+      # space left on device" writing its own diagnostic log part way through the
+      # restore while the two jobs still shared one cargo cache key. Both
+      # reasons are now smaller than the one that replaces them: the ccache
+      # entry restored below is up to 3GB, and `CCACHE_MAXSIZE` bounds what
+      # ccache writes, not what actions/cache extracts, so the cap has not been
+      # applied at the moment the archive is unpacked. The alternative was
+      # restoring less, and there is nothing to cut: a partial ccache directory
+      # is a partial hit rate, and this job is the one whose whole reason for
+      # being here is the 1034s and 1592s of `uv sync` this is meant to remove.
+      # The deletion is the same one the rust and wheel jobs run, measured at
+      # 82s there against 127s for the sequential form.
+      - name: free disk space
+        run: |
+          pids=()
+          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup; do
+            sudo rm -rf "$dir" &
+            pids+=("$!")
+          done
+          for pid in "${pids[@]}"; do
+            wait "$pid" || exit 1
+          done
+          df -h /
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # astral-sh/setup-uv, pinned at v10.2.0
@@ -224,6 +243,44 @@ jobs:
         uses: ./.github/actions/ccache
       - name: sync
         run: uv sync
+      # The claim this branch exists for is that `uv sync` stops recompiling
+      # unchanged C++, and nothing in this repository establishes that it does.
+      # `CC` is set in `.cargo/config.toml`, and cargo finds that file by walking
+      # up from the working directory, not from the manifest path. This job
+      # reaches cargo through uv's PEP 517 build, so what decides the question is
+      # the working directory maturin hands cargo, which is maturin's behaviour
+      # and not something this tree can assert. So the build asserts it, after
+      # the fact, from ccache's own counters.
+      #
+      # Both conditions are checked, and they are not the same condition.
+      # `Cacheable calls` is non-zero on every run, cold included: it says the
+      # extension build compiled through ccache at all, which is the part that
+      # can silently not happen. A hit is only owed when the restore left
+      # something to hit, so that is gated on the restore having been
+      # non-empty. Without both, a cold run fails for a reason that is not a
+      # defect and a warm run that recompiles everything passes on a build that
+      # took twenty minutes. There is no `|| true`: a false claim that survives
+      # a green build is the failure mode worth paying a red build for.
+      - name: ccache reached the extension build
+        run: |
+          set -euo pipefail
+          stats=$(ccache --show-stats)
+          printf '%s\n' "$stats"
+          restored=${{ steps.ccache.outputs.entries }}
+          cacheable=$(printf '%s\n' "$stats" | sed -n 's/^ *Cacheable calls: *\([0-9][0-9]*\).*/\1/p')
+          if [ -z "$cacheable" ]; then
+            echo "ccache --show-stats printed no Cacheable calls line" >&2
+            exit 1
+          fi
+          if [ "$cacheable" -eq 0 ]; then
+            echo "uv sync compiled nothing through ccache: CC did not reach maturin's cargo" >&2
+            exit 1
+          fi
+          hits=$(printf '%s\n' "$stats" | sed -n 's/^ *Hits: *\([0-9][0-9]*\).*/\1/p')
+          if [ "$restored" -ne 0 ] && [ "${hits:-0}" -eq 0 ]; then
+            echo "restored $restored ccache files and this build hit none" >&2
+            exit 1
+          fi
       # Gating, and not covered by pytest: tests/test_typing_contract.py pins
       # the typed definition API with assert_type and with
       # `# pyrefly: ignore[kind]`, which pyrefly rejects once the ignore stops
@@ -301,7 +358,12 @@ jobs:
           shared-key: wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Release objects, so this job's share of the ccache directory is a
-      # different set from the two dev-profile jobs and only this job fills it.
+      # different set from the two dev-profile jobs: it is the only producer of
+      # the release-profile objects, and without the save at the end of this job
+      # nobody would produce them. The three jobs share one directory and one
+      # key, and the objects coexist rather than collide, because ccache hashes
+      # content and the release and dev builds differ in the flags that go into
+      # it.
       - id: ccache
         uses: ./.github/actions/ccache
       # maturin needs an interpreter to build against, and whether a bare `python`
@@ -384,11 +446,25 @@ jobs:
           assert missing == 0, f"{missing} nulls in the joined features"
           print(training_data.head())
           PY
+      # After the build, and only from main, for the reason the restore's key
+      # gives and the wheel job's own rust-cache entry above already gives: a
+      # pull request writes a directory that is then thrown away with the
+      # runner, and the repository's cache budget is 10GB across everything. Not
+      # `always()`, so a failed build does not save objects from a build that
+      # did not finish. The second save under this key is skipped rather than
+      # failing, which is actions/cache's behaviour on a key that exists.
+      - if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ steps.ccache.outputs.key }}
 
   # TEMPORARY. This job exists to put a number on the cold build, and it is
-  # deleted before the branch merges. It restores no cargo cache and manages its
-  # own target directory, because a cold number is the claim and a restored
-  # entry would quietly turn the job into a warm one.
+  # deleted before the branch merges, so it is not part of the gate an agent is
+  # waiting on and it is listed in AGENTS.md as scaffolding rather than as a
+  # check. It restores no cargo cache and manages its own target directory,
+  # because a cold number is the claim and a restored entry would quietly turn
+  # the job into a warm one.
   #
   # Three builds, each into an empty target/, all of them the rust job's own two
   # commands:

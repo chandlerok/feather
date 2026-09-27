@@ -21,4 +21,12 @@ CXX = "ccache g++"
 # Actions cache, which shares 10GB with the cargo entries, and a full bundled
 # build's objects are around a gigabyte. The measured size is in the cold-build
 # comment in the workflow.
+#
+# It bounds what ccache writes and not one byte of what actions/cache restores:
+# the cap is read by ccache, and by the time ccache reads it the archive has
+# already been extracted, so a job can pull back a directory larger than this
+# line. That is why the python job carries a `free disk space` step even though
+# its own cargo entry is small. It is not a reason to cap the restore: a
+# truncated ccache directory is a partial hit rate, and that job is the one
+# this whole mechanism is for.
 CCACHE_MAXSIZE = "3G"

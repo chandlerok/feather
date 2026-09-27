@@ -12,7 +12,20 @@ rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
 # it, so a build with ccache is fast and a build without it fails outright.
 # Declared here so `mise install` covers it, which is also how CI gets it: the
 # runner image does not carry ccache, and apt would be the alternative.
-ccache = "latest"
+#
+# Pinned, for the reason rust is pinned just above and with more force: if the
+# ccache version were floating, it would not even be in the Actions cache key,
+# which is what makes the rest of the argument bite. ccache's on-disk format is
+# its own version, so a directory written by one major is not readable by the
+# next. A floating `latest` that installed a new ccache would compute the same
+# `ccache-Linux-...` key, restore the old directory, be refused every entry in
+# it, and then skip the save because actions/cache does not overwrite an exact
+# key. The cache goes inert, silently, and the job gets slower while green.
+# 4.14.1 is the release GitHub reports as latest (ccache/ccache, checked while
+# fixing this); bumping it is a deliberate cache reset. The key reads the
+# version that is installed rather than the one written here, so the two cannot
+# drift apart silently.
+ccache = "4.14.1"
 uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
 # from the schema it loads.

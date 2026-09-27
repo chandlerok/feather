@@ -101,7 +101,9 @@ Do not wait on a build or a CI run in the foreground; watch it in the background
 ## Pushing and the CI gate
 
 Push the branch and open the pull request; the checks on it (`lint`, `rust`, `python 3.11`,
-`python 3.14`, and `wheel`) are the gate. `check.yml` triggers on pushes to `main` only, which the
+`python 3.14`, and `wheel`) are the gate. A `cold measure` job also appears on the pull request while
+the ccache branch is open: it is temporary scaffolding, it times three cold builds, and it is not
+part of the gate. `check.yml` triggers on pushes to `main` only, which the
 pre-push hook blocks, so a push to a branch with no pull request runs nothing; a pull request runs
 against its merge ref, so it validates against current `main`. `main` takes no direct pushes; the
 [README](README.md) "Contributing" section explains the hook. A new worktree's `mise.toml` is

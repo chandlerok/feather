@@ -1,12 +1,17 @@
 name: ccache
 description: >-
   Restore the ccache directory a bundled DuckDB build fills, under a key that
-  moves when the compiler or the engine does.
+  moves when the compiler, ccache, or the engine does.
 
 outputs:
   key:
     description: The key the entry was looked up under, for actions/cache/save.
     value: ${{ steps.name.outputs.key }}
+  entries:
+    description: >-
+      How many files the restore actually left behind, so a job can tell a cold
+      entry it has no reason to miss from a warm one it failed to hit.
+    value: ${{ steps.state.outputs.entries }}
 
 runs:
   using: composite
@@ -16,12 +21,20 @@ runs:
     # and re-keying this one is what makes a Python job spend twenty minutes
     # inside `uv sync` compiling a DuckDB that has not changed.
     #
-    # The compiler and the `libduckdb-sys` version are in it because ccache's own
-    # hash covers both, and because actions/cache skips the save on an exact key
-    # match. An entry written under a key that outlived its compiler would be
-    # all misses and would never be rewritten, so it would be stale for good
-    # rather than merely old. Reading the version out of Cargo.lock rather than
-    # writing it here means a dependency bump cannot forget this.
+    # The compiler, ccache itself and the `libduckdb-sys` version are in it
+    # because ccache's own hash covers all three, and because actions/cache
+    # skips the save on an exact key match. An entry written under a key that
+    # outlived its compiler or its cache was stale for good rather than merely
+    # old: a new ccache computing an old key restores the old directory, is
+    # refused every entry in it, and then never overwrites it. That is silent,
+    # which is why the key moves when ccache does even though the objects it
+    # holds do not. Reading the version out of Cargo.lock rather than writing it
+    # here means a dependency bump cannot forget this.
+    #
+    # `gcc` and `g++` by name, not `cc` and `c++`. `.cargo/config.toml` sets
+    # `CC = "ccache gcc"`, so `cc` is never what compiles anything here; keying
+    # on whatever `cc` resolves to on PATH would key the build on a compiler
+    # this repository does not use.
     - id: name
       shell: bash
       run: |
@@ -31,7 +44,12 @@ runs:
           echo "no libduckdb-sys version in Cargo.lock" >&2
           exit 1
         fi
-        key="ccache-${{ runner.os }}-$(cc -dumpfullversion)-$(c++ -dumpfullversion)-$duckdb"
+        ccache_version=$(ccache --version | sed -n '1s/^ccache version \([0-9][0-9.]*\).*$/\1/p')
+        if [ -z "$ccache_version" ]; then
+          echo "no ccache version on PATH" >&2
+          exit 1
+        fi
+        key="ccache-${{ runner.os }}-$(gcc -dumpfullversion)-$(g++ -dumpfullversion)-$ccache_version-$duckdb"
         echo "Restoring ccache under $key"
         echo "key=$key" >>"$GITHUB_OUTPUT"
 
@@ -45,3 +63,20 @@ runs:
         # restored entry that no longer matches is inert bytes and a partial
         # hit rate, never a wrong object.
         restore-keys: ccache-${{ runner.os }}-
+
+    # What the restore left, because an empty directory and a full one mean
+    # opposite things to the job that follows. A job that asserts on hit count
+    # has to know which of the two it got, or it fails every cold run for a
+    # reason that is not a defect. Counting files rather than testing the
+    # directory exists, because actions/cache creates `~/.cache/ccache` on a
+    # miss.
+    - id: state
+      shell: bash
+      run: |
+        set -euo pipefail
+        entries=0
+        if [ -d ~/.cache/ccache ]; then
+          entries=$(find ~/.cache/ccache -type f | wc -l)
+        fi
+        echo "ccache restored $entries files"
+        echo "entries=$entries" >>"$GITHUB_OUTPUT"
