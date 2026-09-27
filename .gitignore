@@ -7,3 +7,27 @@ __pycache__/
 *.dylib
 dist/
 .mise/
+
+# What following the README *in this clone* leaves behind, rather than in a
+# directory beside it. The quickstart says `feather init my_feature_store`, so
+# the intended shape keeps all three out of the repository root; this is for
+# the developer who runs the commands here instead.
+#
+# `feather.toml` is the one that matters rather than the tidiest. It has
+# `password` and `secret` fields, the settings schema resolves them from
+# `${ENV_VAR}` and the architecture doc calls a literal secret in this file a
+# bug, but the field still accepts a literal. An unignored settings file is a
+# credential one `git add -A` from being published, and it is the kind of file
+# that gets created by running the quickstart, which is the first thing anyone
+# does after cloning. Nothing here is needed by the test suite: no
+# `feather.toml` is tracked, and the tests that read one build it under
+# `tmp_path`.
+feather.toml
+definitions/
+data/
+
+.env
+.env.*
+!.env.example
+
+.pytest_cache/
