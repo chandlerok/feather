@@ -171,8 +171,9 @@ being a typed field that serde would reject as a bare "unknown variant".
 
 **Sort and partition a feature source by `(entity key, event_timestamp)`.** The recommendation
 stands, and it is the one thing feather should tell users about how to land feature data: it
-costs nothing in dependencies, it is format-independent, and it made the point-in-time join
-about a quarter faster on 31.5% fewer bytes read.
+costs nothing in dependencies, it is format-independent, and it makes the point-in-time join
+read 31.5% fewer bytes. The byte counts in the table below are measured; the join times are
+not, and the table marks which is which.
 
 **The reason the first draft gave for it was wrong**, and the correction matters to anyone
 choosing a layout. The claim was that sorting lets DuckDB skip row groups for the key range.
@@ -189,33 +190,34 @@ seven runs, DuckDB 1.105.05. `half` labels are over the lower half of the key sp
 and `full` over every other key (stride 2), so `full` reaches the top of the key space without
 covering all of it.
 
-| Figure                          | unsorted     | sorted       | sorted wins by |
-| ------------------------------- | ------------ | ------------ | -------------- |
-| file size                       | 20,887,564 B | 14,495,033 B | 30.6%          |
-| bytes read by the join          | 20,545,535 B | 14,068,158 B | 31.5%          |
-| row groups wholly out of range  | 0 of 16      | 8 of 16      | —              |
-| join, labels over half the keys | 174.4 ms     | 138.9 ms     | 1.26x †        |
-| join, labels over every key     | 178.9 ms     | 142.4 ms     | 1.26x †        |
+| Figure                              | unsorted     | sorted       | sorted wins by |
+| ----------------------------------- | ------------ | ------------ | -------------- |
+| file size                           | 20,887,564 B | 14,495,033 B | 30.6%          |
+| bytes read by the join              | 20,545,535 B | 14,068,158 B | 31.5%          |
+| row groups wholly out of range      | 0 of 16      | 8 of 16      | —              |
+| join, labels over half the keys †   | 174.4 ms     | 138.9 ms     | not measured † |
+| join, labels over every other key † | 178.9 ms     | 142.4 ms     | not measured † |
 
 **† The two join times are stale and must be re-measured before they are quoted.** The run
 that produced them gave the label frame timestamps that fell below the feature rows' timestamps
 for their key, so a single label of 500,000 matched anything: the figure is a
-decode-and-build-side-sort ratio, not a point-in-time join. The bytes and the file sizes are
-decode-side and do not depend on the predicate, which is why they stand; the example now places
-the label timestamps inside the feature range and asserts that every label matched, so the next
-run measures a join that joins.
+decode-and-build-side-sort ratio, not a point-in-time join. No run of the fixed program has been
+made on this machine, so no replacement figure exists yet and the ratio is not stated anywhere
+in this document. The bytes and the file sizes are decode-side and do not depend on the
+predicate, which is why they stand; the example now places the label timestamps inside the
+feature range and asserts that every label matched, so the next run measures a join that joins.
 
 Every byte count here reproduced exactly across three runs, and these times come from a run on
-an otherwise idle machine. The join _ratio_ is the soft figure: it landed between 1.20x and
-1.34x across those runs, and the absolute times roughly halved between a run sharing the box
-with another DuckDB build and this one. Quote the byte counts; describe the ratio as "about a
-quarter faster" once it has been re-measured.
+an otherwise idle machine, which is why the absolute times are not comparable with anything
+measured elsewhere. That run is the stale one above, so there is no join ratio to quote from it:
+the layout's effect on join time is the open question this table leaves, and the next run of
+`examples/layout.rs` answers it. Quote the byte counts, which are what stands.
 
 What the layout actually buys is compression, not pruning. Clustered keys are the same value
 over and over, which is what dictionary encoding is for, so the file is 30.6% smaller and there
-are 31.5% fewer bytes to decode. That is why the bytes are the same in both label ranges, and
-why the sorted file's row groups are not skipped from the join at all, which is the opposite of
-what row group skipping would produce.
+are 31.5% fewer bytes to decode. That is what the byte counts show on their own: the two label
+ranges read the same amount from each file, and the sorted file's row groups are not skipped
+from the join at all, which is the opposite of what row group skipping would produce.
 
 **Pruning is real, and it needs a static predicate rather than a join.** The same sorted file
 under `WHERE user_id <= 499999` reads 3,150,108 B against the unsorted file's 10,008,816 B,
@@ -361,6 +363,9 @@ rechecking.
 
 - **DuckDB**: in this repository, `ENTITIES=500000 cargo run --release -p feather-core
   --features offline --example duckdb_input`. That is where the 34.4 ms figure comes from.
+  The same caveat as the layout table's join rows applies to it: that example's label
+  timestamps fall below the feature rows' for their key, so the figure is a decode and
+  build-side-sort cost, not a point-in-time join.
 - **Layout**: in this repository, `cargo run --release -p feather-core --features offline
   --example layout`. It writes the same generated feature table twice, ordered by
   `(user_id, event_timestamp)` and by a deterministic permutation of the same rows
@@ -370,7 +375,9 @@ rechecking.
   `rchar` counter, sampled either side of the timed join, because DuckDB's own profile
   cannot answer it; the row-group counts are read from the file's footer. The program
   prints a matched-row count and asserts it equals the label count, so the figure is a
-  join that returned features rather than one that returned nulls.
+  join that returned features rather than one that returned nulls. `cargo test` does not run
+  examples, so the same invariant is also asserted as an ordinary test, over three label rows
+  and no timing, in `crates/feather-core/src/offline.rs`.
 - **Hand-rolled join**: a crate depending only on `arrow` 58 and `parquet` 58, with the merge as
   a single monotonic cursor over a source sorted by `(key, ts, created)`. The `arrow` API details
   that cost the most time were `lexsort_to_indices(&[SortColumn], limit)` and the fact that

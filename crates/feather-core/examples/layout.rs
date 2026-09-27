@@ -3,9 +3,11 @@
 //!
 //! Run with `cargo run --release -p feather-core --features offline --example layout`.
 //!
-//! The join is the one `examples/duckdb_input.rs` times, over the same generated
-//! feature table, so the two examples agree on what a feature source looks like. That
-//! table is written twice, and only the row order differs: the same writer, the same
+//! The feature table is the one `examples/duckdb_input.rs` generates, so the two examples
+//! agree on what a feature source looks like. The label frame is not that example's: its
+//! timestamps are placed inside the feature range, which that example's are not, because a
+//! label below its key's feature rows matches nothing. That table is
+//! written twice, and only the row order differs: the same writer, the same
 //! row group size, the same rows. `sorted` is ordered by
 //! `(user_id, event_timestamp)`, so each row group covers one run of keys. `unsorted`
 //! is a deterministic permutation of the same rows, so no row group has any local key
@@ -110,8 +112,8 @@ fn main() {
     println!("  unsorted on disk {0} bytes", sizes[0]);
     println!("  sorted on disk   {0} bytes", sizes[1]);
 
-    // A label frame's key is `i * stride` and its timestamp rises with `i`, so `stride`
-    // is the only thing that decides how much of the key space the join touches. The
+    // A label frame's key is `i * stride` and its timestamp rises with `i * stride`, so
+    // `stride` is the only thing that decides how much of the key space the join touches. The
     // last key written is the last label's, not one past it, so the bound printed is
     // the key space the labels actually cover.
     for (name, stride) in [("half", 1), ("full", 2)] {

@@ -1435,27 +1435,36 @@ fn path_needs_filesystem(path: &str) -> bool {
 
 /// The extensions a file source needs installed, with the format each one reads.
 ///
-/// An `Option<(&'static str, &'static str)>` alongside each extension is the `(name,
-/// tier)` pair [`Error::extension_unavailable`] names, and it is `None` for anything
-/// that is not a format's own reader: `httpfs` reads no format and is no tier, so a
-/// remote Parquet source must not have one attributed to its filesystem.
+/// The return is a flat sequence of `(extension, reader)` pairs rather than one element
+/// per *possible* extension: every caller installs what it is handed and only
+/// optionally attaches a reader clause, so a flat sequence cannot make a caller skip an
+/// element or destructure a shape the other side did not produce. The first draft
+/// returned `[(Option<&str>, Option<...>); 2]` and the call site destructured a flat
+/// tuple against it, which does not compile, and which would have been the
+/// silently-skipping shape had it compiled.
 ///
-/// A fixed-size array rather than a `Vec` grown by `push`, so the two cases are
-/// visible side by side and there is no lint question about pushing conditionally
-/// collected values. The order is the filesystem first, because a remote path cannot
-/// be read at all without it, and the format's own extension second.
+/// The `Option<(&'static str, &'static str)>` on each pair is the `(name, tier)` clause
+/// [`Error::extension_unavailable`] renders, and it is `None` for anything that is not
+/// a format's own reader: `httpfs` reads no format and is no tier, so a remote Parquet
+/// source must not have one attributed to its filesystem. The extension itself is
+/// never optional, so a format with no compiled-in reader still yields the one it
+/// needs installed.
+///
+/// A `Vec` of at most two pairs, pushed in the order the source needs them: the
+/// filesystem first, because a remote path cannot be read at all without it, and the
+/// format's own extension second.
 fn extensions_for(
     path: &str,
     format: FileFormat,
-) -> [Option<(&'static str, Option<(&'static str, &'static str)>)>; 2] {
-    let reader = format_reader(format).1;
-    [
-        (path_needs_filesystem(path).then_some("httpfs"), None),
-        (
-            reader,
-            reader.map(|_| (format.as_str(), format.tier().as_str())),
-        ),
-    ]
+) -> Vec<(&'static str, Option<(&'static str, &'static str)>)> {
+    let mut extensions = Vec::with_capacity(2);
+    if path_needs_filesystem(path) {
+        extensions.push(("httpfs", None));
+    }
+    if let Some(extension) = format_reader(format).1 {
+        extensions.push((extension, Some((format.as_str(), format.tier().as_str()))));
+    }
+    extensions
 }
 
 /// How a file format is read: the table function that yields its rows, and the DuckDB
@@ -2337,22 +2346,20 @@ mod tests {
 
     #[test]
     fn a_format_naming_no_compiled_reader_still_names_the_extension_it_needs_installed() {
-        // The install loop is the only place a format turns into a fetch, so it is
-        // asserted where it happens rather than through the reader mapping alone. A
-        // vortex source must reach `INSTALL vortex`; a local Parquet source must reach
-        // nothing, or a project that names no non-default format would touch the
-        // extension repository.
+        // The mapping the install loop consumes, asserted on its own because that is
+        // what can be asserted without an extension repository to fail against: a
+        // vortex source must reach `INSTALL vortex`, and a local Parquet source must
+        // reach nothing, or a project that names no non-default format would touch the
+        // extension repository. What the loop does with each pair is not asserted
+        // here; this pins the input to it.
         assert_eq!(
             extensions_for("data/clicks.vortex", FileFormat::Vortex),
-            [
-                (None, None),
-                (Some("vortex"), Some(("vortex", "third-party maintained"))),
-            ],
+            vec![("vortex", Some(("vortex", "third-party maintained")))],
             "a vortex source installs the vortex extension, and names its tier"
         );
         assert_eq!(
             extensions_for("data/user_stats.parquet", FileFormat::Parquet),
-            [(None, None), (None, None)],
+            Vec::new(),
             "a local parquet source installs nothing"
         );
     }
@@ -2365,16 +2372,101 @@ mod tests {
         // are reading about is a third-party path.
         assert_eq!(
             extensions_for("s3://lake/user_stats.parquet", FileFormat::Parquet),
-            [(Some("httpfs"), None), (None, None)],
+            vec![("httpfs", None)],
             "httpfs was attributed a format"
         );
         assert_eq!(
             extensions_for("s3://lake/clicks.vortex", FileFormat::Vortex),
-            [
-                (Some("httpfs"), None),
-                (Some("vortex"), Some(("vortex", "third-party maintained"))),
+            vec![
+                ("httpfs", None),
+                ("vortex", Some(("vortex", "third-party maintained"))),
             ],
             "a remote vortex source names the format for its reader and not for httpfs"
+        );
+    }
+
+    #[test]
+    fn a_point_in_time_join_matches_a_label_inside_its_key_s_feature_range() {
+        // The invariant `examples/layout.rs` asserts over 500,000 labels and 2,000,000
+        // feature rows, in three rows apiece and with no timing, because `cargo test`
+        // builds examples and does not run them: the assertion in the example's `main`
+        // is gated by nothing. This is the same predicate the example measures
+        // (`examples/layout.rs`'s `join_sql`), against real tables, so a label frame
+        // whose timestamps fall below the feature rows' fails here rather than
+        // quietly turning the measurement into a decode ratio.
+        //
+        // The frame is built the way the example builds it: both sides from one base and
+        // one step, each label one step past the feature row for its own key.
+        let engine = engine();
+        let connection = engine.connection().expect("connection");
+        let base: i64 = 1_700_000_000_000_000;
+        let step: i64 = 7;
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE features (user_id BIGINT, event_timestamp BIGINT, n BIGINT);
+                 INSERT INTO features VALUES
+                     (1, {base}, 10),
+                     (1, {base} + {step} * 2, 11),
+                     (2, {base} + {step} * 10, 20),
+                     (2, {base} + {step} * 12, 21),
+                     (3, {base} + {step} * 20, 30);
+                 CREATE TABLE labels (user_id BIGINT, event_timestamp BIGINT);
+                 INSERT INTO labels VALUES
+                     (1, {base} + {step}),
+                     (2, {base} + {step} * 5),
+                     (3, {base} + {step} * 20);"
+            ))
+            .expect("frames");
+        let sql = "SELECT count(*), count(f.user_id) FROM labels l ASOF LEFT JOIN features f
+                   ON l.user_id = f.user_id AND l.event_timestamp >= f.event_timestamp";
+
+        let (rows, matched): (i64, i64) = connection
+            .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("join");
+        assert_eq!(rows, 3, "a left join emitted the wrong number of rows");
+        // The half that matters: a label whose timestamp sits inside its key's feature
+        // range matched a feature row, so the join returns features rather than nulls.
+        // Reverting the example's label timestamps to `base + i`, which is what made one
+        // label of 500,000 match, leaves only label 1 here and this fails.
+        assert_eq!(
+            matched, 2,
+            "a label inside its feature range matched nothing"
+        );
+
+        // The boundary, which the count above cannot see: what each label got.
+        //
+        // - key 1's label sits one step past the first of its key's two feature rows, so
+        //   the older row wins and the newer one, two steps on, is out of range.
+        // - key 2's label sits below every feature row its key has, which is the defect
+        //   this whole arrangement exists to catch: the intended behaviour is a null, not
+        //   the nearest row below, because `ASOF` never crosses to a later timestamp.
+        // - key 3's label sits exactly on its key's only feature row, so `>=` includes
+        //   it and the row is found rather than passed over.
+        let mut statement = connection
+            .prepare(
+                "SELECT l.user_id, f.event_timestamp, f.n
+                 FROM labels l ASOF LEFT JOIN features f
+                   ON l.user_id = f.user_id AND l.event_timestamp >= f.event_timestamp
+                 ORDER BY l.user_id",
+            )
+            .expect("prepare");
+        let mut query = statement.query([]).expect("rows");
+        let mut got: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
+        while let Some(row) = query.next().expect("row") {
+            got.push((
+                row.get(0).expect("label key"),
+                row.get(1).expect("matched timestamp"),
+                row.get(2).expect("matched value"),
+            ));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (1, Some(base), Some(10)),
+                (2, None, None),
+                (3, Some(base + step * 20), Some(30)),
+            ],
+            "the join picked the wrong feature row, or one for a label below its range"
         );
     }
 
