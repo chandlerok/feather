@@ -40,7 +40,8 @@ two `target/` directories unless something tells cargo otherwise, and nothing he
 several trees at one `CARGO_TARGET_DIR` does share the expensive part, because `libduckdb-sys` is a
 registry dependency and its artifact name does not depend on where the tree is. It also merges the
 trees' own crates, and that is not safe. Cargo leaves the absolute path out of the metadata hash on
-purpose, so `feather-core` in two worktrees is one artifact: one `libcore-<hash>.rlib`, one
+purpose, so `feather-core` in two worktrees is one artifact: one
+`libfeather_core-<hash>.rlib`, one
 fingerprint, one dep-info file. Whichever tree built last owns it, and the other reports itself fresh
 and links the wrong source. Two trees differing in one function, built in both orders, each produced
 the other's value with no warning. It is
