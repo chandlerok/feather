@@ -32,30 +32,44 @@ also what `mise run test` triggers, which is one more reason that task is not an
 This is bootstrap, not a check, so it does not conflict with the next section. The prohibition is
 on building to decide whether a change is correct.
 
-## Share one target directory if you work in several trees
+## Give each tree its own target directory
 
 This section does not say whether to use worktrees; it covers the builds either way. Two trees get
-two `target/` directories unless something tells cargo otherwise, so the bundled DuckDB build runs
-once per tree. Nothing overrides that today: there is no cargo configuration file in the tree and no
-`[env]` table in `mise.toml`. Set the shared path durably, in a committed `.cargo/config.toml` under
-`[build] target-dir` or in `mise.toml` under `[env]` as `CARGO_TARGET_DIR`; an `export` covers
-neither a subagent nor your next shell, and the path is machine-specific, so it is a
-repository-level change, not one a tree commits for itself. Whether sharing is safe across trees
-with different sources is unresolved; #43 settles it.
+two `target/` directories unless something tells cargo otherwise, and nothing here does: there is no
+`.cargo/config.toml` in the tree and no `[env]` table in `mise.toml`. Keep it that way. Pointing
+several trees at one `CARGO_TARGET_DIR` does share the expensive part, because `libduckdb-sys` is a
+registry dependency and its artifact name does not depend on where the tree is. It also merges the
+trees' own crates, and that is not safe. Cargo leaves the absolute path out of the metadata hash on
+purpose, so `feather-core` in two worktrees is one artifact: one `libcore-<hash>.rlib`, one
+fingerprint, one dep-info file. Whichever tree built last owns it, and the other reports itself fresh
+and links the wrong source. Two trees differing in one function, built in both orders, each produced
+the other's value with no warning. It is
+[cargo#12516](https://github.com/rust-lang/cargo/issues/12516), open since 2023, and two checkouts
+of a workspace with path members reproduce it. Sharing is safe only while every tree sits at the same
+commit, which is the moment before a lane's first edit, so it buys the DuckDB build at the price of
+tests that run against another lane's code. Per-tree directories cost one duplicate build, the
+cheaper failure.
 
-Sharing removes the duplication, not the units. The record is one `target/` at 43G holding 12 debug
-and 8 release `libduckdb-sys` units; keeping the two largest per profile and deleting the rest freed
-15G. Units accumulate through repeated build configurations, which per-tree duplication cannot
-account for. The recorded worst case was within 2.4Gi of full (#43). When free space drops below
-about 4Gi, keep the two largest `libduckdb-sys` units per profile of that directory and delete the
-rest, because finished units are gigabytes and aborted ones are megabytes. Name that directory, not
-a relative `target/`, and check that no build is running against it first, because deleting units
-under a running build breaks it:
+Units are the other half of the disk, and sharing does not touch them. The record is one `target/` at
+43G holding 12 debug and 8 release `libduckdb-sys` units; the cleanup that freed 15G kept the two
+newest per profile, which was the wrong rule, as the next paragraph explains. Units accumulate
+through repeated build configurations, which per-tree duplication cannot account for. The recorded
+worst case was within 2.4Gi of full (#43). When free space drops below about 4Gi, keep the two
+largest `libduckdb-sys` units per profile of that tree's directory and delete the rest, not the two
+newest: a finished unit is gigabytes, an aborted build leaves a megabyte stub with a fresh mtime, and
+newest-first therefore keeps the stubs and deletes the finished builds. Name the directory rather
+than a relative `target/`, and confirm nothing is building against it first, because deleting units
+under a running build breaks it. `pgrep -l cargo` does not confirm that on its own: a DuckDB build
+here runs `cc1plus` with its cwd in the registry source directory, so a check that watches only
+`cargo` misses the compiler writing the unit. A live build holds a descriptor under the target
+directory, so watch the descriptors and it does not matter how the build was started:
 
 ```bash
-target=/path/to/a/shared/target
-pgrep -l cargo                                  # a build here means wait
-for p in debug release; do du -sh "$target/$p/build/libduckdb-sys-"*/ 2>/dev/null | sort -rh | tail -n +3 | cut -f2- | xargs rm -rf; done
+tree=/path/to/the/tree                          # each tree has its own; never share one
+target=$tree/target
+if ls -l /proc/[0-9]*/cwd /proc/[0-9]*/fd 2>/dev/null | grep -q "$target"; then echo "a build is using $target; wait"; else
+  for p in debug release; do du -sh "$target/$p/build/libduckdb-sys-"*/ 2>/dev/null | sort -rh | tail -n +3 | cut -f2- | xargs rm -rf; done
+fi
 ```
 
 ## Do not build locally to check a change; CI is the gate
