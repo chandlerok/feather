@@ -96,7 +96,11 @@ def test_definition_json_uses_the_keys_rust_expects() -> None:
     view = payload["views"][0]
     assert view["name"] == "user_clicks"
     assert view["entities"] == [{"name": "user_id", "join_key": "user_id"}]
-    assert view["source"] == {"type": "file", "path": "data/user_stats.parquet"}
+    assert view["source"] == {
+        "type": "file",
+        "path": "data/user_stats.parquet",
+        "format": None,
+    }
     assert view["features"] == [{"name": "click_count", "dtype": "int64"}]
     assert view["ttl_days"] == 30
     # Absent optional fields serialize as null, which serde's default handles.
@@ -124,6 +128,49 @@ def test_a_postgres_source_serializes_with_its_own_tag() -> None:
         "schema": "public",
         "table": "user_stats",
     }
+
+
+def test_a_file_source_names_the_format_it_is_read_as() -> None:
+    """A format is a per-source choice, so it crosses with the source that declares it.
+
+    Two sources in one project may name different formats, which is the whole point of
+    the field: a setting applied to every source at once could not do this.
+    """
+    config = FeatureStoreConfig(
+        project="ads",
+        views=[
+            a_view(source=FileSource(path="data/user_stats.parquet")),
+            a_view(
+                name="user_clicks_vortex",
+                source=FileSource(path="s3://lake/clicks.vortex", format="vortex"),
+            ),
+        ],
+    )
+
+    payload = json.loads(config.model_dump_json())
+
+    assert payload["views"][0]["source"]["format"] is None
+    assert payload["views"][1]["source"]["format"] == "vortex"
+
+
+def test_an_unknown_format_is_left_for_the_core_to_reject() -> None:
+    """The core owns the list of formats, so Python does not keep a second one.
+
+    A `Literal` here would reject the value at authoring time with a message naming the
+    field and nothing else. The core rejects it at load naming the view and the path
+    that declared it, which is the difference between a message and an answer. The Rust
+    half of this is `an_unknown_format_is_rejected_at_load_naming_the_source` in
+    `definitions.rs`.
+    """
+    source = FileSource(path="data/events", format="iceberg")
+
+    assert json.loads(source.model_dump_json())["format"] == "iceberg"
+
+
+def test_an_empty_format_is_rejected() -> None:
+    """An empty string names no format at all, so it is a mistake here rather than later."""
+    with pytest.raises(pydantic.ValidationError):
+        FileSource(path="data/events", format="")
 
 
 def test_a_source_of_an_unknown_type_is_rejected() -> None:

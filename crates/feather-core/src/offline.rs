@@ -35,7 +35,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::{Arrow, Connection};
 
-use crate::definitions::{DType, FeatureView, Source};
+use crate::definitions::{DType, FeatureView, FileFormat, Source};
 use crate::error::{Error, Result};
 use crate::settings::Connection as SettingsConnection;
 use crate::value::arrow_type;
@@ -328,18 +328,38 @@ impl Engine {
     ///     `Ok(())` once the filesystem or scanner the source needs is loaded.
     ///
     /// Raises:
+    ///     [`Error::UnknownSourceFormat`] if a file source names a format Feather has no
+    ///         reader for. Resolved before anything is installed, so a format mistake
+    ///         fails as itself rather than after a fetch.
     ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
     ///         source names a connection the project cannot use. Checked before the
     ///         extension is installed, so a connection mistake fails as itself rather
     ///         than after a fetch.
-    ///     [`Error::DuckDb`] if the extension cannot be installed or loaded.
+    ///     [`Error::ExtensionUnavailable`] if an extension cannot be installed or loaded.
+    ///     [`Error::DuckDb`] if the connection cannot be used.
     fn ensure_source_loaded(&self, view: &FeatureView) -> Result<()> {
+        let format = view.source_format()?;
         match &view.source {
-            Source::File { path } if path_needs_filesystem(path) => {
-                self.connection()?
-                    .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+            Source::File { path, .. } => {
+                let mut extensions = Vec::new();
+                if path_needs_filesystem(path) {
+                    extensions.push("httpfs");
+                }
+                if let Some(extension) = format_reader(format).1 {
+                    extensions.push(extension);
+                }
+                for extension in extensions {
+                    self.connection()?
+                        .execute_batch(&format!("INSTALL {extension}; LOAD {extension};"))
+                        .map_err(|source| Error::ExtensionUnavailable {
+                            view: view.name.clone(),
+                            extension,
+                            format: format.as_str(),
+                            tier: format.tier().as_str(),
+                            source,
+                        })?;
+                }
             }
-            Source::File { .. } => {}
             Source::Postgres { connection, .. } => {
                 self.postgres_conninfo(view, connection)?;
                 self.connection()?
@@ -1229,7 +1249,8 @@ impl Engine {
     ///
     /// The one place a source becomes a relation, so `DESCRIBE`, the join, and the
     /// ambiguity check all read the same expression rather than re-deriving it. A
-    /// reader added later, a warehouse table or a table format, changes only this.
+    /// reader added later, a warehouse table or a table format, changes this and
+    /// [`Engine::ensure_source_loaded`], which is where its extension is loaded.
     ///
     /// Args:
     ///     view: The view whose source is read.
@@ -1238,11 +1259,17 @@ impl Engine {
     ///     A SQL expression yielding the source's rows, already quoted for DuckDB.
     ///
     /// Raises:
+    ///     [`Error::UnknownSourceFormat`] if a file source names a format Feather has no
+    ///         reader for. The same error the definitions loader raises, so a view read
+    ///         without one still fails as itself.
     ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
     ///         source names a connection the project cannot use.
     fn relation(&self, view: &FeatureView) -> Result<String> {
         match &view.source {
-            Source::File { path } => Ok(format!("read_parquet({})", quote_literal(path))),
+            Source::File { path, .. } => {
+                let (reader, _) = format_reader(view.source_format()?);
+                Ok(format!("{reader}({})", quote_literal(path)))
+            }
             Source::Postgres {
                 connection,
                 schema,
@@ -1408,6 +1435,23 @@ fn path_needs_filesystem(path: &str) -> bool {
     path.contains("://")
 }
 
+/// How a file format is read: the table function that yields its rows, and the DuckDB
+/// extension that has to be loaded first, or `None` when the bundled build already
+/// contains it.
+///
+/// Both halves are here rather than on [`FileFormat`] because they are DuckDB's names,
+/// and `definitions.rs` is the language-neutral contract that no engine appears in.
+fn format_reader(format: FileFormat) -> (&'static str, Option<&'static str>) {
+    match format {
+        // The bundled build compiles the Parquet reader in, so installing it would be a
+        // no-op that can still fail on a machine that cannot reach the repository.
+        FileFormat::Parquet => ("read_parquet", None),
+        // Loadable, third-party maintained, and pre-1.0, so a source naming it opts in
+        // and nothing in Feather is compiled against it.
+        FileFormat::Vortex => ("read_vortex", Some("vortex")),
+    }
+}
+
 /// Quote an identifier, doubling any embedded quote.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -1426,7 +1470,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
-    use crate::definitions::{Entity, Field as FeatureField};
+    use crate::definitions::{Entity, Field as FeatureField, SupportTier};
 
     /// A whole day, in the units the join compares in.
     const DAY: i64 = 86_400_000_000;
@@ -2185,12 +2229,101 @@ mod tests {
     }
 
     #[test]
-    fn a_file_source_becomes_a_parquet_relation() {
+    fn a_file_source_with_no_format_declared_is_read_as_parquet() {
+        // The default, so the pinned string is unchanged by the format knob: a project
+        // that names no format must go on getting `read_parquet` and nothing else.
         let relation = engine()
             .relation(&view("data/user_stats.parquet", None))
             .expect("relation");
 
         assert_eq!(relation, "read_parquet('data/user_stats.parquet')");
+    }
+
+    #[test]
+    fn a_file_source_naming_a_format_is_read_with_that_formats_reader() {
+        let relation = engine()
+            .relation(&source_view(Source::File {
+                path: "data/clicks.vortex".to_owned(),
+                format: Some("vortex".to_owned()),
+            }))
+            .expect("relation");
+
+        assert_eq!(relation, "read_vortex('data/clicks.vortex')");
+    }
+
+    #[test]
+    fn an_unknown_format_is_rejected_rather_than_read_as_parquet() {
+        // The failure mode this rules out is a typo silently falling back to the default
+        // and reading a Vortex file as Parquet, which is a decode error much later and
+        // nowhere near the name that caused it.
+        let view = source_view(Source::File {
+            path: "data/clicks.vortex".to_owned(),
+            format: Some("vortx".to_owned()),
+        });
+
+        let error = engine().relation(&view).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` reads source `data/clicks.vortex` in format `vortx`, which \
+             Feather does not read; the formats are parquet, vortex"
+        );
+    }
+
+    #[test]
+    fn two_formats_resolve_from_one_project() {
+        // The seam the format knob exists for: one engine, one set of connections, and
+        // two sources whose formats differ. Nothing here reads a file, so the assertion
+        // is about resolution rather than about either format's data.
+        let connections = BTreeMap::from([(
+            "s3_lake".to_owned(),
+            connection(r#"{"type":"s3","region":"us-east-1","key_id":"k","secret":"s"}"#),
+        )]);
+        let settings = crate::settings::parse_settings(
+            r#"
+            project = "ads"
+            definitions = ["user_clicks"]
+
+            [connections.s3_lake]
+            type = "s3"
+            region = "us-east-1"
+            key_id = "k"
+            secret = "s"
+            "#,
+        )
+        .expect("settings");
+        assert_eq!(
+            settings.connections, connections,
+            "one settings, one connection"
+        );
+        let engine = Engine::open(&Limits::default(), &settings.connections).expect("engine");
+
+        let parquet = engine
+            .relation(&view("data/user_stats.parquet", None))
+            .expect("parquet relation");
+        let vortex = engine
+            .relation(&source_view(Source::File {
+                path: "s3://lake/clicks.vortex".to_owned(),
+                format: Some("vortex".to_owned()),
+            }))
+            .expect("vortex relation");
+
+        assert_eq!(parquet, "read_parquet('data/user_stats.parquet')");
+        assert_eq!(vortex, "read_vortex('s3://lake/clicks.vortex')");
+    }
+
+    #[test]
+    fn each_format_names_the_extension_it_needs_loaded() {
+        // Parquet is compiled into the bundled build, so naming no extension is what
+        // keeps a local project from touching the extension repository at all. Vortex is
+        // loadable and third-party maintained, which is why a source naming it opts in.
+        assert_eq!(format_reader(FileFormat::Parquet), ("read_parquet", None));
+        assert_eq!(
+            format_reader(FileFormat::Vortex),
+            ("read_vortex", Some("vortex"))
+        );
+        assert_eq!(FileFormat::Parquet.tier(), SupportTier::Primary);
+        assert_eq!(FileFormat::Vortex.tier(), SupportTier::ThirdParty);
     }
 
     #[test]

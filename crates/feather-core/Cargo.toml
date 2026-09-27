@@ -70,5 +70,11 @@ name = "duckdb_input"
 # `cargo test --features valkey` fails to compile the example.
 required-features = ["offline"]
 
+[[example]]
+name = "layout"
+# Same reason as duckdb_input, and the measurement it takes is the one behind the
+# layout guidance in docs/engine-and-format-decisions.md.
+required-features = ["offline"]
+
 [lib]
 doctest = true

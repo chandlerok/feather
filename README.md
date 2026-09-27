@@ -126,10 +126,11 @@ ordinary Parquet you can replace.
   whether the user purchased the next day, which is not one of the columns carried back,
   so the join cannot trivially give it away.
 
-The source is declared on the view, next to the fields it feeds, and it is a Parquet file or
-a table in a Postgres database named in `feather.toml`. The label set decides which
-rows exist and carries the target, so it is passed per call and changes with every
-experiment.
+The source is declared on the view, next to the fields it feeds, and it is a file or a table in
+a Postgres database named in `feather.toml`. A file source may name the format it is read as,
+which defaults to Parquet, and the choice is per source, so one project can read two formats
+side by side. The label set decides which rows exist and carries the target, so it is passed
+per call and changes with every experiment.
 
 ## Serving the project
 

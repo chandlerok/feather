@@ -72,6 +72,22 @@ pub enum Error {
     #[error("malformed definitions: {reason}")]
     MalformedDefinitions { reason: String },
 
+    /// A source naming a format Feather has no reader for.
+    ///
+    /// Reported against the view and the path rather than as a deserialization failure,
+    /// because a definition that is wrong here is wrong about one source rather than
+    /// about the file, and a name is what tells the two apart.
+    #[error(
+        "view `{view}` reads source `{path}` in format `{format}`, which Feather does not \
+         read; the formats are {known}"
+    )]
+    UnknownSourceFormat {
+        view: String,
+        path: String,
+        format: String,
+        known: String,
+    },
+
     #[error(
         "one request mixed entities `{first}` and `{second}`; all views in a request must \
          share the same entity"
@@ -196,6 +212,26 @@ pub enum Error {
         view: String,
         location: String,
         reason: String,
+    },
+
+    /// A format's extension that could not be installed or loaded.
+    ///
+    /// The tier travels with it because that is the whole reason a non-Primary format
+    /// is opt-in: an operator reading this needs to know they are on a best-effort or
+    /// third-party path, and the extension's own message names neither the view nor the
+    /// format.
+    #[cfg(feature = "offline")]
+    #[error(
+        "view `{view}` could not load the `{extension}` extension, which reads {format} and \
+         is {tier} tier: {source}"
+    )]
+    ExtensionUnavailable {
+        view: String,
+        extension: &'static str,
+        format: &'static str,
+        tier: &'static str,
+        #[source]
+        source: duckdb::Error,
     },
 
     #[cfg(feature = "valkey")]

@@ -11,7 +11,8 @@
       ],
       "source": {
         "type": "file",
-        "path": "data/user_stats.parquet"
+        "path": "data/user_stats.parquet",
+        "format": null
       },
       "features": [
         {

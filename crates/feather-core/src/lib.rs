@@ -26,7 +26,9 @@ pub mod online;
 pub mod settings;
 pub mod value;
 
-pub use definitions::{DType, Definitions, Entity, FeatureService, FeatureView, Field, Source};
+pub use definitions::{
+    DType, Definitions, Entity, FeatureService, FeatureView, Field, FileFormat, Source, SupportTier,
+};
 pub use error::{Error, Result};
 pub use key::{
     MAX_COMPONENT_LEN, decode_entity_key, encode_entity_key, entity_hash_key, entity_key_component,

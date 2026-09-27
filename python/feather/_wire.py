@@ -62,13 +62,21 @@ class Field(DefinitionModel):
 class FileSource(DefinitionModel):
     """A file-backed offline source.
 
-    A Parquet file, local or reached through a URI scheme such as ``s3://``.
-    ``type`` is what the union below discriminates on, and it is defaulted so that
-    ``FileSource(path="...")`` stays the way a file source is written.
+    A file, local or reached through a URI scheme such as ``s3://``, read in the
+    format ``format`` names. ``type`` is what the union below discriminates on, and it
+    is defaulted so that ``FileSource(path="...")`` stays the way a file source is
+    written; an omitted ``format`` is the default one, Parquet.
+
+    ``format`` is a plain string rather than a ``Literal`` of the known names on
+    purpose. The Rust core is the authority on which formats have readers, and it
+    reports one it does not know against the view and the path that declared it, which
+    is a better error than a second list here rejecting the value with no idea which
+    source it came from.
     """
 
     type: Literal["file"] = "file"
     path: NonEmptyStr
+    format: NonEmptyStr | None = None
 
 
 # `schema` is the key the core expects for a Postgres table, and it is also the name of a

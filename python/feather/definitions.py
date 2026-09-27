@@ -139,7 +139,8 @@ def feature_view(
         entity: The entity the view is keyed by. Not a list: v1 keys one hash per
             entity, so the wire model rejects more than one.
         source: The offline source the features are read from: ``FileSource`` for a
-            Parquet file, ``PostgresSource`` for a table in a configured database.
+            file, which names the format it is read as, or ``PostgresSource`` for a
+            table in a configured database.
         ttl_days: Whole days before a value is stale, or None for no expiry.
             Deliberately not a duration: Rust stores whole days, so a
             ``timedelta`` would silently truncate.

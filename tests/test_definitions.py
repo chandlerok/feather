@@ -87,7 +87,7 @@ def test_the_compiled_json_is_the_rust_contract() -> None:
     assert payload["views"][0] == {
         "name": "user_clicks",
         "entities": [{"name": "user_id", "join_key": "user_id"}],
-        "source": {"type": "file", "path": "data/user_stats.parquet"},
+        "source": {"type": "file", "path": "data/user_stats.parquet", "format": None},
         "features": [
             {"name": "click_count", "dtype": "int64"},
             {"name": "purchase_count", "dtype": "int64"},
