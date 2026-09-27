@@ -44,6 +44,13 @@ manifest-path = "crates/feather-py/Cargo.toml"
 module-name = "feather._core"
 python-source = "python"
 python-packages = ["feather"]
+# Here rather than on a CI command line, so that the flag cannot be forgotten by
+# whoever builds the artifact that ships. The wheel is almost entirely DuckDB's
+# symbol table: 255MB unstripped, 24MB stripped, and PyPI refuses a file over
+# 100MB. So this is not a size nicety, it is the difference between the wheel
+# uploading and not uploading. The `wheel` job in check.yml still passes
+# `--strip` as well, which is redundant and harmless.
+strip = true
 # One wheel for 3.11 through 3.14. pyo3 carries `abi3-py311`, and maturin reads
 # that feature to name the artifact `cp311-abi3`, so a 3.14 install resolves the
 # same file rather than a per-minor one. Nothing in the bindings needs a symbol
