@@ -49,9 +49,10 @@ local linters = new Mapping<String, Step> {
 // here despite the name.
 //
 // A hook is local, so it only guards a clone where it is installed, and
-// `git push --no-verify` skips it. This repository is private on GitHub Free,
-// which offers neither branch protection nor branch rulesets, so there is no
-// server-side backstop. See README "Contributing".
+// `git push --no-verify` skips it. The backstop is server-side: `main` is a
+// protected branch requiring all five checks, so a push that skips the hook
+// still cannot land. What the hook buys is the failure arriving in a second
+// rather than after the Rust build. See README "Contributing".
 local noPushToMain = new Step {
   // Git's pre-push stdin, one line per ref being pushed:
   // `<local-ref> <local-sha> <remote-ref> <remote-sha>`.
