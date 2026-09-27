@@ -72,8 +72,9 @@ cache-keys = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The package lives under python/, so tests run against the source tree without
-# requiring the Rust extension to be built and installed first.
+# The package lives under python/, so tests import the source tree rather than an
+# installed copy. The extension is still required: tests/test_online.py imports
+# MaterializeReport and ViewRefresh, which the compiled module provides.
 pythonpath = ["python"]
 markers = [
   "integration: requires a running Valkey container",
