@@ -200,7 +200,10 @@ jobs:
     environment:
       name: pypi
     permissions:
-      # Job-level, on the job that mints the OIDC token and nothing else.
+      # Job-level, on the job that uploads and nowhere else. `contents: read`
+      # is restated rather than inherited: a job-level block replaces the
+      # workflow-level one instead of extending it, so the checkout below gets
+      # no scope at all unless it is named here again.
       id-token: write
       contents: read
     steps:
