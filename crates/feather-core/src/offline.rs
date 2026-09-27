@@ -22,6 +22,8 @@
 //!   error rather than a cast, because an implicit cast is how an off-by-hours bug enters a
 //!   training set.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -757,9 +759,10 @@ impl Engine {
         let result = self.run_scan(&view.name, &sql, sink).await;
         // A caught panic leaves the connection's state unknown, so it is dropped and the
         // next use opens a fresh one. Every other failure arrived as a value from a call that
-        // returned, which leaves the connection usable. This branch cannot be reached from a
-        // test without a seam to force a mid-scan failure, which is #26's work rather than this
-        // path's.
+        // returned, which leaves the connection usable. `forced_fetch_failure` stands in for
+        // the panic a real fetch raises, so this branch is covered. That closes the coverage
+        // gap, not the issue: #26 stays open because `stream_arrow` still panics instead of
+        // yielding an error, and its fix removes this shim rather than making it safe.
         if matches!(&result, Err(Error::StreamInterrupted { .. })) {
             self.discard_connection();
         }
@@ -973,9 +976,41 @@ fn latest_per_entity_sql(
 /// prevent and has to be revisited. The default panic hook still prints the message to
 /// stderr, because suppressing it would mean replacing a global hook.
 fn next_batch(rows: &mut Arrow<'_>, view: &str) -> Result<Option<RecordBatch>> {
-    catching_panics(|| rows.next()).map_err(|reason| Error::StreamInterrupted {
+    catching_panics(|| {
+        // Stands in for the fetch failure a real scan cannot be made to raise from a test, so
+        // the branch that discards the connection is reachable. Compiled out outside tests.
+        #[cfg(test)]
+        forced_fetch_failure();
+        rows.next()
+    })
+    .map_err(|reason| Error::StreamInterrupted {
         view: view.to_owned(),
         reason,
+    })
+}
+
+// The [`next_batch`] call to fail on, counted from the first. `0` disables it, which is what
+// every test in this file but the ones that ask for a failure sees.
+#[cfg(test)]
+thread_local! {
+    static FORCED_FETCH_FAILURE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Panic where a real chunk fetch would, on the call a test counted down to.
+///
+/// The failure the shim above exists for cannot be forced honestly. A source that stops
+/// answering fails during `prepare`, which returns a value rather than panicking, so no fixture
+/// reaches the iterator's panic. This is the stand-in, and it is the only reason the
+/// connection-discarding branch has a test.
+#[cfg(test)]
+fn forced_fetch_failure() {
+    FORCED_FETCH_FAILURE.with(|at| match at.get() {
+        0 => {}
+        1 => {
+            at.set(0);
+            panic!("Failed to fetch Arrow record batch: forced by a test");
+        }
+        remaining => at.set(remaining - 1),
     })
 }
 
@@ -2473,9 +2508,10 @@ mod tests {
     fn a_panic_inside_a_scan_becomes_an_error_rather_than_unwinding() {
         // `duckdb`'s Arrow iterator panics when a chunk fetch or the Arrow conversion fails, and
         // there is no lazy iterator that yields an error instead. This is the shim that puts the
-        // failure back into the return type, and it is exercised directly because a genuine
-        // mid-scan fetch failure cannot be forced from a test. The two payload shapes are the two
-        // `panic!` produces, plus one with no message at all.
+        // failure back into the return type, exercised directly for the payload shapes, which a
+        // scan cannot produce on demand. The scan itself is covered by
+        // `a_panic_mid_scan_is_a_named_error_rather_than_an_abort`. The two payload shapes are
+        // the two `panic!` produces, plus one with no message at all.
         let borrowed = catching_panics(|| -> Option<RecordBatch> { panic!("boom") })
             .expect_err("a panic is an error");
         assert_eq!(borrowed, "boom");
@@ -2493,6 +2529,105 @@ mod tests {
         // And a scan that does not panic is unaffected.
         let kept = catching_panics(|| 7u8).expect("no panic");
         assert_eq!(kept, 7);
+    }
+
+    /// Make the `nth` batch fetch of the scan that follows fail, and no later one.
+    ///
+    /// The count is per thread and cleared on drop, so a test that fails partway through cannot
+    /// leave the next one in this file failing for a reason it did not arrange.
+    struct ForcedFetchFailure;
+
+    impl ForcedFetchFailure {
+        fn at(nth: u32) -> Self {
+            FORCED_FETCH_FAILURE.with(|at| at.set(nth));
+            Self
+        }
+    }
+
+    impl Drop for ForcedFetchFailure {
+        fn drop(&mut self) {
+            FORCED_FETCH_FAILURE.with(|at| at.set(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_mid_scan_is_a_named_error_rather_than_an_abort() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10), (2, 200, 20)]));
+        let declared = view(&source.string(), None);
+        let engine = engine();
+
+        // A scan that prepared its statement and began streaming, whose first chunk fetch then
+        // fails the way a dropped source connection makes `duckdb` fail. That is the one failure
+        // `next_batch` exists to absorb, and until this seam it had no test at all.
+        let _forced = ForcedFetchFailure::at(1);
+
+        let mut sink = Counted::default();
+        let failed = engine.scan_latest_per_entity(&declared, &mut sink).await;
+
+        match failed {
+            Err(Error::StreamInterrupted { view, reason }) => {
+                assert_eq!(
+                    view, declared.name,
+                    "the error names the view being scanned"
+                );
+                assert!(
+                    reason.contains("forced by a test"),
+                    "the panic's message survives into the error, not only its type: {reason}"
+                );
+            }
+            other => panic!("a panic mid-scan is a StreamInterrupted, not {other:?}"),
+        }
+        assert_eq!(sink.0, 0, "no batch reached the sink before the failure");
+    }
+
+    #[tokio::test]
+    async fn a_panic_mid_scan_discards_the_connection_and_the_engine_answers() {
+        let source = Parquet::write(&integer_source(&[(1, 100, 10)]));
+        let engine = engine();
+
+        // A temporary table lives and dies with the connection that made it, so whether the next
+        // query can still see it reads directly on whether the failed scan's connection was
+        // dropped. Asserting only that the engine answers afterwards would not: this panic is
+        // synthetic, so a connection that was kept would pass that assertion too, and the branch
+        // under test is the discard.
+        engine
+            .connection()
+            .expect("connection")
+            .execute_batch("CREATE TEMPORARY TABLE made_before_the_failure (x INTEGER)")
+            .expect("temp table");
+
+        let forced = ForcedFetchFailure::at(1);
+        let mut sink = Counted::default();
+        assert!(
+            engine
+                .scan_latest_per_entity(&view(&source.string(), None), &mut sink)
+                .await
+                .is_err(),
+            "the scan fails, or there is nothing here to discard"
+        );
+        drop(forced);
+
+        let table_survived = {
+            // Scoped, because the borrow of the connection has to end before the scan below,
+            // which takes the same lock.
+            let connection = engine.connection().expect("a connection is open again");
+            connection
+                .prepare("SELECT count(*) FROM made_before_the_failure")
+                .is_ok()
+        };
+        assert!(
+            !table_survived,
+            "the failed scan's connection was discarded, so its temp table went with it"
+        );
+
+        // And the engine is usable, which is what a caller does after a refresh fails.
+        let other = Parquet::write(&integer_source(&[(1, 300, 30)]));
+        let mut again = Counted::default();
+        engine
+            .scan_latest_per_entity(&view(&other.string(), None), &mut again)
+            .await
+            .expect("the engine still answers");
+        assert_eq!(again.0, 1);
     }
 
     #[tokio::test]
