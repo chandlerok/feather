@@ -760,7 +760,10 @@ impl Engine {
         // A caught panic leaves the connection's state unknown, so it is dropped and the
         // next use opens a fresh one. Every other failure arrived as a value from a call that
         // returned, which leaves the connection usable. `forced_fetch_failure` stands in for
-        // the panic a real fetch raises, so this branch is covered.
+        // the panic a real fetch raises, so this branch is covered. That closes the coverage
+        // gap, not the issue: #26 stays open because `stream_arrow` still panics instead of
+        // yielding an error, so the write path has to survive a panic rather than be handed
+        // one.
         if matches!(&result, Err(Error::StreamInterrupted { .. })) {
             self.discard_connection();
         }
