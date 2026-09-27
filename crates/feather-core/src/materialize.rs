@@ -96,11 +96,12 @@ pub struct MaterializeReport {
 ///     [`Error::SourceConnectionKind`] or [`Error::UnreadableSource`] if a view's source
 ///     cannot be read as the view declares it.
 ///     [`Error::StreamInterrupted`] if a scan failed after it had started.
-///     [`Error::AmbiguousTimestamp`] if the source holds two rows for one entity at one event
-///         timestamp and the view declares no `created_timestamp_field`, which is the same
-///         refusal the join makes. It is a per-view guarantee rather than a per-refresh one: a
-///         refresh scans and writes its views in declaration order, so every view declared before
-///         this one has already been refreshed by the time the check runs.
+///     [`Error::AmbiguousTimestamp`] if the source holds more than one row for one entity at
+///         one event timestamp that nothing else separates: no `created_timestamp_field`, or
+///         rows that share the one it declares. That is the same refusal the join makes, and it
+///         is a per-view guarantee rather than a per-refresh one: a refresh scans and writes
+///         its views in declaration order, so every view declared before this one has already
+///         been refreshed by the time the check runs.
 ///     [`Error::NullEntityKey`] if a source row's entity key is null, which the scan's own
 ///         filter already excludes.
 ///     [`Error::UnsupportedKeyType`] if a source's entity key is not an integer or a string.
@@ -486,6 +487,23 @@ mod tests {
             Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.0))),
             Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.1))),
             Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+        ];
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("source batch")
+    }
+
+    /// `user_id, event_timestamp, created_at, count`, for the tie-break a view can declare.
+    fn source_with_created(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
+        let fields = vec![
+            ArrowField::new("user_id", DataType::Int64, false),
+            ArrowField::new("event_timestamp", DataType::Int64, false),
+            ArrowField::new("created_at", DataType::Int64, false),
+            ArrowField::new("count", DataType::Int64, false),
+        ];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
         ];
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("source batch")
     }
@@ -1062,22 +1080,11 @@ mod tests {
     async fn a_created_timestamp_breaks_the_tie_and_the_newer_creation_wins() {
         // The same two rows, with a created timestamp, which is the rule the join uses for the
         // same ambiguity.
-        let fields = vec![
-            ArrowField::new("user_id", DataType::Int64, false),
-            ArrowField::new("event_timestamp", DataType::Int64, false),
-            ArrowField::new("created_at", DataType::Int64, false),
-            ArrowField::new("count", DataType::Int64, false),
-        ];
-        let rows = [(1i64, 100i64, 5i64, 10i64), (1, 100, 9, 11), (1, 50, 1, 7)];
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
-            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
-        ];
-        let source = Parquet::write(
-            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("source batch"),
-        );
+        let source = Parquet::write(&source_with_created(&[
+            (1, 100, 5, 10),
+            (1, 100, 9, 11),
+            (1, 50, 1, 7),
+        ]));
         let mut view = a_view(&source.string(), None);
         view.created_timestamp_field = Some("created_at".to_owned());
 
@@ -1098,6 +1105,44 @@ mod tests {
             "the later creation wins"
         );
         assert_eq!(stored_freshness(&store, b"1"), Some(100));
+    }
+
+    #[tokio::test]
+    async fn rows_the_created_timestamp_cannot_separate_are_refused_too() {
+        // Three rows for one entity at one event timestamp that also share the created
+        // timestamp. The reducer's tie-break has run out of columns here, so its `row_number()`
+        // would pick whichever row the plan produced, and a refresh would store that as the
+        // entity's current value. The join refuses this source, so the refresh does too.
+        let source = Parquet::write(&source_with_created(&[
+            (1, 100, 5, 10),
+            (1, 100, 5, 11),
+            (1, 100, 5, 12),
+        ]));
+        let mut view = a_view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let mut store = MemoryStore::new();
+        let refused = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(Error::AmbiguousTimestamp {
+                    rows: 3,
+                    ref tie_break,
+                    ..
+                }) if tie_break == "tied on `created_at`"
+            ),
+            "expected a tie no created timestamp breaks to be refused, got {refused:?}"
+        );
+        assert_eq!(store.hash_count(), 0, "nothing is stored");
     }
 
     #[tokio::test]
