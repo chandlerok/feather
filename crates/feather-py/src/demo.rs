@@ -44,7 +44,10 @@ const MICROS_PER_HOUR: i64 = 3_600_000_000;
 /// Write the demo project into `directory`, which is created if it is missing.
 ///
 /// The paths written are returned, so the caller reports what was produced
-/// rather than repeating the names.
+/// rather than repeating the names. Each file is renamed into place once it is
+/// whole, so a failure part-way through leaves the earlier file written and the
+/// later one missing, rather than a truncated Parquet under the name the
+/// project reads.
 #[pyfunction]
 pub fn write_demo_data(directory: PathBuf) -> PyResult<Vec<String>> {
     let data = directory.join("data");
@@ -166,13 +169,72 @@ impl Random {
     }
 }
 
+/// Write one Parquet file, so that a reader never sees a partial one.
+///
+/// The bytes go to a temporary name in the same directory, are flushed to the
+/// device, and only then renamed over the destination. `rename(2)` within a
+/// directory is atomic, so a reader sees either the file that was there before
+/// or the whole new one, and a write that fails part-way through leaves the
+/// previous file alone instead of a truncated Parquet in its place.
+///
+/// The `?` operator cannot express "and delete the temporary file", so the two
+/// fallible steps run into one `Result` and the cleanup is the `if` under it.
+/// That is the only place either step can leave something behind.
+///
+/// `ponytail:` the atomicity is per file, so a `demo` that fails on its second
+/// file leaves the first one written and the second missing. The pair cannot be
+/// renamed as a unit without staging the whole `data/` directory and swapping
+/// it, and that swap cannot be done in place: `rename` will not replace a
+/// non-empty directory, so the old one has to be moved aside first, which opens
+/// a window where `data/` is not there at all. That is a worse failure than the
+/// one this fixes, and the recovery for this one is the `--force` the CLI
+/// already names in the message it prints. Revisit if a half-written demo
+/// project reaches a user.
 fn write_parquet(path: &Path, table: &RecordBatch) -> PyResult<()> {
+    let temporary = temporary_path(path);
+    let written = write_and_sync(&temporary, table)
+        .and_then(|()| std::fs::rename(&temporary, path).map_err(|error| message(path, error)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Write the Parquet bytes to `path` and flush them to the device.
+///
+/// The flush is what makes the rename that follows mean anything: a rename
+/// publishes a name, and without the fsync the bytes behind that name can still
+/// be only in the page cache if the process dies.
+///
+/// `close` consumes the writer and drops the `File` with it, so the handle to
+/// sync is taken as a second one first. `try_clone` duplicates the descriptor
+/// rather than opening the file again, so both handles name the same bytes.
+///
+/// Two closures rather than one, because the Parquet layer and the file layer
+/// raise different error types and a closure has a single one: `io_failure`
+/// covers the create, the clone and the flush, `failure` the three steps the
+/// writer takes.
+fn write_and_sync(path: &Path, table: &RecordBatch) -> PyResult<()> {
+    let io_failure = |error| message(path, error);
     let failure = |error| message(path, error);
-    let file = File::create(path).map_err(|error| message(path, error))?;
+    let file = File::create(path).map_err(io_failure)?;
+    let handle = file.try_clone().map_err(io_failure)?;
     let mut writer = ArrowWriter::try_new(file, table.schema(), None).map_err(failure)?;
     writer.write(table).map_err(failure)?;
     writer.close().map_err(failure)?;
-    Ok(())
+    handle.sync_all().map_err(io_failure)
+}
+
+/// A sibling of `path` to write through before the rename.
+///
+/// The same directory, because a rename that crosses directories is a copy, and a
+/// copy is not atomic. The name is hidden and carries this process's id, so a
+/// second `feather demo` running elsewhere writes a temporary file of its own
+/// rather than truncating this one. Two threads of one process racing on the
+/// same directory are not a case this supports.
+fn temporary_path(path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
 /// One message for every failure under one path, whatever type the layer raised.
