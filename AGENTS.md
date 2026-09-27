@@ -3,6 +3,35 @@
 Rules for coding agents in this repository. Each rule below has already been broken here at least
 once: the cost was thrown-away work or a full disk.
 
+## Bootstrap the tree before you start
+
+A fresh worktree has no toolchain, no Python environment, and no git hooks, and none of the other
+rules below work until it has them. Run this once, before any other command:
+
+```bash
+./setup.sh
+```
+
+It installs the pinned tools through mise (`mise trust`, `mise install`), installs the Python
+environment, and installs the git hooks. It takes about a second. It does not build the extension:
+no DuckDB, no cargo build, no wheel.
+
+`paseo.json` declares this as the worktree setup command, so paseo runs it during worktree
+bootstrap and you should not have to. It is not automatic in two cases: the operator has to allow
+it once per workspace (`paseo workspace setup <workspace-id>`), and a `local` isolation workspace
+has no worktree bootstrap at all. If `setup.sh` is missing, the tree is older than this section,
+and the toolchain is not installed. If the run fails, say which step failed rather than working
+around it; a half-set-up tree produces errors that look like code defects.
+
+One trap, because it costs eight minutes and looks like a hang. `uv run` syncs the project before
+it runs anything, so plain `uv run pytest` rebuilds the extension that `./setup.sh` skipped. Pass
+`--no-sync` to `uv run` and the environment is used as installed. The build is a release build
+with LTO: over eight minutes and 800MB of `target/` in a fresh worktree on this machine. It is
+also what `mise run test` triggers, which is one more reason that task is not an agent's to run.
+
+This is bootstrap, not a check, so it does not conflict with the next section. The prohibition is
+on building to decide whether a change is correct.
+
 ## Share one target directory if you work in several trees
 
 This section does not say whether to use worktrees; it covers the builds either way. Two trees get
@@ -53,8 +82,9 @@ uv run --no-sync pyrefly check   # --no-sync, so nothing builds
 ```
 
 Only `cargo fmt`, `ruff` and `dprint` work in a fresh worktree, and they need mise's tools on PATH
-(`mise x --` or an activated shell); `pyrefly` needs the `.venv` whose creation is the `uv sync`
-this section bans. dprint owns each non-Rust, non-Python file type it has a plugin for: JSON, TOML,
+(`mise x --` or an activated shell); `pyrefly` needs the `.venv`, which `./setup.sh` creates. That
+is the one environment an agent is expected to install, and only through `./setup.sh`, once, before
+starting work. dprint owns each non-Rust, non-Python file type it has a plugin for: JSON, TOML,
 YAML, Markdown and Dockerfile (`dprint.json`); `Cargo.lock`, `uv.lock` and `hk.pkl` are outside it.
 Do not wait on a build or a CI run in the foreground; watch it in the background.
 
