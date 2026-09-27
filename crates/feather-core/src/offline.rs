@@ -481,7 +481,8 @@ impl Engine {
     ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
     ///         source names a connection the project cannot use.
     ///     [`Error::AmbiguousTimestamp`] if the source holds more than one row for a key and
-    ///         timestamp and declares no `created_timestamp_field` to break the tie.
+    ///         timestamp with nothing left to separate them: no `created_timestamp_field`, or
+    ///         rows that share the one it declares.
     ///     [`Error::UnreadableSource`] if the source cannot be read at all, which names the
     ///         view it was being read for.
     ///     [`Error::DuckDb`] if the query itself fails.
@@ -565,15 +566,16 @@ impl Engine {
         let key_expr = quote_ident(key_column);
         let source_ts_value = source_ts_kind.to_micros(&quote_ident(source_ts_column));
 
-        if view.created_timestamp_field.is_none() {
-            self.reject_ambiguous_timestamps(
-                view,
-                &relation,
-                &key_expr,
-                &source_ts_value,
-                AmbiguityScope::LabelKeys,
-            )?;
-        }
+        // Refused whether or not a created timestamp is declared: the check groups by the
+        // created column when there is one, so what it catches is a tie the tie-break cannot
+        // break, and that is the same failure either way.
+        self.reject_ambiguous_timestamps(
+            view,
+            &relation,
+            &key_expr,
+            &source_ts_value,
+            AmbiguityScope::LabelKeys,
+        )?;
 
         let sql = join_sql(
             view,
@@ -645,7 +647,18 @@ impl Engine {
         Ok(())
     }
 
-    /// Fail if two source rows share a key and timestamp, so the winner would be undefined.
+    /// Fail if two source rows share a key and a timestamp and nothing else separates them, so
+    /// the winner would be undefined.
+    ///
+    /// The tie-break is the view's `created_timestamp_field`, so the created column joins the
+    /// grouping when the view declares one: rows are ambiguous when they agree on everything
+    /// the `ORDER BY` can see, and a third row agreeing on the created timestamp too is
+    /// exactly as undecidable as a pair. The alternative is a final deterministic key, and
+    /// there is nowhere to take one from: the view declares the entity, the features and the
+    /// two timestamps and nothing else, while the one thing every reader has, a row's position
+    /// in the file, is not something a Postgres table or an object-storage prefix offers.
+    /// Refusing costs a source whose tied rows are genuinely indistinguishable, while an
+    /// invented key costs every caller of such a source and still leaves the plan to decide.
     fn reject_ambiguous_timestamps(
         &self,
         view: &FeatureView,
@@ -669,14 +682,33 @@ impl Engine {
         // has to resolve. Without this the check would group them and then read a null key back
         // as a string, which is an error rather than a value, so a source the scan handles fine
         // would fail the whole refresh with a message naming neither the source nor the rows.
+
+        // The created column is selected but never filtered on: a null one is a value the
+        // tie-break sorts last, not a row the scan drops, so two rows that are both null for
+        // it are as tied as two rows that agree.
+        let (created_select, created_group, tie_break) = match &view.created_timestamp_field {
+            Some(created) => {
+                let name = quote_ident(created);
+                (
+                    format!(", {name} AS c"),
+                    ", c".to_owned(),
+                    format!("tied on `{created}`"),
+                )
+            }
+            None => (
+                String::new(),
+                String::new(),
+                "and declares no created_timestamp_field".to_owned(),
+            ),
+        };
         let sql = format!(
             "WITH source AS (
-                 SELECT {key_expr} AS k, {source_ts_value} AS t FROM {relation}
+                 SELECT {key_expr} AS k, {source_ts_value} AS t{created_select} FROM {relation}
                  WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
              )
              SELECT CAST(k AS VARCHAR), t, count(*) AS n
              FROM source{restriction}
-             GROUP BY k, t
+             GROUP BY k, t{created_group}
              HAVING count(*) > 1
              LIMIT 1"
         );
@@ -690,6 +722,7 @@ impl Engine {
                 key: row.get(0)?,
                 timestamp: row.get(1)?,
                 rows: row.get(2)?,
+                tie_break,
             });
         }
         Ok(())
@@ -745,6 +778,8 @@ impl Engine {
     ///     [`Error::UnsupportedOfflineType`] for a key or timestamp type the scan cannot
     ///         carry.
     ///     [`Error::ColumnTypeMismatch`] if a source column does not have the declared dtype.
+    ///     [`Error::AmbiguousTimestamp`] if the source holds rows for one entity at one event
+    ///         timestamp that nothing separates, which is the same refusal the join makes.
     ///     [`Error::UnknownConnection`], [`Error::SourceConnectionKind`] or
     ///         [`Error::UnreadableSource`] exactly as in [`Engine::point_in_time_join`].
     ///     [`Error::StreamInterrupted`] if the scan failed after it had started, which is
@@ -882,22 +917,20 @@ impl Engine {
 
         let relation = self.relation(view)?;
 
-        // The same refusal the join makes, for the same reason: without a created timestamp to
-        // break a tie, which of two rows sharing a key and an event timestamp wins would depend
-        // on the query plan. A refresh has no label frame to restrict the check to, so it looks at
-        // the whole source, and it looks before writing anything of this view's, so a source that
-        // training refuses to read is not one serving quietly answers from. That is per view:
-        // views are refreshed in declaration order, so the ones before this have already written
-        // by the time the check runs.
-        if view.created_timestamp_field.is_none() {
-            self.reject_ambiguous_timestamps(
-                view,
-                &relation,
-                &quote_ident(key_column),
-                &source_ts_expr,
-                AmbiguityScope::WholeSource,
-            )?;
-        }
+        // The same refusal the join makes, for the same reason: which of two rows sharing a key
+        // and an event timestamp wins would depend on the query plan, and a created timestamp
+        // only settles it for the rows it separates. A refresh has no label frame to restrict
+        // the check to, so it looks at the whole source, and it looks before writing anything of
+        // this view's, so a source that training refuses to read is not one serving quietly
+        // answers from. That is per view: views are refreshed in declaration order, so the ones
+        // before this have already written by the time the check runs.
+        self.reject_ambiguous_timestamps(
+            view,
+            &relation,
+            &quote_ident(key_column),
+            &source_ts_expr,
+            AmbiguityScope::WholeSource,
+        )?;
 
         Ok(latest_per_entity_sql(
             view,
@@ -947,8 +980,13 @@ fn latest_per_entity_sql(
     selected.push(format!("{key_expr} AS {SCAN_KEY_COLUMN}"));
     selected.push(format!("{source_ts_value} AS {SCAN_TS_COLUMN}"));
 
+    // A null created timestamp sorts last: a row whose creation time is unknown cannot be shown
+    // to be the newer one, so a known value wins the tie against it. DuckDB's own default is
+    // nulls last in both directions, so this states the behaviour rather than changing it, and it
+    // is stated because `default_null_order` can be set otherwise. The check refuses the case
+    // this cannot settle, which is two tied rows both null.
     let tie_break = match &view.created_timestamp_field {
-        Some(created) => format!(", {} DESC", quote_ident(created)),
+        Some(created) => format!(", {} DESC NULLS LAST", quote_ident(created)),
         None => String::new(),
     };
 
@@ -1060,10 +1098,12 @@ fn join_sql(
     // expresses one instant per group, and the maximality in that phrase is the match rule's.
     // With no created timestamp there is no column to break a tie with, and two rows sharing a
     // key and an instant were already refused by the ambiguity check, so the `None` arm has no
-    // tie to break.
+    // tie to break. With one, the check still refuses the rows it cannot separate, so the sort
+    // is choosing between rows a rule told apart.
     let dedup = match &view.created_timestamp_field {
         Some(created) => format!(
-            " QUALIFY row_number() OVER (PARTITION BY {key_expr}, {source_ts_value} ORDER BY {} DESC) = 1",
+            " QUALIFY row_number() OVER (PARTITION BY {key_expr}, {source_ts_value} \
+             ORDER BY {} DESC NULLS LAST) = 1",
             quote_ident(created)
         ),
         None => String::new(),
@@ -1134,9 +1174,10 @@ fn join_sql(
 
 /// How much of a source the ambiguity check looks at.
 ///
-/// A view that declares no `created_timestamp_field` has no rule for two rows sharing a key and
-/// an event timestamp, so which one wins would depend on the query plan. Both paths refuse that,
-/// and this says how far each has to look to find it.
+/// The check refuses rows that share a key and an event timestamp with nothing else to separate
+/// them, which for a view that declares no `created_timestamp_field` is every such pair and for
+/// one that does is any two or more that share the created timestamp as well. Either way the
+/// winner would depend on the query plan. This says how far the check has to look to find one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AmbiguityScope {
     /// Only the keys an entity frame names, which bounds the check by the request.
@@ -1459,6 +1500,7 @@ mod tests {
 
     use arrow::array::{Array, Float64Array, TimestampMicrosecondArray};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
 
     use super::*;
     use crate::definitions::{Entity, Field as FeatureField};
@@ -1475,15 +1517,33 @@ mod tests {
 
     impl Parquet {
         fn write(batch: &RecordBatch) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "feather-offline-{}-{}.parquet",
-                std::process::id(),
-                FIXTURE.fetch_add(1, Ordering::Relaxed)
-            ));
+            let path = new_path();
             let file = std::fs::File::create(&path).expect("create fixture");
             let mut writer =
                 ArrowWriter::try_new(file, batch.schema(), None).expect("parquet writer");
             writer.write(batch).expect("write fixture");
+            writer.close().expect("close fixture");
+            Self { path }
+        }
+
+        /// The same rows as a file whose row groups are the batches given, in the order given,
+        /// so a test can change the layout without changing the data. A maximum row group size
+        /// of one is what forces the flush between them.
+        fn write_row_groups(batches: &[RecordBatch]) -> Self {
+            let schema = batches
+                .first()
+                .map(|batch| batch.schema())
+                .expect("at least one batch");
+            let path = new_path();
+            let file = std::fs::File::create(&path).expect("create fixture");
+            let properties = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(1))
+                .build();
+            let mut writer =
+                ArrowWriter::try_new(file, schema, Some(properties)).expect("parquet writer");
+            for batch in batches {
+                writer.write(batch).expect("write fixture");
+            }
             writer.close().expect("close fixture");
             Self { path }
         }
@@ -1497,6 +1557,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+
+    /// A path no other fixture in this process is using.
+    fn new_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "feather-offline-{}-{}.parquet",
+            std::process::id(),
+            FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// `user_id, event_timestamp, count` as integers.
@@ -1531,6 +1600,27 @@ mod tests {
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+            ],
+        )
+        .expect("source batch")
+    }
+
+    /// `user_id, event_timestamp, created_at, count`, with the created timestamp nullable, so a
+    /// source whose creation times a warehouse left missing can be built.
+    fn nullable_tie_breakable_source(rows: &[(i64, i64, Option<i64>, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("event_timestamp", DataType::Int64, false),
+            Field::new("created_at", DataType::Int64, true),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter(rows.iter().map(|r| r.2))),
                 Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
             ],
         )
@@ -1849,6 +1939,120 @@ mod tests {
             "at 100 the greater created_at wins the tie, so the value is 10 and not 20; at \
              150 the older instant still matches, tie-broken the same way; at 200 the later \
              instant's 30 wins; and (2, 100) shows the second key keeping its own row"
+        );
+    }
+
+    #[test]
+    fn three_rows_at_one_instant_are_ordered_by_their_created_timestamps() {
+        // The tie-break is a sort, so a third row is decided the same way a second is, and the
+        // middle creation must not win just because it is in the middle. `count` crosses
+        // `created_at`, so picking the wrong row changes the answer.
+        let source = Parquet::write(&tie_breakable_source(&[
+            (1, 100, 5, 10),
+            (1, 100, 9, 20),
+            (1, 100, 7, 30),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let joined = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect("join");
+
+        assert_eq!(
+            counts(&joined),
+            [Some(20)],
+            "created_at 9 has the greatest count"
+        );
+    }
+
+    #[test]
+    fn three_rows_nothing_separates_are_refused() {
+        // The tie-break has one column, so a third row sharing it is as undecidable as a pair and
+        // `row_number()` would pick whatever the plan produced. The same rows are written twice,
+        // once as one row group with the tied rows together and once in the opposite order with
+        // a row group each: a refusal that held for one layout and not the other would mean the
+        // plan was still deciding, which is the failure this rule exists to prevent. The second
+        // key is in the file so the layouts differ in more than the tied rows' position.
+        let rows: [(i64, i64, i64, i64); 4] = [
+            (1, 100, 5, 10),
+            (1, 100, 5, 20),
+            (1, 100, 5, 30),
+            (2, 200, 1, 40),
+        ];
+        let together = Parquet::write(&tie_breakable_source(&rows));
+        let spread = Parquet::write_row_groups(
+            &rows
+                .iter()
+                .rev()
+                .map(|row| tie_breakable_source(std::slice::from_ref(row)))
+                .collect::<Vec<_>>(),
+        );
+
+        for (layout, source) in [("one row group", &together), ("a row group each", &spread)] {
+            let mut view = view(&source.string(), None);
+            view.created_timestamp_field = Some("created_at".to_owned());
+
+            let error = engine()
+                .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+                .expect_err("rows no rule separates must be refused");
+
+            assert!(
+                matches!(
+                    &error,
+                    Error::AmbiguousTimestamp {
+                        key,
+                        timestamp: 100,
+                        rows: 3,
+                        tie_break,
+                        ..
+                    } if key == "1" && tie_break == "tied on `created_at`"
+                ),
+                "{layout}: expected key 1 at 100, three rows, named as tied on the created \
+                 timestamp, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_created_timestamp_loses_the_tie_to_a_known_one() {
+        // A warehouse column is nullable in practice, and a row whose creation time is missing
+        // cannot be shown to be the newer one, so it loses to a row that carries a timestamp.
+        // DuckDB already sorts nulls last; the SQL says so rather than relying on the default,
+        // and this asserts the value that comes out.
+        let source = Parquet::write(&nullable_tie_breakable_source(&[
+            (1, 100, Some(9), 20),
+            (1, 100, None, 10),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let joined = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect("a missing created timestamp is not an ambiguity on its own");
+
+        assert_eq!(counts(&joined), [Some(20)]);
+    }
+
+    #[test]
+    fn two_rows_tied_on_a_missing_created_timestamp_are_refused() {
+        // Nulls last settles a missing timestamp against a known one and does nothing for two
+        // missing ones, which are as tied as two equal values. Nulls are grouped together by the
+        // check, so this is the same refusal and not a new rule.
+        let source = Parquet::write(&nullable_tie_breakable_source(&[
+            (1, 100, None, 10),
+            (1, 100, None, 20),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("two rows with no creation time are refused");
+
+        assert!(
+            matches!(error, Error::AmbiguousTimestamp { rows: 2, .. }),
+            "{error}"
         );
     }
 
