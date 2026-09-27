@@ -17,7 +17,17 @@
 //!
 //! - `half` walks the lower half of the key space, so the sorted file's later row
 //!   groups are wholly outside it and the unsorted file's are not.
-//! - `full` walks every key, so no row group is out of range in either file.
+//! - `full` walks every *other* key, so it reaches the top of the key space without
+//!   covering it, and no row group is out of range in either file.
+//!
+//! The label timestamps are placed inside the feature timestamps' range on purpose.
+//! The join predicate is `l.event_timestamp >= f.event_timestamp`, so a label whose
+//! timestamp sits below the feature rows for its key matches nothing at all and the
+//! measurement becomes a decode-and-build-side-sort ratio over a join that returns no
+//! features. The overlap is by construction rather than by a constant that happens to
+//! work: both sides are written from [`FEATURE_TS_BASE`] and [`FEATURE_TS_STEP`], and
+//! `measure` asserts that every label matched a feature row, so a label that stops
+//! landing inside the range fails the program rather than quietly deflating the figures.
 //!
 //! The sorted case should win the first by more than the second. Winning both by the
 //! same wide margin would be a property of this generated data rather than of the
@@ -35,6 +45,9 @@
 //!   with the bytes actually read is what tells the two apart.
 //! - **join ms** is the minimum over `REPEATS` runs, for the reason
 //!   `examples/duckdb_input.rs` gives.
+//! - **matched** is the non-null half of the join's output, and the only figure here
+//!   that can tell a real point-in-time join from one that matched nothing. It is
+//!   asserted, not just printed.
 //!
 //! A filtered scan at the end asks whether the skipping happens for *any* query shape or
 //! only fails for the join. That distinction is the difference between "sorting is still
@@ -60,6 +73,15 @@ const LABELS: usize = 500_000;
 /// Rows per Parquet row group, stated so the row-group figures mean something.
 /// `FEATURE_ROWS` is 16 groups of these, and each sorted group covers 65536 keys.
 const ROW_GROUP_ROWS: usize = 131_072;
+/// Where a feature row's timestamp starts, and how far apart successive rows are.
+///
+/// The feature table is generated in SQL and the labels are generated in Rust, so these
+/// two constants are what the two sides have in common; a label's timestamp is placed
+/// relative to the same base and step, which is why the two ranges overlap by
+/// construction rather than by two independent sets of literals agreeing.
+const FEATURE_TS_BASE: i64 = 1_700_000_000_000_000;
+/// The step between successive feature rows' timestamps, in the same units.
+const FEATURE_TS_STEP: i64 = 7;
 /// Repetitions per figure; the minimum join time and the median byte count are reported.
 /// Seven, because the layout's effect on join time is small enough that three runs
 /// cannot separate it from the run-to-run spread `duckdb_input.rs` already reports.
@@ -89,28 +111,31 @@ fn main() {
     println!("  sorted on disk   {0} bytes", sizes[1]);
 
     // A label frame's key is `i * stride` and its timestamp rises with `i`, so `stride`
-    // is the only thing that decides how much of the key space the join touches.
+    // is the only thing that decides how much of the key space the join touches. The
+    // last key written is the last label's, not one past it, so the bound printed is
+    // the key space the labels actually cover.
     for (name, stride) in [("half", 1), ("full", 2)] {
-        let last_key = (LABELS * stride - 1) as i64;
+        let last_key = ((LABELS - 1) * stride) as i64;
         println!();
         println!("label range {name}: {LABELS} labels over keys 0..{last_key}");
         println!(
-            "{:<10} {:>14} {:>12} {:>14} {:>10} {:>10}",
-            "layout", "bytes read", "groups", "out of range", "join ms", "rows out"
+            "{:<10} {:>14} {:>12} {:>14} {:>10} {:>10} {:>10}",
+            "layout", "bytes read", "groups", "out of range", "join ms", "rows out", "matched"
         );
-        println!("{}", "-".repeat(76));
+        println!("{}", "-".repeat(86));
 
         let mut measured = Vec::new();
         for (label, path) in [("unsorted", UNSORTED_PATH), ("sorted", SORTED_PATH)] {
             let result = measure(&conn, path, stride, last_key);
             println!(
-                "{:<10} {:>14} {:>12} {:>14} {:>10} {:>10}",
+                "{:<10} {:>14} {:>12} {:>14} {:>10} {:>10} {:>10}",
                 label,
                 shown(result.bytes_read),
                 result.groups,
                 result.groups_out_of_range,
                 format!("{:.1}", ms(result.join)),
                 result.rows,
+                result.matched,
             );
             measured.push(result);
         }
@@ -206,7 +231,7 @@ fn connect() -> Connection {
         "CREATE TABLE features AS
          SELECT i,
                 (i % {DISTINCT_KEYS}) AS user_id,
-                1700000000000000 + (i * 7) AS event_timestamp,
+                {FEATURE_TS_BASE} + (i * {FEATURE_TS_STEP}) AS event_timestamp,
                 (i % 1000) AS count
          FROM range({FEATURE_ROWS}) t(i);"
     ))
@@ -229,9 +254,13 @@ fn labels(n: usize, stride: usize) -> RecordBatch {
     let ids: ArrayRef = Arc::new(Int64Array::from(
         (0..n).map(|i| (i * stride) as i64).collect::<Vec<_>>(),
     ));
+    // One step past the feature row for this key, so `l.event_timestamp >=
+    // f.event_timestamp` holds for exactly one of the two rows that key has: the
+    // feature rows for a key sit at the key and at the key plus `DISTINCT_KEYS`, which
+    // is `DISTINCT_KEYS * FEATURE_TS_STEP` microseconds apart.
     let ts: ArrayRef = Arc::new(Int64Array::from(
         (0..n)
-            .map(|i| 1_700_000_000_000_000i64 + i as i64)
+            .map(|i| FEATURE_TS_BASE + (i * stride) as i64 * FEATURE_TS_STEP + FEATURE_TS_STEP)
             .collect::<Vec<_>>(),
     ));
     let schema = Arc::new(Schema::new(vec![
@@ -247,7 +276,7 @@ fn labels(n: usize, stride: usize) -> RecordBatch {
 /// mechanism the claim names.
 fn join_sql(path: &str) -> String {
     format!(
-        "SELECT count(*) FROM labels l ASOF LEFT JOIN read_parquet('{path}') f
+        "SELECT count(*), count(f.user_id) FROM labels l ASOF LEFT JOIN read_parquet('{path}') f
          ON l.user_id = f.user_id AND l.event_timestamp >= f.event_timestamp"
     )
 }
@@ -255,6 +284,7 @@ fn join_sql(path: &str) -> String {
 struct Measured {
     join: Duration,
     rows: i64,
+    matched: i64,
     bytes_read: Option<u64>,
     groups: usize,
     groups_out_of_range: usize,
@@ -277,10 +307,11 @@ fn measure(conn: &Connection, path: &str, stride: usize, last_key: i64) -> Measu
     let mut join = Duration::MAX;
     let mut bytes = Vec::new();
     let mut rows = 0;
+    let mut matched = 0;
     for _ in 0..REPEATS {
         let before = rchar();
         let started = Instant::now();
-        let matched = run_join(conn, path);
+        let counted = run_join(conn, path);
         let elapsed = started.elapsed();
         if let (Some(before), Some(after)) = (before, rchar()) {
             if after > before {
@@ -288,17 +319,28 @@ fn measure(conn: &Connection, path: &str, stride: usize, last_key: i64) -> Measu
             }
         }
         join = join.min(elapsed);
-        rows = matched;
+        rows = counted.0;
+        matched = counted.1;
     }
     // Every case is an `ASOF LEFT JOIN`, so the row count is the label count whatever
     // the layout did. A different number means the two cases are not comparable.
     assert_eq!(rows, LABELS as i64, "every label row survives the join");
+    // A `LEFT JOIN` returns a row per label whether or not a feature row matched it, so
+    // the assertion above holds for a join that matched nothing. This one does not: it
+    // is the check that the label timestamps are inside the feature rows' range, and
+    // without it a label frame that misses entirely would leave the join timings and
+    // the byte counts measuring a build-side sort and a decode.
+    assert_eq!(
+        matched, LABELS as i64,
+        "every label matched a feature row, so the join is a join"
+    );
     bytes.sort_unstable();
 
     let groups = key_ranges(conn, path);
     Measured {
         join,
         rows,
+        matched,
         bytes_read: bytes.get(bytes.len() / 2).copied(),
         groups: groups.len(),
         groups_out_of_range: groups
@@ -337,10 +379,13 @@ fn measure_scan(conn: &Connection, path: &str, last_key: i64) -> Option<u64> {
     bytes.get(bytes.len() / 2).copied()
 }
 
-fn run_join(conn: &Connection, path: &str) -> i64 {
+/// The join's output rows and how many of them carry a feature row.
+fn run_join(conn: &Connection, path: &str) -> (i64, i64) {
     let sql = join_sql(path);
     let mut statement = conn.prepare(&sql).expect("prepare join");
-    statement.query_row([], |row| row.get(0)).expect("run join")
+    statement
+        .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("run join")
 }
 
 /// Bytes this process has read from files so far, from the kernel's own counter.
@@ -364,8 +409,9 @@ fn rchar() -> Option<u64> {
 ///
 /// The pruning opportunity rather than a record of what the reader did: this is what
 /// could have been skipped given the label keys, from the same statistics the reader
-/// uses to decide. The measured bytes are what it actually read, and the two agreeing
-/// is what confirms the mechanism.
+/// uses to decide. The measured bytes are what it actually read, and comparing the two
+/// is the measurement: they do not agree, and that is the finding rather than a
+/// confirmation of anything.
 fn key_ranges(conn: &Connection, path: &str) -> Vec<(i64, i64, u64)> {
     let sql = format!(
         "SELECT max(CASE WHEN path_in_schema = 'user_id'
@@ -389,9 +435,13 @@ fn key_ranges(conn: &Connection, path: &str) -> Vec<(i64, i64, u64)> {
     while let Some(row) = rows.next().expect("read row groups") {
         let low: Option<i64> = row.get(0).expect("min");
         let high: Option<i64> = row.get(1).expect("max");
-        let bytes: Option<u64> = row.get(2).expect("bytes");
+        // Signed rather than `u64`, because whether duckdb-rs 1.105 implements
+        // `FromSql` for `u64` is not established here and a build is not runnable on
+        // the machine this was written on. A `total_compressed_size` is non-negative,
+        // so the cast is lossless and `max` only guards a sum that came back negative.
+        let bytes: Option<i64> = row.get(2).expect("bytes");
         if let (Some(low), Some(high)) = (low, high) {
-            ranges.push((low, high, bytes.unwrap_or(0)));
+            ranges.push((low, high, bytes.unwrap_or(0).max(0) as u64));
         }
     }
     ranges

@@ -60,18 +60,35 @@ def a_postgres_view() -> FeatureView:
     )
 
 
+def a_vortex_view() -> FeatureView:
+    """A view whose source names the one non-default format, in the same shape as :func:`a_view`.
+
+    In the shared fixture, so `"vortex"` is compared across the boundary rather than
+    asserted twice, once per language: a rename on either side alone would leave the
+    other side's test green.
+
+    Returns:
+        The view whose serialized form names a format.
+    """
+    return a_view(
+        name="user_events",
+        source=FileSource(path="s3://lake/clicks.vortex", format="vortex"),
+        features=[Field(name="event_count", dtype="int64")],
+    )
+
+
 def a_config() -> FeatureStoreConfig:
     """The canonical project: one view per source kind, and a service referencing one.
 
     Both kinds are in the shared fixture, so the tag is compared across the boundary
-    rather than asserted twice, once per language.
+    rather than asserted twice, once per language, and so is the format name.
 
     Returns:
         The config whose serialized form is the shared fixture.
     """
     return FeatureStoreConfig(
         project="ads",
-        views=[a_view(ttl_days=30), a_postgres_view()],
+        views=[a_view(ttl_days=30), a_postgres_view(), a_vortex_view()],
         services=[FeatureService(name="ranking", features=["user_clicks:click_count"])],
     )
 

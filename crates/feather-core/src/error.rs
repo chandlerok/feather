@@ -1,3 +1,6 @@
+#[cfg(feature = "offline")]
+use std::fmt;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -214,22 +217,20 @@ pub enum Error {
         reason: String,
     },
 
-    /// A format's extension that could not be installed or loaded.
+    /// An extension that could not be installed or loaded.
     ///
     /// The tier travels with it because that is the whole reason a non-Primary format
     /// is opt-in: an operator reading this needs to know they are on a best-effort or
     /// third-party path, and the extension's own message names neither the view nor the
-    /// format.
+    /// format. It travels only for the format's own reader, because `httpfs` reads no
+    /// format and has no tier, and an `s3://` Parquet source that cannot reach the
+    /// extension repository must not be told that `httpfs` reads Parquet.
     #[cfg(feature = "offline")]
-    #[error(
-        "view `{view}` could not load the `{extension}` extension, which reads {format} and \
-         is {tier} tier: {source}"
-    )]
+    #[error("view `{view}` could not load the `{extension}` extension{reader}: {source}")]
     ExtensionUnavailable {
         view: String,
         extension: &'static str,
-        format: &'static str,
-        tier: &'static str,
+        reader: ExtensionReader,
         #[source]
         source: duckdb::Error,
     },
@@ -237,4 +238,70 @@ pub enum Error {
     #[cfg(feature = "valkey")]
     #[error("valkey: {0}")]
     Valkey(#[from] redis::RedisError),
+}
+
+/// What a failed extension load says about the format the extension reads.
+///
+/// Empty for an extension that is not a format's reader, which is the whole point: the
+/// same [`Error::ExtensionUnavailable`] covers `httpfs` and a format's own extension,
+/// and only the second has a format and a tier to name.
+#[cfg(feature = "offline")]
+#[derive(Debug)]
+pub struct ExtensionReader(Option<(&'static str, &'static str)>);
+
+#[cfg(feature = "offline")]
+impl fmt::Display for ExtensionReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((format, tier)) = self.0 {
+            write!(formatter, ", which reads {format} and is {tier} tier")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "offline")]
+impl Error {
+    /// A `duckdb` failure installing or loading `extension` for `view`.
+    ///
+    /// `reader` is the format's `(name, tier)` when `extension` is that format's own
+    /// reader, and `None` for anything else, so the message attributes a format and a
+    /// tier only to the extension that has them.
+    pub fn extension_unavailable(
+        view: String,
+        extension: &'static str,
+        reader: Option<(&'static str, &'static str)>,
+        source: duckdb::Error,
+    ) -> Self {
+        Self::ExtensionUnavailable {
+            view,
+            extension,
+            reader: ExtensionReader(reader),
+            source,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "offline"))]
+mod tests {
+    use super::ExtensionReader;
+
+    #[test]
+    fn a_format_readers_failure_clause_names_the_format_and_the_tier() {
+        // The whole reason the clause exists: an operator reading a load failure for a
+        // non-Primary format has to be told they are on a third-party path. Rendered here
+        // rather than only through a real failed install, because provoking one needs an
+        // extension repository this test must not depend on.
+        assert_eq!(
+            ExtensionReader(Some(("vortex", "third-party maintained"))).to_string(),
+            ", which reads vortex and is third-party maintained tier"
+        );
+    }
+
+    #[test]
+    fn a_filesystems_failure_clause_is_nothing_at_all() {
+        // `httpfs` reads no format and is no tier, so a clause naming one is not a
+        // smaller claim, it is the wrong claim. The message reads
+        // "could not load the `httpfs` extension: <duckdb's own text>" instead.
+        assert_eq!(ExtensionReader(None).to_string(), "");
+    }
 }

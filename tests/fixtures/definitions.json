@@ -47,6 +47,29 @@
       "ttl_days": null,
       "timestamp_field": null,
       "created_timestamp_field": null
+    },
+    {
+      "name": "user_events",
+      "entities": [
+        {
+          "name": "user_id",
+          "join_key": "user_id"
+        }
+      ],
+      "source": {
+        "type": "file",
+        "path": "s3://lake/clicks.vortex",
+        "format": "vortex"
+      },
+      "features": [
+        {
+          "name": "event_count",
+          "dtype": "int64"
+        }
+      ],
+      "ttl_days": null,
+      "timestamp_field": null,
+      "created_timestamp_field": null
     }
   ],
   "services": [

@@ -2,8 +2,9 @@
 //!
 //! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix, and
 //! a warehouse table are read by different readers and joined the same way, so nothing here
-//! selects a compute backend: [`Engine::relation`] is the one place a source's kind decides
-//! which reader its rows come from.
+//! selects a compute backend: [`Engine::relation`] is the one place a source becomes
+//! a relation, and so the one place its kind and a file source's format decide which
+//! reader its rows come from.
 //!
 //! The rules are the ones specified under "Point-in-time join semantics" in the
 //! architecture document, and they live here rather than in the caller because getting them
@@ -335,28 +336,24 @@ impl Engine {
     ///         source names a connection the project cannot use. Checked before the
     ///         extension is installed, so a connection mistake fails as itself rather
     ///         than after a fetch.
-    ///     [`Error::ExtensionUnavailable`] if an extension cannot be installed or loaded.
+    ///     [`Error::ExtensionUnavailable`] if a file source's format extension, or the
+    ///         filesystem a remote path needs, cannot be installed or loaded. A Postgres
+    ///         source's extension is not covered: it is still [`Error::DuckDb`].
     ///     [`Error::DuckDb`] if the connection cannot be used.
     fn ensure_source_loaded(&self, view: &FeatureView) -> Result<()> {
         let format = view.source_format()?;
         match &view.source {
             Source::File { path, .. } => {
-                let mut extensions = Vec::new();
-                if path_needs_filesystem(path) {
-                    extensions.push("httpfs");
-                }
-                if let Some(extension) = format_reader(format).1 {
-                    extensions.push(extension);
-                }
-                for extension in extensions {
+                for (extension, reader) in extensions_for(path, format) {
                     self.connection()?
                         .execute_batch(&format!("INSTALL {extension}; LOAD {extension};"))
-                        .map_err(|source| Error::ExtensionUnavailable {
-                            view: view.name.clone(),
-                            extension,
-                            format: format.as_str(),
-                            tier: format.tier().as_str(),
-                            source,
+                        .map_err(|source| {
+                            Error::extension_unavailable(
+                                view.name.clone(),
+                                extension,
+                                reader,
+                                source,
+                            )
                         })?;
                 }
             }
@@ -1248,8 +1245,9 @@ impl Engine {
     /// The table expression a view's source becomes.
     ///
     /// The one place a source becomes a relation, so `DESCRIBE`, the join, and the
-    /// ambiguity check all read the same expression rather than re-deriving it. A
-    /// reader added later, a warehouse table or a table format, changes this and
+    /// ambiguity check all read the same expression rather than re-deriving it. For a
+    /// file source the format, not the kind, selects the reader. A reader added later,
+    /// a warehouse table or a table format, changes this and
     /// [`Engine::ensure_source_loaded`], which is where its extension is loaded.
     ///
     /// Args:
@@ -1433,6 +1431,31 @@ fn s3_secret_sql(name: &str, configured: &SettingsConnection) -> Option<String> 
 /// plain HTTP. A bare path is the local filesystem, which needs nothing loaded.
 fn path_needs_filesystem(path: &str) -> bool {
     path.contains("://")
+}
+
+/// The extensions a file source needs installed, with the format each one reads.
+///
+/// An `Option<(&'static str, &'static str)>` alongside each extension is the `(name,
+/// tier)` pair [`Error::extension_unavailable`] names, and it is `None` for anything
+/// that is not a format's own reader: `httpfs` reads no format and is no tier, so a
+/// remote Parquet source must not have one attributed to its filesystem.
+///
+/// A fixed-size array rather than a `Vec` grown by `push`, so the two cases are
+/// visible side by side and there is no lint question about pushing conditionally
+/// collected values. The order is the filesystem first, because a remote path cannot
+/// be read at all without it, and the format's own extension second.
+fn extensions_for(
+    path: &str,
+    format: FileFormat,
+) -> [Option<(&'static str, Option<(&'static str, &'static str)>)>; 2] {
+    let reader = format_reader(format).1;
+    [
+        (path_needs_filesystem(path).then_some("httpfs"), None),
+        (
+            reader,
+            reader.map(|_| (format.as_str(), format.tier().as_str())),
+        ),
+    ]
 }
 
 /// How a file format is read: the table function that yields its rows, and the DuckDB
@@ -2310,6 +2333,49 @@ mod tests {
 
         assert_eq!(parquet, "read_parquet('data/user_stats.parquet')");
         assert_eq!(vortex, "read_vortex('s3://lake/clicks.vortex')");
+    }
+
+    #[test]
+    fn a_format_naming_no_compiled_reader_still_names_the_extension_it_needs_installed() {
+        // The install loop is the only place a format turns into a fetch, so it is
+        // asserted where it happens rather than through the reader mapping alone. A
+        // vortex source must reach `INSTALL vortex`; a local Parquet source must reach
+        // nothing, or a project that names no non-default format would touch the
+        // extension repository.
+        assert_eq!(
+            extensions_for("data/clicks.vortex", FileFormat::Vortex),
+            [
+                (None, None),
+                (Some("vortex"), Some(("vortex", "third-party maintained"))),
+            ],
+            "a vortex source installs the vortex extension, and names its tier"
+        );
+        assert_eq!(
+            extensions_for("data/user_stats.parquet", FileFormat::Parquet),
+            [(None, None), (None, None)],
+            "a local parquet source installs nothing"
+        );
+    }
+
+    #[test]
+    fn a_filesystem_extension_is_never_credited_with_a_format_or_a_tier() {
+        // `httpfs` reads no format and is no tier. A remote Parquet source needs it and
+        // does not need the Parquet reader, so crediting it with a format and a Primary
+        // tier would tell an operator the opposite of what is true: that the failure they
+        // are reading about is a third-party path.
+        assert_eq!(
+            extensions_for("s3://lake/user_stats.parquet", FileFormat::Parquet),
+            [(Some("httpfs"), None), (None, None)],
+            "httpfs was attributed a format"
+        );
+        assert_eq!(
+            extensions_for("s3://lake/clicks.vortex", FileFormat::Vortex),
+            [
+                (Some("httpfs"), None),
+                (Some("vortex"), Some(("vortex", "third-party maintained"))),
+            ],
+            "a remote vortex source names the format for its reader and not for httpfs"
+        );
     }
 
     #[test]

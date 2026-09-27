@@ -253,10 +253,18 @@ impl Source {
     /// This kind's string fields, as `(key, value)` pairs.
     ///
     /// The keys are the wire names, so an error about one names the key the author
-    /// wrote rather than the variant it selects.
+    /// wrote rather than the variant it selects. An absent optional contributes no
+    /// pair: there is no value to be empty, and an absent `format` is the default
+    /// rather than a declaration.
     fn string_fields(&self) -> Vec<(&'static str, &str)> {
         match self {
-            Self::File { path, .. } => vec![("path", path)],
+            Self::File { path, format } => {
+                let mut fields = vec![("path", path.as_str())];
+                if let Some(format) = format {
+                    fields.push(("format", format.as_str()));
+                }
+                fields
+            }
             Self::Postgres {
                 connection,
                 schema,
@@ -731,6 +739,28 @@ mod tests {
                 .source_format()
                 .expect("parquet"),
             FileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn an_empty_format_is_refused_as_an_empty_source_field() {
+        // The core is the authority on the rule that no source field is empty, and
+        // Python enforces it with `NonEmptyStr`. A binding that does not would
+        // otherwise get the reader's error instead of the sibling one, and the sibling
+        // one is what names the field the author wrote.
+        let definitions = Definitions::from_json(
+            r#"{"project":"ads","views":[{"name":"user_clicks",
+                "entities":[{"name":"user_id","join_key":"user_id"}],
+                "source":{"type":"file","path":"data/user_stats.parquet","format":""},
+                "features":[{"name":"click_count","dtype":"int64"}]}]}"#,
+        )
+        .expect("valid");
+
+        let error = definitions.validate().expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` declares an empty `format` in its source"
         );
     }
 
