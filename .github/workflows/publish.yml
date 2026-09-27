@@ -172,7 +172,7 @@ jobs:
           maturin-version: v1.15.0
           args: >-
             --release --locked --compatibility pypi
-            -i python3.11
+            -i python3.11 --out dist
       # One artifact per platform rather than one shared name, because the four
       # wheels differ only in their platform tag and a shared name would have
       # each upload overwrite the last.
@@ -202,6 +202,7 @@ jobs:
     permissions:
       # Job-level, on the job that mints the OIDC token and nothing else.
       id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
