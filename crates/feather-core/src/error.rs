@@ -5,6 +5,17 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The size ceiling `clippy::result_large_err` enforces, as a compile error instead.
+///
+/// The lint reports a lint-worthy value at every function that returns it, which for an
+/// error enum is most of the crate, so the report arrives as a wall of identical
+/// diagnostics pointing at fields rather than at the enum that is actually too big. A
+/// size assertion names the real problem, and it holds under every feature combination
+/// rather than only the one a lint run happened to enable. It is 128, clippy's own
+/// threshold, not a rounder number: an enum this size is already paying for a `memcpy`
+/// per `Result` it hands back, and the headroom under it is the point of the ceiling.
+const _: () = assert!(std::mem::size_of::<Error>() <= 128);
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("entity `{entity}` has no key components")]
@@ -225,6 +236,16 @@ pub enum Error {
     /// format. It travels only for the format's own reader, because `httpfs` reads no
     /// format and has no tier, and an `s3://` Parquet source that cannot reach the
     /// extension repository must not be told that `httpfs` reads Parquet.
+    ///
+    /// `source` is boxed, unlike every other `#[source]` here, and that is a size
+    /// decision rather than a taste one. `duckdb::Error` is an enum of its own whose
+    /// widest variant carries an Arrow `Type`, so it runs to tens of bytes; added to
+    /// the three fields above it this variant crossed the 128 bytes at which
+    /// `clippy::result_large_err` starts reporting every function that returns a
+    /// `Result<_, Error>`. The other source fields are `std::io::Error` at eight
+    /// bytes and never came close. One heap cell on the error path is the cheap half
+    /// of that trade; the other half is that the enum is now sized by the pre-existing
+    /// four-`String` variants, which the assertion above holds in place.
     #[cfg(feature = "offline")]
     #[error("view `{view}` could not load the `{extension}` extension{reader}: {source}")]
     ExtensionUnavailable {
@@ -232,7 +253,7 @@ pub enum Error {
         extension: &'static str,
         reader: ExtensionReader,
         #[source]
-        source: duckdb::Error,
+        source: Box<duckdb::Error>,
     },
 
     #[cfg(feature = "valkey")]
@@ -266,6 +287,9 @@ impl Error {
     /// `reader` is the format's `(name, tier)` when `extension` is that format's own
     /// reader, and `None` for anything else, so the message attributes a format and a
     /// tier only to the extension that has them.
+    ///
+    /// The `source` is taken by value and boxed here, so the one caller does not have
+    /// to know that the variant stores it indirectly.
     pub fn extension_unavailable(
         view: String,
         extension: &'static str,
@@ -276,7 +300,7 @@ impl Error {
             view,
             extension,
             reader: ExtensionReader(reader),
-            source,
+            source: Box::new(source),
         }
     }
 }
