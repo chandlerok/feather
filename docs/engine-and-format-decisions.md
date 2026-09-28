@@ -185,33 +185,29 @@ the scan has already read.
 Measured with `examples/layout.rs`: one generated 2M-row feature table over 1M distinct keys,
 written twice with the same writer and the same 131072-row row groups, differing only in row
 order. `unsorted` is a deterministic permutation of the same rows, so no row group has local
-key structure; `sorted` is ordered by `(user_id, event_timestamp)`. 500k labels, minimum of
-seven runs, DuckDB 1.105.05. `half` labels are over the lower half of the key space (stride 1)
-and `full` over every other key (stride 2), so `full` reaches the top of the key space without
-covering all of it.
+key structure; `sorted` is ordered by `(user_id, event_timestamp)`. 500k labels, DuckDB
+1.105.05. `half` labels are over the lower half of the key space (stride 1) and `full` over
+every other key (stride 2), so `full` reaches the top of the key space without covering all of
+it.
 
 | Figure                              | unsorted     | sorted       | sorted wins by |
 | ----------------------------------- | ------------ | ------------ | -------------- |
 | file size                           | 20,887,564 B | 14,495,033 B | 30.6%          |
 | bytes read by the join              | 20,545,535 B | 14,068,158 B | 31.5%          |
 | row groups wholly out of range      | 0 of 16      | 8 of 16      | —              |
-| join, labels over half the keys †   | 174.4 ms     | 138.9 ms     | not measured † |
-| join, labels over every other key † | 178.9 ms     | 142.4 ms     | not measured † |
+| join, labels over half the keys †   | not measured | not measured | —              |
+| join, labels over every other key † | not measured | not measured | —              |
 
-**† The two join times are stale and must be re-measured before they are quoted.** The run
-that produced them gave the label frame timestamps that fell below the feature rows' timestamps
-for their key, so a single label of 500,000 matched anything: the figure is a
-decode-and-build-side-sort ratio, not a point-in-time join. No run of the fixed program has been
-made on this machine, so no replacement figure exists yet and the ratio is not stated anywhere
-in this document. The bytes and the file sizes are decode-side and do not depend on the
-predicate, which is why they stand; the example now places the label timestamps inside the
-feature range and asserts that every label matched, so the next run measures a join that joins.
+**† Not measured, and withdrawn rather than restated.** The run that produced a figure here
+gave the label frame timestamps that fell below the feature rows' timestamps for their key, so
+a single label of 500,000 matched anything: what it timed was a decode-and-build-side sort, not
+a point-in-time join. The bytes and the file sizes are decode-side and do not depend on the
+predicate, which is why they stand. The example now places the label timestamps inside the
+feature range and asserts that every label matched, so the next run of `examples/layout.rs`
+measures a join that joins.
 
-Every byte count here reproduced exactly across three runs, and these times come from a run on
-an otherwise idle machine, which is why the absolute times are not comparable with anything
-measured elsewhere. That run is the stale one above, so there is no join ratio to quote from it:
-the layout's effect on join time is the open question this table leaves, and the next run of
-`examples/layout.rs` answers it. Quote the byte counts, which are what stands.
+Every byte count here reproduced exactly across three runs. Quote those, and leave the join time
+unquoted: the layout's effect on it is the open question this table leaves.
 
 What the layout actually buys is compression, not pruning. Clustered keys are the same value
 over and over, which is what dictionary encoding is for, so the file is 30.6% smaller and there
