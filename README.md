@@ -177,10 +177,14 @@ under `target/` and can accept code the pinned compiler rejects, and the resolve
 version is what the CI build cache is keyed on.
 
 The hook is local. It guards only a clone where it has been installed, and
-`git push --no-verify` skips it. Server-side enforcement is not available on this
-repository: it is private, and GitHub offers branch protection and branch rulesets for
-private repositories only on a paid plan. Making the repository public, or upgrading to
-GitHub Pro, is what would close that gap.
+`git push --no-verify` skips it. The backstop is server-side, and it is the reason this
+repository is public rather than private: GitHub offers branch protection and branch rulesets
+to private repositories only on a paid plan, so while it was private there was no way to
+require a check before `main` could change. `main` is now a protected branch and a pull
+request has to clear all five checks — `lint`, `rust`, `python 3.11`, `python 3.14`, and
+`wheel` — with the branch up to date, and force pushes and branch deletion are off. A push
+that skips the hook still cannot land; it just fails after the Rust build instead of in a
+second, which is what the hook is for.
 
 ## License
 

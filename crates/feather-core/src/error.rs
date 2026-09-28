@@ -192,8 +192,8 @@ pub enum Error {
 
     #[cfg(feature = "offline")]
     #[error(
-        "view `{view}` has {rows} rows for `{key_column}` = `{key}` at timestamp {timestamp}, and \
-         declares no created_timestamp_field, so which one wins would depend on the query plan"
+        "view `{view}` has {rows} rows for `{key_column}` = `{key}` at timestamp {timestamp} \
+         {tie_break}, so which one wins would depend on the query plan"
     )]
     AmbiguousTimestamp {
         view: String,
@@ -201,6 +201,9 @@ pub enum Error {
         key: String,
         timestamp: i64,
         rows: i64,
+        /// What stopped the tie from being broken: that the view declares no created
+        /// timestamp, or that the tied rows share the one it declares.
+        tie_break: String,
     },
 
     #[cfg(feature = "offline")]

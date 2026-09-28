@@ -712,10 +712,17 @@ If two feature rows share the same entity key and the same maximal timestamp, `A
 picks one without a documented rule. Feather resolves this deterministically before the
 join: if `created_timestamp_field` is declared, the row with the greatest
 `created_timestamp` wins; if it is not declared, the join fails with an error rather than
-returning a planner-dependent value. Rows that are also tied on `created_timestamp` are the
-one case left unresolved: the ambiguity check is skipped once the field is declared, so the
-winner there is whatever the plan returns, and a source that can repeat a
-`created_timestamp` within one key and instant is not refused.
+returning a planner-dependent value. A row with a null `created_timestamp` sorts last, so
+it loses to a row that carries one.
+
+The tie-break has one column, so rows that share the created timestamp as well are
+undecidable too, and a third such row is no more decidable than a second. There is no
+further key to order by: the view declares the entity, the features and the two timestamps
+and nothing else, and a row's position in the file is not something a Postgres table or an
+object-storage prefix offers at all. Those rows are therefore refused with the same error as
+the undeclared case, naming the created timestamp they are tied on. A refresh refuses them
+before writing anything of that view's, so serving never answers from a source training
+would not read.
 
 ### Null keys
 
