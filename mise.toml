@@ -12,7 +12,16 @@ uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
 # from the schema it loads.
 hk = "1.56.1"
-ruff = "latest"
+# Pinned, for a different reason than rust above. No cache is keyed on ruff:
+# rust-cache keys on the resolved rustc version, there is no mise.lock, and the
+# `lint` job's only other cache is mise's own install cache, so a floating ruff
+# costs nothing to re-resolve. What it costs is disagreement. `ruff format
+# --check` is the CI gate, and `mise run format` and `hk fix` both rewrite files
+# through hk.pkl's Builtins.ruff_format, so a formatter release lands as an
+# unrelated reformat inside whatever PR happens to be open. That is the hk class
+# of reason, not the rust one. The version is the one resolved here; bumping it is a one-line change, and
+# pyproject.toml's ruff configuration was written against the 0.12.x series.
+ruff = "0.16.9"
 maturin = "latest"
 # Formats every non-Rust, non-Python file type: JSON, TOML, YAML, Markdown,
 # Dockerfile. cargo owns Rust, ruff owns Python.
