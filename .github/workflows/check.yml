@@ -677,7 +677,12 @@ jobs:
             start=$SECONDS
             clippy_and_build
             echo "RESULT $label: $(( SECONDS - start ))s"
-            du -sh ~/.cache/ccache
+            # `CCACHE_DISABLE=1` leaves the wrapper in place but stops ccache, and a
+            # ccache that never ran creates no directory, so the baseline phase has
+            # nothing to measure here. Without the guard the `du` fails under
+            # `set -euo pipefail` and takes the two phases this job exists to run
+            # down with it.
+            du -sh ~/.cache/ccache 2>/dev/null || echo "no ccache directory: ccache was disabled"
             ccache --show-stats | grep -Ei 'hit|miss|direct|cacheable' || true
             df -h /
           }
