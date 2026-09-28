@@ -298,22 +298,56 @@ jobs:
       # failure rather than a zero: `[ "$x" -eq 0 ]` on a multi-line value
       # returns 2, `set -e` does not fire inside an `if` condition, and the
       # guard that was supposed to catch a miss would pass instead.
+      #
+      # The cap is checked here too, and that is the third condition rather than
+      # a comment. `ccache --show-stats` run from a shell step is a ccache
+      # process cargo never started, so it reads no `CCACHE_MAXSIZE` and reports
+      # ccache's own default. Measured on the pinned 4.14.1: an unset
+      # `CCACHE_MAXSIZE` reports `Cache size (GiB): 0.0 / 5.0` and `3G` reports
+      # `0.0 / 3.0`, so the `5.0` in this job's own log is that default and
+      # says nothing either way about the cap that was in force while the
+      # extension compiled. What was in force came from the same `[env]` table,
+      # in the same environment block, as `CC`, and the cacheable calls above
+      # are the proof that table reached maturin's cargo. The part that can be
+      # checked from here is that the value in the file is one ccache accepts
+      # and attributes to the environment; the rest is a comment above
+      # `.cargo/config.toml` and, now, a `3.0` or a `5.0` nobody has to guess
+      # about.
       - name: ccache reached the extension build
         run: |
           set -euo pipefail
           stats=$(ccache --show-stats)
           printf '%s\n' "$stats"
           restored="${{ steps.ccache.outputs.entries }}"
+          # ccache 4.14 prints a ratio and not a count:
+          # `Cacheable calls:    371 / 371 (100.0%)`, the numerator left
+          # aligned in the label's column and the denominator right aligned in a
+          # four wide field, so neither integer's width is predictable. The
+          # number is therefore the leading integer before the `/`, and the
+          # rest of the line is anchored rather than assumed: a bare integer, a
+          # thousands separator, a unit suffix, a missing percentage, or
+          # trailing text all leave the line unsubstituted and trip the case
+          # below instead of yielding a truncated count that reads like a real
+          # one. That is the same loudness the previous end-of-line anchor
+          # bought, on the shape ccache actually prints; anchoring the count to
+          # the end of the line rejected every line ccache can emit, so the
+          # step failed on every run and asserted nothing.
+          #
           # `0,/re/` rather than `/re/`, so the range ends at the first match and
-          # exactly one line is printed. ccache's stats carry an indented
-          # `Hits:` sub-line under more than one call category, and a `sed
-          # s///p` over the whole output would concatenate them.
-          # The number is anchored to the end of the line so that a format
-          # change, a thousands separator or a unit suffix, leaves the line
-          # unsubstituted and trips the case below rather than yielding a
-          # truncated count that reads as a real one.
+          # exactly one line is printed. For `Hits:` that is a choice of which
+          # counter rather than only a de-duplication: ccache prints a `Hits:`
+          # line per call category, and two of them, the call-category one and
+          # the local-storage one, share the `Cacheable calls:` line's
+          # indentation, so indentation cannot tell them apart. The first is
+          # the one this wants, because ccache prints it directly beneath
+          # `Cacheable calls:` as that category's hit count. The other is
+          # under `Local storage:` and counts cache entries served out of the
+          # local directory, which is a different thing from a compiled result
+          # being reused; taking it would test a counter this build barely
+          # moves, which passes vacuously on exactly the run the assertion
+          # exists to fail.
           cacheable=$(printf '%s\n' "$stats" \
-            | sed -n '0,/^ *Cacheable calls:/{s/^ *Cacheable calls: *\([0-9][0-9]*\)[[:space:]]*$/\1/p;}')
+            | sed -n '0,/^ *Cacheable calls:/{s/^ *Cacheable calls: *\([0-9][0-9]*\) *\/ *[0-9][0-9]* *( *[0-9][0-9.]*%)[[:space:]]*$/\1/p;}')
           case "$restored" in
             '' | *[!0-9]*)
               echo "ccache action reported a file count that is not an integer" >&2
@@ -332,7 +366,7 @@ jobs:
             exit 1
           fi
           hits=$(printf '%s\n' "$stats" \
-            | sed -n '0,/^ *Hits:/{s/^ *Hits: *\([0-9][0-9]*\)[[:space:]]*$/\1/p;}')
+            | sed -n '0,/^ *Hits:/{s/^ *Hits: *\([0-9][0-9]*\) *\/ *[0-9][0-9]* *( *[0-9][0-9.]*%)[[:space:]]*$/\1/p;}')
           case "$hits" in
             '' | *[!0-9]*)
               echo "no single Hits integer in ccache --show-stats" >&2
@@ -344,6 +378,33 @@ jobs:
             echo "restored $restored ccache files and this build hit none" >&2
             exit 1
           fi
+          # The cap last, because it is the only one of the three that is a
+          # property of this repository rather than of this run, so it should
+          # not be what masks a real build failure. Read from
+          # `.cargo/config.toml` rather than from the environment, deliberately:
+          # a step that inherited the variable would be checking its own env
+          # and proving nothing about the file cargo reads.
+          cap=$(sed -n 's/^CCACHE_MAXSIZE *= *"\([^"]*\)"$/\1/p' .cargo/config.toml)
+          case "$cap" in
+            '' | *[!0-9A-Za-z.]*)
+              echo "no CCACHE_MAXSIZE in .cargo/config.toml" >&2
+              exit 1
+              ;;
+          esac
+          # `ccache --show-config` names the source of every setting, so
+          # `(environment) max_size` is ccache saying it took the value from
+          # the environment, and a line reading `(default) max_size` is ccache
+          # saying the opposite. Both the cap being rejected as a size string
+          # and the cap silently not being in force land on the same empty
+          # result here, which is the failure either way.
+          applied=$(CCACHE_MAXSIZE="$cap" ccache --show-config \
+            | sed -n 's/^(environment) max_size = \(.*\)$/\1/p')
+          if [ -z "$applied" ]; then
+            echo "ccache does not report an environment max_size for CCACHE_MAXSIZE=$cap" >&2
+            CCACHE_MAXSIZE="$cap" ccache --show-config >&2 || true
+            exit 1
+          fi
+          echo "ccache reports max_size = $applied for the configured CCACHE_MAXSIZE=$cap"
       # Gating, and not covered by pytest: tests/test_typing_contract.py pins
       # the typed definition API with assert_type and with
       # `# pyrefly: ignore[kind]`, which pyrefly rejects once the ignore stops

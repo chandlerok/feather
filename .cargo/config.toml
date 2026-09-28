@@ -29,4 +29,11 @@ CXX = "ccache g++"
 # its own cargo entry is small. It is not a reason to cap the restore: a
 # truncated ccache directory is a partial hit rate, and that job is the one
 # this whole mechanism is for.
+#
+# A `ccache --show-stats` in a CI log reads `Cache size (GiB): 0.0 / 5.0`, and
+# 5.0 GiB is ccache's default rather than a sign this line is ignored: a shell
+# step's ccache is a process cargo never started, so it inherits no `[env]`
+# table, and only the ccache processes cargo spawns during the compile read
+# this. The python job's assertion checks the value here against what ccache
+# reports for it, so the cap is observed rather than assumed.
 CCACHE_MAXSIZE = "3G"
