@@ -743,20 +743,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_format_is_refused_as_an_empty_source_field() {
+    fn an_empty_format_is_refused_when_the_json_is_read() {
         // The core is the authority on the rule that no source field is empty, and
         // Python enforces it with `NonEmptyStr`. A binding that does not would
         // otherwise get the reader's error instead of the sibling one, and the sibling
-        // one is what names the field the author wrote.
-        let definitions = Definitions::from_json(
+        // one is what names the field the author wrote. `from_json` validates, so the
+        // binding is refused here rather than handed a `Definitions` it has to
+        // remember to check; reaching this through `from_json` is what pins that.
+        let error = Definitions::from_json(
             r#"{"project":"ads","views":[{"name":"user_clicks",
                 "entities":[{"name":"user_id","join_key":"user_id"}],
                 "source":{"type":"file","path":"data/user_stats.parquet","format":""},
                 "features":[{"name":"click_count","dtype":"int64"}]}]}"#,
         )
-        .expect("valid");
-
-        let error = definitions.validate().expect_err("must fail");
+        .expect_err("must fail");
 
         assert_eq!(
             error.to_string(),
