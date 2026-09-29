@@ -207,14 +207,6 @@ pub enum Error {
     },
 
     #[cfg(feature = "offline")]
-    #[error("could not read `{path}`: {source}")]
-    Source {
-        path: String,
-        #[source]
-        source: duckdb::Error,
-    },
-
-    #[cfg(feature = "offline")]
     #[error("view `{view}` failed while its source was scanned: {reason}")]
     StreamInterrupted { view: String, reason: String },
 
@@ -223,12 +215,22 @@ pub enum Error {
     /// The scanner's own text is carried in the message rather than replaced, since it is
     /// the only description of what went wrong; naming the view and the source around it is
     /// what makes one failing Postgres view distinguishable from another.
+    ///
+    /// `reason` is the scanner's error rather than its rendered text, so the chain survives
+    /// the wrapping and `Error::source` reaches the scanner's own error, boxed: the concrete
+    /// type behind that node is `Box<duckdb::Error>`, so a caller downcasts to the box and
+    /// derefs it. It is boxed because a `#[source]` has to be an `Error` and the scanner's
+    /// rendered text is a `String`, which is not one. The box also keeps this variant to the
+    /// two `String`s it already had and one pointer, and the 128-byte ceiling is held in
+    /// place by the const assertion at the top of this file rather than by any measurement
+    /// here.
     #[cfg(feature = "offline")]
     #[error("view `{view}` could not read {location}: {reason}")]
     UnreadableSource {
         view: String,
         location: String,
-        reason: String,
+        #[source]
+        reason: Box<duckdb::Error>,
     },
 
     /// An extension that could not be installed or loaded.
@@ -240,12 +242,12 @@ pub enum Error {
     /// format and has no tier, and an `s3://` Parquet source that cannot reach the
     /// extension repository must not be told that `httpfs` reads Parquet.
     ///
-    /// `source` is boxed, unlike every other `#[source]` here, and that is a size
-    /// decision rather than a taste one. `duckdb::Error` is an enum of its own whose
-    /// widest variant carries an Arrow `Type`, so it runs to tens of bytes; added to
-    /// the three fields above it this variant crossed the 128 bytes at which
+    /// `source` is boxed, as [`Error::UnreadableSource`]`'s `reason` is, and that is
+    /// a size decision rather than a taste one. `duckdb::Error` is an enum of its own
+    /// whose widest variant carries an Arrow `Type`, so it runs to tens of bytes; added
+    /// to the three fields above it this variant crossed the 128 bytes at which
     /// `clippy::result_large_err` starts reporting every function that returns a
-    /// `Result<_, Error>`. The other source fields are `std::io::Error` at eight
+    /// `Result<_, Error>`. The other two `#[source]` fields are `std::io::Error` at eight
     /// bytes and never came close. One heap cell on the error path is the cheap half
     /// of that trade; the other half is that the enum is now sized by the pre-existing
     /// four-`String` variants, which the assertion above holds in place.

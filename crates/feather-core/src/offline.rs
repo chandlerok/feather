@@ -54,6 +54,24 @@ const LABEL_KEY: &str = "feather_key";
 const LABEL_TS: &str = "feather_ts";
 const MATCHED_TS: &str = "feather_matched_ts";
 
+/// The ambiguity check's output aliases, prefixed for the reason [`MATCHED_TS`] and its
+/// neighbours are: they are names this module invents inside generated SQL, and a prefix keeps
+/// them out of the namespace a caller's columns live in.
+///
+/// No caller column can shadow one of these names today, because the check reads them back
+/// out of a CTE that projects only these three, so a source column is never a candidate for
+/// the outer `GROUP BY` and no engine precedence rule is consulted. The prefix is what keeps
+/// that true if the query is ever restructured to read the base relation directly, which is
+/// the shape where the collision would be real.
+const AMBIGUITY_KEY: &str = "feather_ambiguity_key";
+const AMBIGUITY_TS: &str = "feather_ambiguity_ts";
+const AMBIGUITY_CREATED: &str = "feather_ambiguity_created";
+
+/// How a source is named in a message that has to say which one failed.
+fn source_location(view: &FeatureView) -> String {
+    format!("source `{}`", view.source.description())
+}
+
 /// The columns a materialization scan lays its batches out under.
 ///
 /// Public because the write path names them when it reports a malformed batch, and one
@@ -523,8 +541,9 @@ impl Engine {
 
         self.ensure_source_loaded(view)?;
 
-        let location = format!("source `{}`", view.source.description());
+        let location = source_location(view);
         let described = self.describe_source(view)?;
+        Self::check_created_column_is_present(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -631,14 +650,38 @@ impl Engine {
             }
             Ok(types)
         };
-        // The scanner's text is kept, because it is the only description of what went wrong
+        // The scanner's error is kept, because it is the only description of what went wrong
         // and it may echo part of the conninfo. Wrapping rather than replacing it puts that
-        // text behind a message that says which view was reading.
+        // text behind a message that says which view was reading, and carries it as the
+        // error's own source so the chain below this one is not lost.
         describe().map_err(|error| Error::UnreadableSource {
             view: view.name.clone(),
-            location: format!("source `{}`", view.source.description()),
-            reason: error.to_string(),
+            location: source_location(view),
+            reason: Box::new(error),
         })
+    }
+
+    /// Refuse a created timestamp the source does not carry, before the query is built.
+    ///
+    /// The generated SQL names the created column, so an absent one fails in DuckDB's binder
+    /// with a message about a column of a table the caller never named. This says which
+    /// source and which column, which is what [`Error::MissingColumn`] carries. It does not
+    /// name the view, unlike [`Error::UnreadableSource`] raised from the same call, so a
+    /// caller running several views over one source has to work out which one failed.
+    /// Checked in both read paths, because both build that SQL and neither is the only caller
+    /// of it: the join bounds the check to the label frame's keys and a refresh reads the
+    /// whole source.
+    fn check_created_column_is_present(view: &FeatureView, described: &TypeMap) -> Result<()> {
+        let Some(created) = &view.created_timestamp_field else {
+            return Ok(());
+        };
+        described
+            .get(created)
+            .map(|_| ())
+            .ok_or_else(|| Error::MissingColumn {
+                location: source_location(view),
+                column: created.clone(),
+            })
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -690,7 +733,7 @@ impl Engine {
         // every entity a source holds, not only the ones some label row happened to name.
         let restriction = match scope {
             AmbiguityScope::LabelKeys => {
-                format!(" WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
+                format!(" WHERE {AMBIGUITY_KEY} IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
             }
             AmbiguityScope::WholeSource => String::new(),
         };
@@ -707,8 +750,8 @@ impl Engine {
             Some(created) => {
                 let name = quote_ident(created);
                 (
-                    format!(", {name} AS c"),
-                    ", c".to_owned(),
+                    format!(", {name} AS {AMBIGUITY_CREATED}"),
+                    format!(", {AMBIGUITY_CREATED}"),
                     format!("tied on `{created}`"),
                 )
             }
@@ -720,12 +763,12 @@ impl Engine {
         };
         let sql = format!(
             "WITH source AS (
-                 SELECT {key_expr} AS k, {source_ts_value} AS t{created_select} FROM {relation}
+                 SELECT {key_expr} AS {AMBIGUITY_KEY}, {source_ts_value} AS {AMBIGUITY_TS}{created_select} FROM {relation}
                  WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
              )
-             SELECT CAST(k AS VARCHAR), t, count(*) AS n
+             SELECT CAST({AMBIGUITY_KEY} AS VARCHAR), {AMBIGUITY_TS}, count(*) AS n
              FROM source{restriction}
-             GROUP BY k, t{created_group}
+             GROUP BY {AMBIGUITY_KEY}, {AMBIGUITY_TS}{created_group}
              HAVING count(*) > 1
              LIMIT 1"
         );
@@ -864,8 +907,9 @@ impl Engine {
 
         self.ensure_source_loaded(view)?;
 
-        let location = format!("source `{}`", view.source.description());
+        let location = source_location(view);
         let described = self.describe_source(view)?;
+        Self::check_created_column_is_present(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -1662,6 +1706,52 @@ mod tests {
         .expect("source batch")
     }
 
+    /// `user_id, event_timestamp, created_at, count, c`, for a source carrying a column named
+    /// like the alias the ambiguity check used to group the created timestamp by.
+    fn decoy_tie_breakable_source(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("event_timestamp", DataType::Int64, false),
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("count", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+                // Distinct per row, so grouping by this column cannot produce the groups
+                // grouping by the created timestamp produces.
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3 * 7))),
+            ],
+        )
+        .expect("source batch")
+    }
+
+    /// `user_id, event_timestamp, created_at, count`, with a floating-point created timestamp,
+    /// so a source whose creation times a warehouse typed as a double can be built.
+    fn float_tie_breakable_source(rows: &[(i64, i64, f64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("event_timestamp", DataType::Int64, false),
+            Field::new("created_at", DataType::Float64, false),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+            ],
+        )
+        .expect("source batch")
+    }
+
     /// `user_id, event_timestamp, created_at, count`, for tie breaking.
     fn tie_breakable_source(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2022,7 +2112,10 @@ mod tests {
     fn three_rows_at_one_instant_are_ordered_by_their_created_timestamps() {
         // The tie-break is a sort, so a third row is decided the same way a second is, and the
         // middle creation must not win just because it is in the middle. `count` crosses
-        // `created_at`, so picking the wrong row changes the answer.
+        // `created_at`, so picking the wrong row changes the answer. The three-row case was
+        // already decided this way before the refusal landed, so this characterises it rather
+        // than pinning that change: the pair it would have let the plan decide is
+        // `three_rows_nothing_separates_are_refused` beside it.
         let source = Parquet::write(&tie_breakable_source(&[
             (1, 100, 5, 10),
             (1, 100, 9, 20),
@@ -2128,6 +2221,134 @@ mod tests {
 
         assert!(
             matches!(error, Error::AmbiguousTimestamp { rows: 2, .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_tie_is_refused_whatever_the_source_calls_its_other_columns() {
+        // The check groups by names it invents, and this source carries a column called `c`,
+        // which is what an earlier version of the check called the created column. Those names
+        // are prefixed now, and the check reads them from a CTE that projects only the three
+        // aliases, so no column of the source can shadow one. The tied pair is refused
+        // whatever this source's other columns are called.
+        let source = Parquet::write(&decoy_tie_breakable_source(&[
+            (1, 100, 5, 10),
+            (1, 100, 5, 20),
+            (2, 200, 1, 30),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("a tied pair is refused whatever the source's other columns are called");
+
+        assert!(
+            matches!(
+                &error,
+                Error::AmbiguousTimestamp {
+                    key,
+                    timestamp: 100,
+                    rows: 2,
+                    ..
+                } if key == "1"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_created_timestamp_the_source_does_not_carry_is_named_in_the_error() {
+        // The check runs before the query is built, so a view that declares a created column
+        // its source lacks is told which source and which column, rather than reaching
+        // DuckDB's binder and being told about a table the caller never named. It is not told
+        // which view: `MissingColumn` carries a source and a column, and no view.
+        //
+        // The column is pinned by name. The location is pinned only in so far as it names
+        // this source, which is the claim the check makes; how a location is rendered is not
+        // pinned. The variant is the rest of the pin: revert the check and the same fixture
+        // gets DuckDB's binder error instead, which is not a `MissingColumn`.
+        let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("inserted_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err(
+                "a created column the source does not carry is reported before the query is built",
+            );
+
+        assert!(
+            matches!(
+                &error,
+                Error::MissingColumn { column, location }
+                    if column == "inserted_at" && location.contains(&source.string())
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_created_timestamp_the_source_does_not_carry_is_named_in_the_refresh_path() {
+        // The check runs in the read path and in the refresh path, and this is the second
+        // call site. Revert it and this fixture gets DuckDB's binder error instead of a
+        // `MissingColumn` naming the source and the column.
+        let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("inserted_at".to_owned());
+
+        let error = engine().latest_per_entity_sql(&view).expect_err(
+            "a created column the source does not carry is reported before the query is built",
+        );
+
+        assert!(
+            matches!(
+                &error,
+                Error::MissingColumn { column, location }
+                    if column == "inserted_at" && location.contains(&source.string())
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_nan_created_timestamps_are_refused_as_a_tie() {
+        // The refusal this replaces rested on a premise nobody could check on the machine the
+        // branch was written on: that a DuckDB GROUP BY groups floats by IEEE equality, under
+        // which NaN equals nothing, so two NaN rows are two groups of one and the ambiguity
+        // check passes them. DuckDB's own documentation says the opposite, that NaN compares
+        // equal to NaN and is greater than any other float, but that sentence is about
+        // comparison rather than grouping, and the old test settled nothing either, because
+        // the type refusal short-circuited before the GROUP BY ever ran. With the refusal gone
+        // the query executes and this test records what the engine does.
+        //
+        // One expected outcome, not an either-way assertion. If this test FAILS, DuckDB split
+        // the two NaNs into two groups of one, so the refusal this commit removes was
+        // load-bearing, and that case needs a different fix rather than a restored type check:
+        // a float created timestamp then has to be caught by something other than its
+        // declared type.
+        let source = Parquet::write(&float_tie_breakable_source(&[
+            (1, 100, f64::NAN, 10),
+            (1, 100, f64::NAN, 20),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("DuckDB groups the two NaN created timestamps together, so they tie");
+
+        assert!(
+            matches!(
+                &error,
+                Error::AmbiguousTimestamp {
+                    key,
+                    timestamp: 100,
+                    rows: 2,
+                    ..
+                } if key == "1"
+            ),
             "{error}"
         );
     }
@@ -2386,6 +2607,21 @@ mod tests {
 
         assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
         assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        // A `#[source]` on a `Box<E>` makes the box the concrete type behind the chain node, so
+        // the downcast names `Box<duckdb::Error>` and the caller derefs it to reach DuckDB's
+        // own error. Naming the inner type would be asking for a node that is not there.
+        let boxed = std::error::Error::source(&error)
+            .and_then(|node| node.downcast_ref::<Box<duckdb::Error>>());
+        assert!(
+            boxed.is_some(),
+            "the scanner's own error is the source of this one, not only its text: {error}"
+        );
+        // The downcast's type argument is the claim, and `is_some` is what tests it: the node
+        // behind the chain is a `Box<duckdb::Error>`, not some other error, and not a bare
+        // `duckdb::Error` either. There is deliberately no further assertion comparing the
+        // message against the node's own text, because the message is rendered from the same
+        // field the node points at, so that comparison holds for any value in the box and
+        // would not notice a wrong one.
         assert!(
             error
                 .to_string()
