@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_column_named_like_the_old_alias_does_not_hide_a_tie() {
+    fn a_tie_is_refused_whatever_the_source_calls_its_other_columns() {
         // The check groups by names it invents, and this source carries a column called `c`,
         // which is what an earlier version of the check called the created column. Those names
         // are prefixed now, and the check reads them from a CTE that projects only the three
@@ -2264,23 +2264,48 @@ mod tests {
         // DuckDB's binder and being told about a table the caller never named. It is not told
         // which view: `MissingColumn` carries a source and a column, and no view.
         //
-        // The expected location is built with the same `source_location` the check calls, so
-        // this does not pin how a location is rendered, only that the check is what raised
-        // this error. The variant is the pin: revert the check and the same fixture gets
-        // DuckDB's binder error instead, which is not a `MissingColumn`.
+        // The column is pinned by name. The location is pinned only in so far as it names
+        // this source, which is the claim the check makes; how a location is rendered is not
+        // pinned. The variant is the rest of the pin: revert the check and the same fixture
+        // gets DuckDB's binder error instead, which is not a `MissingColumn`.
         let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
         let mut view = view(&source.string(), None);
         view.created_timestamp_field = Some("inserted_at".to_owned());
 
         let error = engine()
             .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
-            .expect_err("a created column the source does not carry cannot be grouped by");
+            .expect_err(
+                "a created column the source does not carry is reported before the query is built",
+            );
 
         assert!(
             matches!(
                 &error,
                 Error::MissingColumn { column, location }
-                    if column == "inserted_at" && location == &source_location(&view)
+                    if column == "inserted_at" && location.contains(&source.string())
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_created_timestamp_the_source_does_not_carry_is_named_in_the_refresh_path() {
+        // The check runs in the read path and in the refresh path, and this is the second
+        // call site. Revert it and this fixture gets DuckDB's binder error instead of a
+        // `MissingColumn` naming the source and the column.
+        let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("inserted_at".to_owned());
+
+        let error = engine().latest_per_entity_sql(&view).expect_err(
+            "a created column the source does not carry is reported before the query is built",
+        );
+
+        assert!(
+            matches!(
+                &error,
+                Error::MissingColumn { column, location }
+                    if column == "inserted_at" && location.contains(&source.string())
             ),
             "{error}"
         );
