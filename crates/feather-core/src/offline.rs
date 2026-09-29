@@ -543,7 +543,6 @@ impl Engine {
 
         let location = source_location(view);
         let described = self.describe_source(view)?;
-        self.check_created_timestamp_type(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -658,35 +657,6 @@ impl Engine {
             location: source_location(view),
             reason: error.to_string(),
         })
-    }
-
-    /// Refuse a created timestamp the ambiguity check cannot group by.
-    ///
-    /// The check groups by the created column so rows agreeing on it are refused instead of
-    /// sorted, and a `GROUP BY` over a float uses IEEE equality, under which NaN equals
-    /// nothing, not even itself. Two rows whose created timestamps are both NaN are therefore
-    /// two groups of one, so the check passes them and `ORDER BY` picks between them, which is
-    /// the plan-dependent outcome the refusal exists to prevent. Refused here, against the
-    /// declared type, rather than inferred from the sort's behaviour.
-    ///
-    /// Checked in both read paths, because both run the check and neither is the only caller of
-    /// it: the join bounds it to the label frame's keys and a refresh reads the whole source.
-    fn check_created_timestamp_type(&self, view: &FeatureView, described: &TypeMap) -> Result<()> {
-        let Some(created) = &view.created_timestamp_field else {
-            return Ok(());
-        };
-        let actual = described.get(created).ok_or_else(|| Error::MissingColumn {
-            location: source_location(view),
-            column: created.clone(),
-        })?;
-        if matches!(normalize_type(actual).as_str(), "FLOAT" | "DOUBLE") {
-            return Err(Error::UnsupportedCreatedTimestampType {
-                view: view.name.clone(),
-                column: created.clone(),
-                actual: actual.clone(),
-            });
-        }
-        Ok(())
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -914,7 +884,6 @@ impl Engine {
 
         let location = source_location(view);
         let described = self.describe_source(view)?;
-        self.check_created_timestamp_type(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -2264,12 +2233,21 @@ mod tests {
     }
 
     #[test]
-    fn a_floating_point_created_timestamp_is_refused() {
-        // A float is not equal to itself, so a `GROUP BY` on the created column puts two rows
-        // whose created timestamps are both NaN into two groups of one and the check passes
-        // them. `ORDER BY` then places those NaNs next to each other and picks between them,
-        // so the winner is the plan's, which is the outcome the refusal exists to prevent.
-        // Refused against the declared type rather than left to the sort's behaviour.
+    fn two_nan_created_timestamps_are_refused_as_a_tie() {
+        // The refusal this replaces rested on a premise nobody could check on the machine the
+        // branch was written on: that a DuckDB GROUP BY groups floats by IEEE equality, under
+        // which NaN equals nothing, so two NaN rows are two groups of one and the ambiguity
+        // check passes them. DuckDB's own documentation says the opposite, that NaN compares
+        // equal to NaN and is greater than any other float, but that sentence is about
+        // comparison rather than grouping, and the old test settled nothing either, because
+        // the type refusal short-circuited before the GROUP BY ever ran. With the refusal gone
+        // the query executes and this test records what the engine does.
+        //
+        // One expected outcome, not an either-way assertion. If this test FAILS, DuckDB split
+        // the two NaNs into two groups of one, so the refusal this commit removes was
+        // load-bearing, and that case needs a different fix rather than a restored type check:
+        // a float created timestamp then has to be caught by something other than its
+        // declared type.
         let source = Parquet::write(&float_tie_breakable_source(&[
             (1, 100, f64::NAN, 10),
             (1, 100, f64::NAN, 20),
@@ -2279,13 +2257,17 @@ mod tests {
 
         let error = engine()
             .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
-            .expect_err("a float created timestamp is not equal to itself, so it cannot group");
+            .expect_err("DuckDB groups the two NaN created timestamps together, so they tie");
 
         assert!(
             matches!(
                 &error,
-                Error::UnsupportedCreatedTimestampType { column, actual, .. }
-                    if column == "created_at" && actual == "DOUBLE"
+                Error::AmbiguousTimestamp {
+                    key,
+                    timestamp: 100,
+                    rows: 2,
+                    ..
+                } if key == "1"
             ),
             "{error}"
         );
