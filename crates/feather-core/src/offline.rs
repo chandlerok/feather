@@ -543,6 +543,7 @@ impl Engine {
 
         let location = source_location(view);
         let described = self.describe_source(view)?;
+        Self::check_created_column_is_present(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -657,6 +658,25 @@ impl Engine {
             location: source_location(view),
             reason: error.to_string(),
         })
+    }
+
+    /// Refuse a created timestamp the source does not carry, before the query is built.
+    ///
+    /// The generated SQL names the created column, so an absent one fails in DuckDB's binder
+    /// with a message about a column of a table the caller never named. This says which view
+    /// declared it and which column was missing, which is the whole of what the error needs
+    /// to carry. It is checked in both read paths, because both build that SQL and neither is
+    /// the only caller of it: the join bounds the check to the label frame's keys and a
+    /// refresh reads the whole source.
+    fn check_created_column_is_present(view: &FeatureView, described: &TypeMap) -> Result<()> {
+        let Some(created) = &view.created_timestamp_field else {
+            return Ok(());
+        };
+        described.get(created).ok_or_else(|| Error::MissingColumn {
+            location: source_location(view),
+            column: created.clone(),
+        })?;
+        Ok(())
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -884,6 +904,7 @@ impl Engine {
 
         let location = source_location(view);
         let described = self.describe_source(view)?;
+        Self::check_created_column_is_present(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -2227,6 +2248,29 @@ mod tests {
                     rows: 2,
                     ..
                 } if key == "1"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_created_timestamp_the_source_does_not_carry_is_named_in_the_error() {
+        // The check runs before the query is built, so a view that declares a created column
+        // its source lacks is told which view and which column, rather than reaching DuckDB's
+        // binder and being told about a table the caller never named.
+        let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("inserted_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("a created column the source does not carry cannot be grouped by");
+
+        assert!(
+            matches!(
+                &error,
+                Error::MissingColumn { column, location }
+                    if column == "inserted_at" && location.contains(&view.name)
             ),
             "{error}"
         );
