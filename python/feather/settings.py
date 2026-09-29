@@ -115,6 +115,22 @@ class Valkey(pydantic.BaseModel):
     field_expiration: bool = False
 
 
+class Store(pydantic.BaseModel):
+    """The embedded online store, which a serving process owns.
+
+    An LSM rather than an in-memory map, so a dataset larger than memory is a disk read
+    rather than an eviction, and a restart is a remap rather than a full
+    re-materialization. A database is opened by one process at a time, which is why the
+    serving process is the only thing that opens it.
+    """
+
+    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+
+    path: NonEmptyStr
+    cache_bytes: pydantic.PositiveInt | None = None
+    memtable_bytes: pydantic.PositiveInt | None = None
+
+
 class FeatherSettings(pydantic.BaseModel):
     """A validated ``feather.toml``.
 
@@ -128,6 +144,7 @@ class FeatherSettings(pydantic.BaseModel):
     definitions: Annotated[list[NonEmptyStr], pydantic.Field(min_length=1)]
     connections: dict[NonEmptyStr, Connection] = pydantic.Field(default_factory=dict)
     valkey: Valkey | None = None
+    store: Store | None = None
 
 
 def load_settings(path: str | os.PathLike[str] = DEFAULT_PATH) -> FeatherSettings:

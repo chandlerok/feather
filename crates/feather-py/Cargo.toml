@@ -19,6 +19,10 @@ arrow.workspace = true
 # from source, so every build of the extension now pays what this crate used to
 # avoid. It also means the Python CI job can no longer skip the C++ build.
 feather-core = { path = "../feather-core" }
+# The serving surface. A `serve`-only build links this and not `offline`, so a deployment
+# that only serves carries no DuckDB and no C++ build. That is the point of keeping the
+# transport in its own crate.
+feather-serve = { path = "../feather-serve", optional = true }
 # For `feather demo`, which writes the two Parquet files the generated project
 # reads. Same version as arrow, for the same reason: two Arrow majors in one
 # process do not share types.
@@ -45,8 +49,20 @@ tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net
 # could not use one would fail at the first online call with "this build has no Valkey support".
 # Local mode still needs nothing, and the extra dependency is redis plus the tokio the store
 # already runs on.
-default = ["offline", "valkey"]
+# `serve` and `fjall` are default because both are load-bearing for a project that
+# actually serves: without `serve` no wheel has `_core.serve` and `FeatureStore.serve()`
+# is a RuntimeError, and without `fjall` nothing can write the database `serve()` opens,
+# so `feather refresh` would populate a map that dies with the process and every read
+# would come back null. Neither implies `offline`, and neither drags in DuckDB: a
+# `serve`-only build links `feather-serve` and nothing else.
+default = ["offline", "valkey", "fjall", "serve"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
 # tests the engines, and so a build can drop DuckDB with --no-default-features.
 offline = ["feather-core/offline", "dep:tokio"]
 valkey = ["feather-core/valkey"]
+# The embedded store, which the materialization path needs so a refresh writes the
+# database `serve()` opens.
+fjall = ["feather-core/fjall"]
+# Serving over Arrow Flight. Does not imply `offline`: a project that only reads
+# online features never runs a point-in-time join, so it should not pay for the engine.
+serve = ["dep:feather-serve", "dep:tokio"]

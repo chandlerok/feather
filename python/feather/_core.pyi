@@ -13,6 +13,34 @@ from typing import Protocol
 
 __version__: str
 
+def serve(
+    settings_path: str,
+    definitions_json: str,
+    service: str,
+    addr: str = ...,
+    workers: int = ...,
+) -> None:
+    """Serve a feature service over Arrow Flight, blocking until stopped.
+
+    Present only in a build with the ``serve`` cargo feature, which does not imply the
+    ``offline`` one: a project that only reads online features never runs a
+    point-in-time join and should not link DuckDB. :meth:`feather.FeatureStore.serve`
+    checks for this and says so rather than failing with a missing attribute.
+
+    Args:
+        settings_path: The ``feather.toml`` to read.
+        definitions_json: The project's compiled definitions.
+        service: The name of a feature service to serve.
+        addr: The socket to bind.
+        workers: Tokio worker threads.
+
+    Raises:
+        OSError: If the settings cannot be read, or the store directory cannot be opened.
+        ValueError: If the service is not declared, or names a view or feature the
+            definitions do not have.
+    """
+    ...
+
 def write_demo_data(directory: str) -> list[str]:
     """Write the demo project's two Parquet files into ``directory/data``.
 

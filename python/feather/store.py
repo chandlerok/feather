@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from feather.definitions import (
+    FeatureService,
     FeatureStoreConfig,
     FeatureView,
     Field,
@@ -61,17 +62,67 @@ class FeatureStore:
             ImportError: If a definition module fails to import.
         """
         settings = load_settings(path)
+        views, services = _import_definitions(settings.definitions, Path(path).parent)
         definitions = config_to_wire(
             FeatureStoreConfig(
                 project=settings.project,
-                views=_import_views(settings.definitions, Path(path).parent),
+                views=views,
+                services=services,
             )
         )
         # Imported here rather than at module scope, so that importing `feather`
         # still works without the compiled extension. Only this call needs it.
         from feather import _core
 
-        self._store = _core.FeatureStore(str(path), definitions.model_dump_json())
+        self._settings_path = str(path)
+        self._definitions_json = definitions.model_dump_json()
+        self._store = _core.FeatureStore(self._settings_path, self._definitions_json)
+
+    def serve(
+        self,
+        service: str,
+        addr: str = "127.0.0.1:8815",
+        workers: int = 4,
+    ) -> None:
+        """Serve a feature service over Arrow Flight, blocking until stopped.
+
+        The calling process becomes the server, which is the point: a client in any
+        language reads the response with its own Arrow library, so there is no generated
+        shim, and the store lives in this process rather than behind a connection
+        string.
+
+        Blocking, and it never returns. The GIL is released while it runs, so this
+        process's other threads keep going, and the server's own workers use every core.
+
+        This is single-writer by construction. The store is a database that one process
+        opens at a time, so this is the only thing in a deployment that opens it, which
+        is also why a push here is visible to every reader without a fan-out.
+
+        Args:
+            service: The name of a feature service in the project's definitions.
+            addr: The socket to bind. Loopback by default, and the only thing
+                protecting an unauthenticated endpoint until authentication lands.
+            workers: Tokio worker threads, which is how many cores the read path
+                uses.
+
+        Raises:
+            RuntimeError: If this build has no serving support, which is a build
+                choice rather than a project one: serving does not pull in the
+                offline engine, so a `serve`-only wheel is a valid build.
+            ValueError: If the service is not declared, or names a view or feature
+                the definitions do not have. Both are caught here rather than on the
+                first request.
+        """
+        from feather import _core
+
+        serve_impl = getattr(_core, "serve", None)
+        if serve_impl is None:
+            msg = (
+                "this build of feather has no serving support; it is behind the "
+                "`serve` cargo feature, which is not implied by the default one"
+            )
+            raise RuntimeError(msg)
+        serve_impl(self._settings_path, self._definitions_json, service, addr, workers)
 
     def get_historical_features(
         self,
@@ -257,12 +308,20 @@ def _why_not_arrow(entity_df: object) -> str:
     )
 
 
-def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]:
-    """Import the modules a project declares, and collect the views they define.
+def _import_definitions(
+    modules: Sequence[str], root: Path
+) -> tuple[list[type[FeatureView]], list[FeatureService]]:
+    """Import the modules a project declares, and collect what they define.
 
     Loaded by path rather than by module name. A definition module depends only on
     ``feather`` by design, so it needs no package context, and loading it this way
     puts nothing on ``sys.path``.
+
+    Both views and services, from one walk and one import of each module. A service
+    declared in a definitions module and left out of here is invisible to
+    :meth:`FeatureStore.serve`, which resolves the service's field set from the wire
+    model, so collecting views alone is what would make ``serve()`` raise for every
+    project that declares a service.
 
     Args:
         modules: The paths ``feather.toml`` lists.
@@ -270,13 +329,15 @@ def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]
             resolved against.
 
     Returns:
-        The declared views, in declaration order, module by module.
+        The declared views and the declared services, in declaration order, module by
+        module.
 
     Raises:
         FileNotFoundError: If a listed module does not exist.
         ImportError: If a module fails to import.
     """
     views: list[type[FeatureView]] = []
+    services: list[FeatureService] = []
     for module in modules:
         path = Path(module)
         if not path.is_absolute():
@@ -286,17 +347,21 @@ def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]
             raise ImportError(f"cannot load a definition module from {path}")
         loaded = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(loaded)
-        # Filtered by `__module__` rather than taking every value, so a view
-        # imported into a second module is collected once, where it was declared.
-        views.extend(
-            value
-            for value in vars(loaded).values()
-            if isinstance(value, type)
-            and issubclass(value, FeatureView)
-            and value is not FeatureView
-            and value.__module__ == spec.name
-        )
-    return views
+        # Classes are filtered by `__module__` rather than taking every value, so a view
+        # imported into a second module is collected once, where it was declared. A
+        # service is an instance rather than a class, so the same test reads its type's
+        # module.
+        for value in vars(loaded).values():
+            if isinstance(value, FeatureService):
+                services.append(value)
+            elif (
+                isinstance(value, type)
+                and issubclass(value, FeatureView)
+                and value is not FeatureView
+                and value.__module__ == spec.name
+            ):
+                views.append(value)
+    return views, services
 
 
 __all__ = ["FeatureStore", "MissingPolicy"]

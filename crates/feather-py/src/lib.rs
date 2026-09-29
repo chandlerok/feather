@@ -40,6 +40,8 @@ use pyo3_arrow::PyTable;
 
 #[cfg(feature = "offline")]
 use feather_core::offline::ROW_COLUMN;
+#[cfg(all(feature = "offline", feature = "fjall"))]
+use feather_core::online::fjall::FjallStore;
 #[cfg(feature = "offline")]
 use feather_core::online::memory::MemoryStore;
 #[cfg(all(feature = "offline", feature = "valkey"))]
@@ -48,6 +50,8 @@ use feather_core::online::valkey::ValkeyStore;
 use feather_core::online::{
     EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues, WriteBatch,
 };
+#[cfg(all(feature = "offline", feature = "fjall"))]
+use feather_core::settings::Store as StoreSettings;
 #[cfg(feature = "offline")]
 use feather_core::settings::Valkey as ValkeySettings;
 #[cfg(feature = "offline")]
@@ -155,6 +159,10 @@ struct Inner {
     project: String,
     /// The Valkey connection the settings declare, if any.
     valkey: Option<ValkeySettings>,
+    /// The embedded store the settings declare, if any. Read here so the write path and
+    /// `serve()` open the same database, rather than each picking its own.
+    #[cfg(feature = "fjall")]
+    store: Option<StoreSettings>,
     /// The store features are served from, opened on the first online call.
     ///
     /// `None` until then, so that constructing a store over a project whose Valkey is down
@@ -167,6 +175,10 @@ struct Inner {
 enum Online {
     /// Local mode: the settings declare no Valkey, so the values live in this process.
     Memory(MemoryStore),
+    /// The settings declare an embedded store, so a refresh writes a database that outlives
+    /// the process and that `serve()` can then open.
+    #[cfg(feature = "fjall")]
+    Fjall(Box<FjallStore>),
     /// The settings declare a Valkey.
     #[cfg(feature = "valkey")]
     Valkey(Box<ValkeyStore>),
@@ -177,6 +189,8 @@ impl OnlineStore for Online {
     async fn write(&mut self, batches: &[WriteBatch]) -> feather_core::Result<()> {
         match self {
             Online::Memory(store) => store.write(batches).await,
+            #[cfg(feature = "fjall")]
+            Online::Fjall(store) => store.write(batches).await,
             #[cfg(feature = "valkey")]
             Online::Valkey(store) => store.write(batches).await,
         }
@@ -188,6 +202,8 @@ impl OnlineStore for Online {
     ) -> feather_core::Result<Vec<Vec<Option<Vec<u8>>>>> {
         match self {
             Online::Memory(store) => store.read(requests).await,
+            #[cfg(feature = "fjall")]
+            Online::Fjall(store) => store.read(requests).await,
             #[cfg(feature = "valkey")]
             Online::Valkey(store) => store.read(requests).await,
         }
@@ -199,6 +215,8 @@ impl OnlineStore for Online {
     ) -> feather_core::Result<()> {
         match self {
             Online::Memory(store) => store.delete_fields(keys_and_fields).await,
+            #[cfg(feature = "fjall")]
+            Online::Fjall(store) => store.delete_fields(keys_and_fields).await,
             #[cfg(feature = "valkey")]
             Online::Valkey(store) => store.delete_fields(keys_and_fields).await,
         }
@@ -210,6 +228,8 @@ impl ProjectScan for Online {
     async fn hash_fields(&self, key: &[u8]) -> feather_core::Result<Vec<(String, Vec<u8>)>> {
         match self {
             Online::Memory(store) => store.hash_fields(key).await,
+            #[cfg(feature = "fjall")]
+            Online::Fjall(store) => store.hash_fields(key).await,
             #[cfg(feature = "valkey")]
             Online::Valkey(store) => store.hash_fields(key).await,
         }
@@ -222,6 +242,8 @@ impl ProjectScan for Online {
     ) -> feather_core::Result<Vec<Vec<u8>>> {
         match self {
             Online::Memory(store) => store.scan_entity_keys(project, exclude).await,
+            #[cfg(feature = "fjall")]
+            Online::Fjall(store) => store.scan_entity_keys(project, exclude).await,
             #[cfg(feature = "valkey")]
             Online::Valkey(store) => store.scan_entity_keys(project, exclude).await,
         }
@@ -296,10 +318,19 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
         return Ok(());
     }
     let opened = {
+        #[cfg_attr(not(feature = "fjall"), allow(unused_mut))]
         let Inner {
-            runtime, valkey, ..
+            runtime,
+            valkey,
+            #[cfg(feature = "fjall")]
+            store,
+            ..
         } = &*inner;
-        connect_online(runtime, valkey.as_ref())?
+        #[cfg(feature = "fjall")]
+        let opened = connect_online(runtime, valkey.as_ref(), store.as_ref())?;
+        #[cfg(not(feature = "fjall"))]
+        let opened = connect_online(runtime, valkey.as_ref())?;
+        opened
     };
     inner.online = Some(opened);
     Ok(())
@@ -324,7 +355,26 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
 fn connect_online(
     runtime: &tokio::runtime::Runtime,
     configured: Option<&ValkeySettings>,
+    #[cfg(feature = "fjall")] store: Option<&StoreSettings>,
 ) -> PyResult<Online> {
+    // An embedded store is checked before the Valkey connection so a project that declares
+    // both is an error rather than a silent preference: one is the store of record and the
+    // other would be a second, divergent copy.
+    #[cfg(feature = "fjall")]
+    if let (Some(store), Some(valkey)) = (store, configured) {
+        return Err(PyValueError::new_err(format!(
+            "`[store]` and `[valkey]` are both configured; declare one, because a refresh \
+             would write a database that `serve()` does not open, and the values would not \
+             agree (store path {}, valkey endpoint {})",
+            store.path, valkey.endpoint
+        )));
+    }
+    #[cfg(feature = "fjall")]
+    if let Some(store) = store {
+        return Ok(Online::Fjall(Box::new(
+            FjallStore::open(&store.path, store.cache(), store.memtable()).map_err(core_error)?,
+        )));
+    }
     let Some(configured) = configured else {
         return Ok(Online::Memory(MemoryStore::new()));
     };
@@ -401,6 +451,8 @@ impl FeatureStore {
                 project: definitions.project.clone(),
                 definitions,
                 valkey: settings.valkey,
+                #[cfg(feature = "fjall")]
+                store: settings.store,
                 online: None,
             }),
         })
@@ -990,12 +1042,155 @@ fn arrow_error(error: arrow::error::ArrowError) -> PyErr {
     PyValueError::new_err(format!("arrow: {error}"))
 }
 
+/// Serve online features over Arrow Flight, blocking until stopped.
+///
+/// A module function rather than a method on the `FeatureStore` class, because the class is
+/// `offline`-gated and serving must not be: a deployment that only reads online features never
+/// runs a point-in-time join, so it should not link DuckDB. The Python wrapper exposes this as
+/// `FeatureStore.serve()`, which is the API a user touches.
+///
+/// The store's directory is read from the project's `[store]` table, and defaults to
+/// `.feather/online` beside the settings file. A database is opened by one process at a time,
+/// so this is the only thing in a deployment that opens it.
+///
+/// Args:
+///     settings_path: The `feather.toml` to read.
+///     definitions_json: The project's compiled definitions.
+///     service: The name of the feature service to serve.
+///     addr: The socket to bind. Loopback by default, and the only thing protecting an
+///         unauthenticated endpoint until issue #5 settles authentication.
+///     workers: Tokio worker threads.
+///
+/// Returns:
+///     Nothing, ever: it blocks. Ctrl-C is not wired yet, so the process is stopped by a
+///     signal, and a database closed by a signal is recovered from its journal on next open.
+#[cfg(feature = "serve")]
+#[pyfunction]
+#[pyo3(signature = (settings_path, definitions_json, service, addr = "127.0.0.1:8815", workers = 4))]
+fn serve(
+    py: Python<'_>,
+    settings_path: &str,
+    definitions_json: &str,
+    service: &str,
+    addr: &str,
+    workers: usize,
+) -> PyResult<()> {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let settings = feather_core::load_settings(settings_path).map_err(core_error)?;
+    let definitions = feather_core::Definitions::from_json(definitions_json).map_err(core_error)?;
+
+    let declared = definitions
+        .services
+        .iter()
+        .find(|s| s.name == service)
+        .ok_or_else(|| PyValueError::new_err(format!("no feature service named `{service}`")))?;
+    let references = declared.references().map_err(core_error)?;
+    let features: Vec<(String, String)> = references
+        .iter()
+        .map(|(view, feature)| ((*view).to_owned(), (*feature).to_owned()))
+        .collect();
+
+    let views: BTreeMap<String, feather_core::FeatureView> = definitions
+        .views
+        .iter()
+        .map(|v| (v.name.clone(), v.clone()))
+        .collect();
+    // The entity every view in the service shares. One hash key per entity is what makes a
+    // single store read cover the whole request, so this is not per-view: a service whose
+    // views are keyed on different entities would look up the wrong bytes, miss, and come back
+    // as a null for every column, which reads as "feature absent" rather than "service
+    // misconfigured". `get_online_features` already rejects that case, and so does this.
+    let mut entity_name: Option<String> = None;
+    for (view, _) in &references {
+        let declared = views
+            .get(*view)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "feature service `{service}` names view `{view}`, which the definitions do not declare"
+                ))
+            })?
+            .entity()
+            .map_err(core_error)?
+            .name
+            .clone();
+        match &entity_name {
+            None => entity_name = Some(declared),
+            Some(first) if *first != declared => {
+                return Err(PyValueError::new_err(format!(
+                    "feature service `{service}` spans views keyed on different entities \
+                     (`{first}` and `{declared}`); every view in a service must share one, \
+                     because the entity is part of the store key"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    let entity_name = entity_name.unwrap_or_default();
+
+    let resolved = feather_serve::ResolvedService::resolve(
+        &definitions.project,
+        &feather_serve::ServiceSpec {
+            name: service.to_owned(),
+            entity_name,
+            features,
+        },
+        &views,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    let directory = settings.store.as_ref().map_or_else(
+        || {
+            PathBuf::from(settings_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".feather/online")
+        },
+        |store| PathBuf::from(&store.path),
+    );
+    let (cache, memtable) = settings
+        .store
+        .as_ref()
+        .map_or((64 << 20, 64 << 20), |s| (s.cache(), s.memtable()));
+
+    let socket: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| PyValueError::new_err(format!("bad address `{addr}`: {e}")))?;
+
+    let store = Arc::new(
+        feather_core::online::fjall::FjallStore::open(&directory, cache, memtable)
+            .map_err(core_error)?,
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .map_err(|e| PyOSError::new_err(e.to_string()))?;
+
+    // The GIL released across the whole blocking serve, which is what lets the server's own
+    // workers run on every core and the caller's other Python threads keep going. Measured in
+    // `docs/serving-transport.md`: a Python host serves at 0.91 of a plain Rust one.
+    py.detach(|| {
+        runtime.block_on(feather_serve::serve(
+            socket,
+            store,
+            resolved,
+            std::future::pending(),
+        ))
+    })
+    .map_err(|e| PyOSError::new_err(e.to_string()))
+}
+
 /// The compiled extension. Imported as `feather._core`.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(load_settings, m)?)?;
     m.add_function(wrap_pyfunction!(demo::write_demo_data, m)?)?;
+    #[cfg(feature = "serve")]
+    m.add_function(wrap_pyfunction!(serve, m)?)?;
     #[cfg(feature = "offline")]
     {
         m.add_class::<FeatureStore>()?;

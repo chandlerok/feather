@@ -277,6 +277,32 @@ def test_an_unknown_key_raises(tmp_path: Path) -> None:
         load_settings(write(tmp_path, LOCAL + "\nnope = 1\n"))
 
 
+def test_a_store_table_arrives_typed(tmp_path: Path) -> None:
+    settings = load_settings(write(tmp_path, LOCAL + '\n[store]\npath = ".feather/online"\n'))
+
+    assert settings.store is not None
+    assert settings.store.path == ".feather/online"
+    assert settings.store.cache_bytes is None
+    assert settings.store.memtable_bytes is None
+
+
+def test_an_explicit_store_size_is_kept(tmp_path: Path) -> None:
+    settings = load_settings(write(tmp_path, LOCAL + '\n[store]\npath = "d"\ncache_bytes = 1024\n'))
+
+    assert settings.store is not None
+    assert settings.store.cache_bytes == 1024
+
+
+def test_a_zero_store_size_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        load_settings(write(tmp_path, LOCAL + '\n[store]\npath = "d"\ncache_bytes = 0\n'))
+
+
+def test_an_unknown_store_key_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        load_settings(write(tmp_path, LOCAL + '\n[store]\npath = "d"\nnope = 1\n'))
+
+
 def test_an_offline_store_table_raises(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         load_settings(write(tmp_path, LOCAL + '\n[offline_store]\ntype = "snowflake"\n'))
