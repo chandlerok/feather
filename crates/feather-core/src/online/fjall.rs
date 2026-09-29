@@ -518,7 +518,8 @@ mod tests {
                 .await
                 .expect("write");
         }
-        // Reopened rather than reused: the claim under test is that a restart is a remap.
+        // Reopened rather than reused: the claim under test is that a restart is a remap, so the
+        // second store is a fresh handle over the same directory after the first was dropped.
         let store = FjallStore::open(dir.path(), 8 << 20, 8 << 20).expect("reopen");
         let out = store
             .read(&[ReadRequest {
@@ -528,5 +529,28 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(out[0][0].as_deref(), Some(&b"persisted"[..]));
+    }
+
+    /// The store is single-owner, which is the constraint the serving process exists to satisfy.
+    ///
+    /// A second open over the same directory is refused rather than queued, and closing the first
+    /// releases the lock. The Python online tests depend on both halves: they open a second
+    /// `FeatureStore` over the same project, which only works because they close the first, and
+    /// that close-then-reopen is what a restart does.
+    #[test]
+    fn a_second_open_over_the_same_directory_is_refused_until_the_first_is_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+
+        let first = FjallStore::open(path, 1 << 20, 1 << 20).expect("first open");
+        let second = FjallStore::open(path, 1 << 20, 1 << 20);
+        assert!(
+            second.is_err(),
+            "a second owner over the same directory must be refused, not queued"
+        );
+        drop(first);
+
+        FjallStore::open(path, 1 << 20, 1 << 20)
+            .expect("closing the first releases the lock, which is what a restart does");
     }
 }

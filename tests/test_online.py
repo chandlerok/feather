@@ -342,6 +342,10 @@ def test_a_renamed_view_is_retired_and_leaves_the_registry(tmp_path: Path) -> No
         module.read_text(encoding="utf-8").replace('name="clicks"', 'name="renamed"'),
         encoding="utf-8",
     )
+    # Close the first store before opening another over the same project. The embedded store
+    # is single-owner, so a second `FeatureStore` needs the first one released; reopening after
+    # a close is exactly what a restart does, which is the real deployment shape.
+    del project
     renamed = FeatureStore(tmp_path / "feather.toml")
 
     first = renamed.materialize()
@@ -359,26 +363,30 @@ def test_a_refresh_and_a_read_round_trip_through_the_store(tmp_path: Path) -> No
     """
     project = make_project(tmp_path, project=f"feathertest_online_{uuid.uuid4().hex}", store=True)
     report = project.store.materialize()
+    feature = project.Clicks.click_count
 
     frame = pl.DataFrame(
         project.store.get_online_features(
             entity_df=entities([1, 2, 3, 99]),
-            features=[project.Clicks.click_count],
+            features=[feature],
         )
     )
 
     assert report.views[0].rows == 3
     assert frame["click_count"].to_list() == [10, 20, 5, None], "read back from the store"
 
-    # A second store over the same project sees the same values, which is only possible if the
-    # first one wrote them into the server rather than into its own process.
-    reopened = FeatureStore(tmp_path / "feather.toml")
-    assert pl.DataFrame(
-        reopened.get_online_features(entity_df=entities([1]), features=[project.Clicks.click_count])
-    )["click_count"].to_list() == [10]
-
     # Everything is already in the registry, so nothing is retired and no keyspace walk runs.
     assert project.store.materialize().retired == []
+
+    # A store opened afresh over the same project sees the same values, which is only possible
+    # if the refresh wrote them to the database rather than into its own process. The embedded
+    # store is single-owner, so the first one is closed before the second opens; that is what a
+    # restart does, and it is the deployment shape this test is really about.
+    del project
+    reopened = FeatureStore(tmp_path / "feather.toml")
+    assert pl.DataFrame(reopened.get_online_features(entity_df=entities([1]), features=[feature]))[
+        "click_count"
+    ].to_list() == [10]
 
 
 def test_two_threads_sharing_one_store_do_not_deadlock(tmp_path: Path) -> None:
