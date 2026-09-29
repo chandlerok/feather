@@ -650,13 +650,14 @@ impl Engine {
             }
             Ok(types)
         };
-        // The scanner's text is kept, because it is the only description of what went wrong
+        // The scanner's error is kept, because it is the only description of what went wrong
         // and it may echo part of the conninfo. Wrapping rather than replacing it puts that
-        // text behind a message that says which view was reading.
+        // text behind a message that says which view was reading, and carries it as the
+        // error's own source so the chain below this one is not lost.
         describe().map_err(|error| Error::UnreadableSource {
             view: view.name.clone(),
             location: source_location(view),
-            reason: error.to_string(),
+            reason: Box::new(error),
         })
     }
 
@@ -2606,6 +2607,21 @@ mod tests {
 
         assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
         assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        // A `#[source]` on a `Box<E>` makes the box the concrete type behind the chain node, so
+        // the downcast names `Box<duckdb::Error>` and the caller derefs it to reach DuckDB's
+        // own error. Naming the inner type would be asking for a node that is not there.
+        let boxed = std::error::Error::source(&error)
+            .and_then(|node| node.downcast_ref::<Box<duckdb::Error>>());
+        assert!(
+            boxed.is_some(),
+            "the scanner's own error is the source of this one, not only its text: {error}"
+        );
+        // The downcast's type argument is the claim, and `is_some` is what tests it: the node
+        // behind the chain is a `Box<duckdb::Error>`, not some other error, and not a bare
+        // `duckdb::Error` either. There is deliberately no further assertion comparing the
+        // message against the node's own text, because the message is rendered from the same
+        // field the node points at, so that comparison holds for any value in the box and
+        // would not notice a wrong one.
         assert!(
             error
                 .to_string()
