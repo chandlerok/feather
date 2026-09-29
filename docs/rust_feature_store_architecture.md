@@ -636,8 +636,15 @@ the format rules are recorded, with the evidence behind them, in
 - **What is not a default.** `ducklake` is the recommendation for a source currently held in
   Postgres. `vortex` is a core extension with filters evaluated on compressed data, measured
   by DuckDB at 18% ahead of Parquet v2 on TPC-H SF100, but it is third-party maintained and
-  pre-1.0, so it is opt-in. Only `parquet`, `httpfs`, `icu` and `json` are Primary tier, so
-  Parquet on object storage is the only fully supported read path.
+  pre-1.0, so it is selectable per source and opt-in. Only `parquet`, `httpfs`, `icu` and
+  `json` are Primary tier, so Parquet on object storage is the only fully supported read path.
+  The per-source `format` that makes `vortex` selectable is in place; the table formats are
+  not implemented. The layout measurement in
+  [`engine-and-format-decisions.md`](./engine-and-format-decisions.md) is why that order is
+  the honest one: clustered keys compressed a feature source 30.6% smaller and cut the bytes
+  a point-in-time join read by 31.5%, which is a larger and cheaper win than any format
+  change. It also corrected the reason, which had been row group skipping: for this join the
+  reader skips nothing, and the win is compression.
 
 #### Source schema validation
 
@@ -1147,6 +1154,10 @@ libraries, and a build cannot turn them on:
 - `postgres` is loaded on the first read of a Postgres source. Nothing loads it at open, because
   a Postgres connection travels in the relation as libpq's own connection string rather than as
   a secret.
+- `vortex` is loaded on the first read of a source whose `format` names it. It is loadable
+  because it is third-party maintained and pre-1.0, which is also why nothing in Feather is
+  compiled against it. See "The format is a per-source choice" in
+  [`engine-and-format-decisions.md`](./engine-and-format-decisions.md).
 - An image that cannot reach the extension repository bakes the files in and points
   `Limits::extension_directory` at them, so `INSTALL` is a no-op and `LOAD` finds them locally.
 
@@ -1155,7 +1166,14 @@ support; Secondary ones are best-effort, still bugfixed and shipped with each re
 `parquet`, `httpfs`, `icu` and `json` are Primary. `iceberg`, `delta`, `ducklake`, `postgres`,
 `azure`, `mysql`, `sqlite` and `unity_catalog` are Secondary, and `vortex`, `lance` and
 `motherduck` are third-party maintained. Parquet on object storage is therefore the only fully
-supported read path in DuckDB's tiers, and the only file format this project defaults to.
+supported read path in DuckDB's tiers, and it is the format a file source gets when it does not
+name one.
+
+A `File` source may name its own `format`, so the choice is per source rather than per project
+and one project can read two formats side by side. The tier a format belongs to is declared in
+the core on the format itself, not in `feather.toml` and not in a definition module: it is a
+property of DuckDB's extension rather than of a deployment or of the data, so a file carrying
+it could only hold an assertion that could be wrong.
 
 The cost of that design is the same one the warehouse extensions carry: an extension is built for
 one DuckDB version and one platform, and the path it lives at names both. An extension that lags

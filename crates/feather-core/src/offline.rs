@@ -2,8 +2,9 @@
 //!
 //! One engine, DuckDB, for every source. A local Parquet file, an object-storage prefix, and
 //! a warehouse table are read by different readers and joined the same way, so nothing here
-//! selects a compute backend: [`Engine::relation`] is the one place a source's kind decides
-//! which reader its rows come from.
+//! selects a compute backend: [`Engine::relation`] is the one place a source becomes
+//! a relation, and so the one place its kind and a file source's format decide which
+//! reader its rows come from.
 //!
 //! The rules are the ones specified under "Point-in-time join semantics" in the
 //! architecture document, and they live here rather than in the caller because getting them
@@ -37,7 +38,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use duckdb::{Arrow, Connection};
 
-use crate::definitions::{DType, FeatureView, Source};
+use crate::definitions::{DType, FeatureView, FileFormat, Source};
 use crate::error::{Error, Result};
 use crate::settings::Connection as SettingsConnection;
 use crate::value::arrow_type;
@@ -330,18 +331,34 @@ impl Engine {
     ///     `Ok(())` once the filesystem or scanner the source needs is loaded.
     ///
     /// Raises:
+    ///     [`Error::UnknownSourceFormat`] if a file source names a format Feather has no
+    ///         reader for. Resolved before anything is installed, so a format mistake
+    ///         fails as itself rather than after a fetch.
     ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
     ///         source names a connection the project cannot use. Checked before the
     ///         extension is installed, so a connection mistake fails as itself rather
     ///         than after a fetch.
-    ///     [`Error::DuckDb`] if the extension cannot be installed or loaded.
+    ///     [`Error::ExtensionUnavailable`] if a file source's format extension, or the
+    ///         filesystem a remote path needs, cannot be installed or loaded. A Postgres
+    ///         source's extension is not covered: it is still [`Error::DuckDb`].
+    ///     [`Error::DuckDb`] if the connection cannot be used.
     fn ensure_source_loaded(&self, view: &FeatureView) -> Result<()> {
+        let format = view.source_format()?;
         match &view.source {
-            Source::File { path } if path_needs_filesystem(path) => {
-                self.connection()?
-                    .execute_batch("INSTALL httpfs; LOAD httpfs;")?;
+            Source::File { path, .. } => {
+                for (extension, reader) in extensions_for(path, format) {
+                    self.connection()?
+                        .execute_batch(&format!("INSTALL {extension}; LOAD {extension};"))
+                        .map_err(|source| {
+                            Error::extension_unavailable(
+                                view.name.clone(),
+                                extension,
+                                reader,
+                                source,
+                            )
+                        })?;
+                }
             }
-            Source::File { .. } => {}
             Source::Postgres { connection, .. } => {
                 self.postgres_conninfo(view, connection)?;
                 self.connection()?
@@ -1304,8 +1321,10 @@ impl Engine {
     /// The table expression a view's source becomes.
     ///
     /// The one place a source becomes a relation, so `DESCRIBE`, the join, and the
-    /// ambiguity check all read the same expression rather than re-deriving it. A
-    /// reader added later, a warehouse table or a table format, changes only this.
+    /// ambiguity check all read the same expression rather than re-deriving it. For a
+    /// file source the format, not the kind, selects the reader. A reader added later,
+    /// a warehouse table or a table format, changes this and
+    /// [`Engine::ensure_source_loaded`], which is where its extension is loaded.
     ///
     /// Args:
     ///     view: The view whose source is read.
@@ -1314,11 +1333,17 @@ impl Engine {
     ///     A SQL expression yielding the source's rows, already quoted for DuckDB.
     ///
     /// Raises:
+    ///     [`Error::UnknownSourceFormat`] if a file source names a format Feather has no
+    ///         reader for. The same error the definitions loader raises, so a view read
+    ///         without one still fails as itself.
     ///     [`Error::UnknownConnection`] or [`Error::SourceConnectionKind`] if a Postgres
     ///         source names a connection the project cannot use.
     fn relation(&self, view: &FeatureView) -> Result<String> {
         match &view.source {
-            Source::File { path } => Ok(format!("read_parquet({})", quote_literal(path))),
+            Source::File { path, .. } => {
+                let (reader, _) = format_reader(view.source_format()?);
+                Ok(format!("{reader}({})", quote_literal(path)))
+            }
             Source::Postgres {
                 connection,
                 schema,
@@ -1484,6 +1509,57 @@ fn path_needs_filesystem(path: &str) -> bool {
     path.contains("://")
 }
 
+/// The extensions a file source needs installed, with the format each one reads.
+///
+/// The return is a flat sequence of `(extension, reader)` pairs rather than one element
+/// per *possible* extension: every caller installs what it is handed and only
+/// optionally attaches a reader clause, so a flat sequence cannot make a caller skip an
+/// element or destructure a shape the other side did not produce. The first draft
+/// returned `[(Option<&str>, Option<...>); 2]` and the call site destructured a flat
+/// tuple against it, which does not compile, and which would have been the
+/// silently-skipping shape had it compiled.
+///
+/// The `Option<(&'static str, &'static str)>` on each pair is the `(name, tier)` clause
+/// [`Error::extension_unavailable`] renders, and it is `None` for anything that is not
+/// a format's own reader: `httpfs` reads no format and is no tier, so a remote Parquet
+/// source must not have one attributed to its filesystem. The extension itself is
+/// never optional, so a format with no compiled-in reader still yields the one it
+/// needs installed.
+///
+/// A `Vec` of at most two pairs, pushed in the order the source needs them: the
+/// filesystem first, because a remote path cannot be read at all without it, and the
+/// format's own extension second.
+fn extensions_for(
+    path: &str,
+    format: FileFormat,
+) -> Vec<(&'static str, Option<(&'static str, &'static str)>)> {
+    let mut extensions = Vec::with_capacity(2);
+    if path_needs_filesystem(path) {
+        extensions.push(("httpfs", None));
+    }
+    if let Some(extension) = format_reader(format).1 {
+        extensions.push((extension, Some((format.as_str(), format.tier().as_str()))));
+    }
+    extensions
+}
+
+/// How a file format is read: the table function that yields its rows, and the DuckDB
+/// extension that has to be loaded first, or `None` when the bundled build already
+/// contains it.
+///
+/// Both halves are here rather than on [`FileFormat`] because they are DuckDB's names,
+/// and `definitions.rs` is the language-neutral contract that no engine appears in.
+fn format_reader(format: FileFormat) -> (&'static str, Option<&'static str>) {
+    match format {
+        // The bundled build compiles the Parquet reader in, so installing it would be a
+        // no-op that can still fail on a machine that cannot reach the repository.
+        FileFormat::Parquet => ("read_parquet", None),
+        // Loadable, third-party maintained, and pre-1.0, so a source naming it opts in
+        // and nothing in Feather is compiled against it.
+        FileFormat::Vortex => ("read_vortex", Some("vortex")),
+    }
+}
+
 /// Quote an identifier, doubling any embedded quote.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -1503,7 +1579,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
 
     use super::*;
-    use crate::definitions::{Entity, Field as FeatureField};
+    use crate::definitions::{Entity, Field as FeatureField, SupportTier};
 
     /// A whole day, in the units the join compares in.
     const DAY: i64 = 86_400_000_000;
@@ -2424,12 +2500,227 @@ mod tests {
     }
 
     #[test]
-    fn a_file_source_becomes_a_parquet_relation() {
+    fn a_file_source_with_no_format_declared_is_read_as_parquet() {
+        // The default, so the pinned string is unchanged by the format knob: a project
+        // that names no format must go on getting `read_parquet` and nothing else.
         let relation = engine()
             .relation(&view("data/user_stats.parquet", None))
             .expect("relation");
 
         assert_eq!(relation, "read_parquet('data/user_stats.parquet')");
+    }
+
+    #[test]
+    fn a_file_source_naming_a_format_is_read_with_that_formats_reader() {
+        let relation = engine()
+            .relation(&source_view(Source::File {
+                path: "data/clicks.vortex".to_owned(),
+                format: Some("vortex".to_owned()),
+            }))
+            .expect("relation");
+
+        assert_eq!(relation, "read_vortex('data/clicks.vortex')");
+    }
+
+    #[test]
+    fn an_unknown_format_is_rejected_rather_than_read_as_parquet() {
+        // The failure mode this rules out is a typo silently falling back to the default
+        // and reading a Vortex file as Parquet, which is a decode error much later and
+        // nowhere near the name that caused it.
+        let view = source_view(Source::File {
+            path: "data/clicks.vortex".to_owned(),
+            format: Some("vortx".to_owned()),
+        });
+
+        let error = engine().relation(&view).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` reads source `data/clicks.vortex` in format `vortx`, which \
+             Feather does not read; the formats are parquet, vortex"
+        );
+    }
+
+    #[test]
+    fn two_formats_resolve_from_one_project() {
+        // The seam the format knob exists for: one engine, one set of connections, and
+        // two sources whose formats differ. Nothing here reads a file, so the assertion
+        // is about resolution rather than about either format's data.
+        let connections = BTreeMap::from([(
+            "s3_lake".to_owned(),
+            connection(r#"{"type":"s3","region":"us-east-1","key_id":"k","secret":"s"}"#),
+        )]);
+        let settings = crate::settings::parse_settings(
+            r#"
+            project = "ads"
+            definitions = ["user_clicks"]
+
+            [connections.s3_lake]
+            type = "s3"
+            region = "us-east-1"
+            key_id = "k"
+            secret = "s"
+            "#,
+        )
+        .expect("settings");
+        assert_eq!(
+            settings.connections, connections,
+            "one settings, one connection"
+        );
+        let engine = Engine::open(&Limits::default(), &settings.connections).expect("engine");
+
+        let parquet = engine
+            .relation(&view("data/user_stats.parquet", None))
+            .expect("parquet relation");
+        let vortex = engine
+            .relation(&source_view(Source::File {
+                path: "s3://lake/clicks.vortex".to_owned(),
+                format: Some("vortex".to_owned()),
+            }))
+            .expect("vortex relation");
+
+        assert_eq!(parquet, "read_parquet('data/user_stats.parquet')");
+        assert_eq!(vortex, "read_vortex('s3://lake/clicks.vortex')");
+    }
+
+    #[test]
+    fn a_format_naming_no_compiled_reader_still_names_the_extension_it_needs_installed() {
+        // The mapping the install loop consumes, asserted on its own because that is
+        // what can be asserted without an extension repository to fail against: a
+        // vortex source must reach `INSTALL vortex`, and a local Parquet source must
+        // reach nothing, or a project that names no non-default format would touch the
+        // extension repository. What the loop does with each pair is not asserted
+        // here; this pins the input to it.
+        assert_eq!(
+            extensions_for("data/clicks.vortex", FileFormat::Vortex),
+            vec![("vortex", Some(("vortex", "third-party maintained")))],
+            "a vortex source installs the vortex extension, and names its tier"
+        );
+        assert_eq!(
+            extensions_for("data/user_stats.parquet", FileFormat::Parquet),
+            Vec::new(),
+            "a local parquet source installs nothing"
+        );
+    }
+
+    #[test]
+    fn a_filesystem_extension_is_never_credited_with_a_format_or_a_tier() {
+        // `httpfs` reads no format and is no tier. A remote Parquet source needs it and
+        // does not need the Parquet reader, so crediting it with a format and a Primary
+        // tier would tell an operator the opposite of what is true: that the failure they
+        // are reading about is a third-party path.
+        assert_eq!(
+            extensions_for("s3://lake/user_stats.parquet", FileFormat::Parquet),
+            vec![("httpfs", None)],
+            "httpfs was attributed a format"
+        );
+        assert_eq!(
+            extensions_for("s3://lake/clicks.vortex", FileFormat::Vortex),
+            vec![
+                ("httpfs", None),
+                ("vortex", Some(("vortex", "third-party maintained"))),
+            ],
+            "a remote vortex source names the format for its reader and not for httpfs"
+        );
+    }
+
+    #[test]
+    fn a_point_in_time_join_matches_a_label_inside_its_key_s_feature_range() {
+        // The invariant `examples/layout.rs` asserts over 500,000 labels and 2,000,000
+        // feature rows, in three rows apiece and with no timing, because `cargo test`
+        // builds examples and does not run them: the assertion in the example's `main`
+        // is gated by nothing. This is the same predicate the example measures
+        // (`examples/layout.rs`'s `join_sql`), against real tables, so a label frame
+        // whose timestamps fall below the feature rows' fails here rather than
+        // quietly turning the measurement into a decode ratio.
+        //
+        // The frame is built the way the example builds it: both sides from one base and
+        // one step, each label one step past the feature row for its own key.
+        let engine = engine();
+        let connection = engine.connection().expect("connection");
+        let base: i64 = 1_700_000_000_000_000;
+        let step: i64 = 7;
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE features (user_id BIGINT, event_timestamp BIGINT, n BIGINT);
+                 INSERT INTO features VALUES
+                     (1, {base}, 10),
+                     (1, {base} + {step} * 2, 11),
+                     (2, {base} + {step} * 10, 20),
+                     (2, {base} + {step} * 12, 21),
+                     (3, {base} + {step} * 20, 30);
+                 CREATE TABLE labels (user_id BIGINT, event_timestamp BIGINT);
+                 INSERT INTO labels VALUES
+                     (1, {base} + {step}),
+                     (2, {base} + {step} * 5),
+                     (3, {base} + {step} * 20);"
+            ))
+            .expect("frames");
+        let sql = "SELECT count(*), count(f.user_id) FROM labels l ASOF LEFT JOIN features f
+                   ON l.user_id = f.user_id AND l.event_timestamp >= f.event_timestamp";
+
+        let (rows, matched): (i64, i64) = connection
+            .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("join");
+        assert_eq!(rows, 3, "a left join emitted the wrong number of rows");
+        // The half that matters: a label whose timestamp sits inside its key's feature
+        // range matched a feature row, so the join returns features rather than nulls.
+        // Reverting the example's label timestamps to `base + i`, which is what made one
+        // label of 500,000 match, leaves only label 1 here and this fails.
+        assert_eq!(
+            matched, 2,
+            "a label inside its feature range matched nothing"
+        );
+
+        // The boundary, which the count above cannot see: what each label got.
+        //
+        // - key 1's label sits one step past the first of its key's two feature rows, so
+        //   the older row wins and the newer one, two steps on, is out of range.
+        // - key 2's label sits below every feature row its key has, which is the defect
+        //   this whole arrangement exists to catch: the intended behaviour is a null, not
+        //   the nearest row below, because `ASOF` never crosses to a later timestamp.
+        // - key 3's label sits exactly on its key's only feature row, so `>=` includes
+        //   it and the row is found rather than passed over.
+        let mut statement = connection
+            .prepare(
+                "SELECT l.user_id, f.event_timestamp, f.n
+                 FROM labels l ASOF LEFT JOIN features f
+                   ON l.user_id = f.user_id AND l.event_timestamp >= f.event_timestamp
+                 ORDER BY l.user_id",
+            )
+            .expect("prepare");
+        let mut query = statement.query([]).expect("rows");
+        let mut got: Vec<(i64, Option<i64>, Option<i64>)> = Vec::new();
+        while let Some(row) = query.next().expect("row") {
+            got.push((
+                row.get(0).expect("label key"),
+                row.get(1).expect("matched timestamp"),
+                row.get(2).expect("matched value"),
+            ));
+        }
+        assert_eq!(
+            got,
+            vec![
+                (1, Some(base), Some(10)),
+                (2, None, None),
+                (3, Some(base + step * 20), Some(30)),
+            ],
+            "the join picked the wrong feature row, or one for a label below its range"
+        );
+    }
+
+    #[test]
+    fn each_format_names_the_extension_it_needs_loaded() {
+        // Parquet is compiled into the bundled build, so naming no extension is what
+        // keeps a local project from touching the extension repository at all. Vortex is
+        // loadable and third-party maintained, which is why a source naming it opts in.
+        assert_eq!(format_reader(FileFormat::Parquet), ("read_parquet", None));
+        assert_eq!(
+            format_reader(FileFormat::Vortex),
+            ("read_vortex", Some("vortex"))
+        );
+        assert_eq!(FileFormat::Parquet.tier(), SupportTier::Primary);
+        assert_eq!(FileFormat::Vortex.tier(), SupportTier::ThirdParty);
     }
 
     #[test]

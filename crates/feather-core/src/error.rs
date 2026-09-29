@@ -1,6 +1,20 @@
+#[cfg(feature = "offline")]
+use std::fmt;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The size ceiling `clippy::result_large_err` enforces, as a compile error instead.
+///
+/// The lint reports a lint-worthy value at every function that returns it, which for an
+/// error enum is most of the crate, so the report arrives as a wall of identical
+/// diagnostics pointing at fields rather than at the enum that is actually too big. A
+/// size assertion names the real problem, and it holds under every feature combination
+/// rather than only the one a lint run happened to enable. It is 128, clippy's own
+/// threshold, not a rounder number: an enum this size is already paying for a `memcpy`
+/// per `Result` it hands back, and the headroom under it is the point of the ceiling.
+const _: () = assert!(std::mem::size_of::<Error>() <= 128);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -71,6 +85,22 @@ pub enum Error {
 
     #[error("malformed definitions: {reason}")]
     MalformedDefinitions { reason: String },
+
+    /// A source naming a format Feather has no reader for.
+    ///
+    /// Reported against the view and the path rather than as a deserialization failure,
+    /// because a definition that is wrong here is wrong about one source rather than
+    /// about the file, and a name is what tells the two apart.
+    #[error(
+        "view `{view}` reads source `{path}` in format `{format}`, which Feather does not \
+         read; the formats are {known}"
+    )]
+    UnknownSourceFormat {
+        view: String,
+        path: String,
+        format: String,
+        known: String,
+    },
 
     #[error(
         "one request mixed entities `{first}` and `{second}`; all views in a request must \
@@ -201,7 +231,104 @@ pub enum Error {
         reason: String,
     },
 
+    /// An extension that could not be installed or loaded.
+    ///
+    /// The tier travels with it because that is the whole reason a non-Primary format
+    /// is opt-in: an operator reading this needs to know they are on a best-effort or
+    /// third-party path, and the extension's own message names neither the view nor the
+    /// format. It travels only for the format's own reader, because `httpfs` reads no
+    /// format and has no tier, and an `s3://` Parquet source that cannot reach the
+    /// extension repository must not be told that `httpfs` reads Parquet.
+    ///
+    /// `source` is boxed, unlike every other `#[source]` here, and that is a size
+    /// decision rather than a taste one. `duckdb::Error` is an enum of its own whose
+    /// widest variant carries an Arrow `Type`, so it runs to tens of bytes; added to
+    /// the three fields above it this variant crossed the 128 bytes at which
+    /// `clippy::result_large_err` starts reporting every function that returns a
+    /// `Result<_, Error>`. The other source fields are `std::io::Error` at eight
+    /// bytes and never came close. One heap cell on the error path is the cheap half
+    /// of that trade; the other half is that the enum is now sized by the pre-existing
+    /// four-`String` variants, which the assertion above holds in place.
+    #[cfg(feature = "offline")]
+    #[error("view `{view}` could not load the `{extension}` extension{reader}: {source}")]
+    ExtensionUnavailable {
+        view: String,
+        extension: &'static str,
+        reader: ExtensionReader,
+        #[source]
+        source: Box<duckdb::Error>,
+    },
+
     #[cfg(feature = "valkey")]
     #[error("valkey: {0}")]
     Valkey(#[from] redis::RedisError),
+}
+
+/// What a failed extension load says about the format the extension reads.
+///
+/// Empty for an extension that is not a format's reader, which is the whole point: the
+/// same [`Error::ExtensionUnavailable`] covers `httpfs` and a format's own extension,
+/// and only the second has a format and a tier to name.
+#[cfg(feature = "offline")]
+#[derive(Debug)]
+pub struct ExtensionReader(Option<(&'static str, &'static str)>);
+
+#[cfg(feature = "offline")]
+impl fmt::Display for ExtensionReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some((format, tier)) = self.0 {
+            write!(formatter, ", which reads {format} and is {tier} tier")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "offline")]
+impl Error {
+    /// A `duckdb` failure installing or loading `extension` for `view`.
+    ///
+    /// `reader` is the format's `(name, tier)` when `extension` is that format's own
+    /// reader, and `None` for anything else, so the message attributes a format and a
+    /// tier only to the extension that has them.
+    ///
+    /// The `source` is taken by value and boxed here, so the one caller does not have
+    /// to know that the variant stores it indirectly.
+    pub fn extension_unavailable(
+        view: String,
+        extension: &'static str,
+        reader: Option<(&'static str, &'static str)>,
+        source: duckdb::Error,
+    ) -> Self {
+        Self::ExtensionUnavailable {
+            view,
+            extension,
+            reader: ExtensionReader(reader),
+            source: Box::new(source),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "offline"))]
+mod tests {
+    use super::ExtensionReader;
+
+    #[test]
+    fn a_format_readers_failure_clause_names_the_format_and_the_tier() {
+        // The whole reason the clause exists: an operator reading a load failure for a
+        // non-Primary format has to be told they are on a third-party path. Rendered here
+        // rather than only through a real failed install, because provoking one needs an
+        // extension repository this test must not depend on.
+        assert_eq!(
+            ExtensionReader(Some(("vortex", "third-party maintained"))).to_string(),
+            ", which reads vortex and is third-party maintained tier"
+        );
+    }
+
+    #[test]
+    fn a_filesystems_failure_clause_is_nothing_at_all() {
+        // `httpfs` reads no format and is no tier, so a clause naming one is not a
+        // smaller claim, it is the wrong claim. The message reads
+        // "could not load the `httpfs` extension: <duckdb's own text>" instead.
+        assert_eq!(ExtensionReader(None).to_string(), "");
+    }
 }

@@ -122,21 +122,108 @@ taken from DuckDB's published extension documentation rather than checked here.
 | Third-party maintained | `vortex`, `lance`, `motherduck`                                                                                         |
 
 So within DuckDB's tiers, **Parquet on object storage, `parquet` plus `httpfs`, is the only
-fully supported read path**, and it is the format this project defaults to.
-Parquet is also the only format feather itself reads today — a `File` source is a Parquet file,
-`Settings` has no format field, and the Postgres reader is a table scan rather than a file
-format (see "Backend coverage" in the architecture document) — and the rules above are why the
-rest are not defaults. A per-source format choice is intended follow-up work (#36).
+fully supported read path**, and it is the format a source gets when it does not name one.
+The Postgres reader is a table scan rather than a file format (see "Backend coverage" in the
+architecture document), so a format never applies to it.
+
+### The format is a per-source choice
+
+A `File` source carries an optional `format`, and it resolves independently per source, so one
+project can read Parquet and Vortex side by side. The default is the Primary format, Parquet, and
+that is the only reason it is the default: the tier table above is what makes it defensible
+rather than a preference, and a format added later cannot become the default by being added.
+
+| `format`  | Read by             | Tier                 | Extension                   |
+| --------- | ------------------- | -------------------- | --------------------------- |
+| omitted   | `read_parquet(...)` | Primary              | compiled into the build     |
+| `parquet` | `read_parquet(...)` | Primary              | compiled into the build     |
+| `vortex`  | `read_vortex(...)`  | Third-party, pre-1.0 | installed on the first read |
+
+`Engine::relation` is where the format becomes a table function, and
+`Engine::ensure_source_loaded` is where its extension is installed, so a format added later
+changes those two and nothing else. Vortex is installed on the first read rather than at open,
+on the same deferral as `httpfs` and `postgres`, so a project that names no non-default format
+never touches the extension repository. Nothing in Feather is compiled against it.
+
+**The tier is declared in the code, on the format, and in neither `feather.toml` nor the
+definition module.** It is a fact about DuckDB's extension rather than about a project: the
+answer is the same everywhere, so both files would only be somewhere for a project to assert a
+tier that could be wrong. `feather.toml` holds what a deployment is made of, and a support tier
+is not infrastructure. The definition module holds what the data is, and a Vortex file is a
+Vortex file whatever tier its reader carries. `FileFormat::tier` in
+`crates/feather-core/src/definitions.rs` is the single place, and a load failure for a
+non-Primary format names it so an operator reading the error knows they are on a best-effort
+or third-party path.
+
+An unknown format is a load error, not a fallback:
+
+```text
+view `user_clicks` reads source `data/clicks.vortex` in format `vortx`, which Feather does
+not read; the formats are parquet, vortex
+```
+
+The alternative, silently reading it as Parquet, fails much later as a decode error with
+nothing near the name that caused it. The error names the view, the path, and the value, which
+is why `format` is carried on the source as a string and resolved by the loader rather than
+being a typed field that serde would reject as a bare "unknown variant".
 
 ### Layout beats format
 
-Sort and partition a feature source by `(entity key, event_timestamp)`. That is what lets DuckDB
-skip row groups, or storage segments under Vortex, for the key range instead of scanning
-everything. **A sorted Parquet should beat an unsorted Vortex.** This is reasoning rather than a
-measurement — verifying it is open work in #36 — but it costs nothing in dependencies, is
-format-independent, and is the highest-leverage change available without changing engines.
+**Sort and partition a feature source by `(entity key, event_timestamp)`.** The recommendation
+stands, and it is the one thing feather should tell users about how to land feature data: it
+costs nothing in dependencies, it is format-independent, and it makes the point-in-time join
+read 31.5% fewer bytes. The byte counts in the table below are measured; the join times are
+not, and the table marks which is which.
 
-If feather recommends one thing to users about how to land feature data, it should be this.
+**The reason the first draft gave for it was wrong**, and the correction matters to anyone
+choosing a layout. The claim was that sorting lets DuckDB skip row groups for the key range.
+It does not, for this join. With 8 of 16 row groups wholly outside the label keys, the sorted
+file's bytes read are the same _to the byte_ as when the range covers every key. An `ASOF
+JOIN` reads its build side before it knows any label keys, so a dynamic filter arrives after
+the scan has already read.
+
+Measured with `examples/layout.rs`: one generated 2M-row feature table over 1M distinct keys,
+written twice with the same writer and the same 131072-row row groups, differing only in row
+order. `unsorted` is a deterministic permutation of the same rows, so no row group has local
+key structure; `sorted` is ordered by `(user_id, event_timestamp)`. 500k labels, DuckDB
+1.105.05. `half` labels are over the lower half of the key space (stride 1) and `full` over
+every other key (stride 2), so `full` reaches the top of the key space without covering all of
+it.
+
+| Figure                              | unsorted     | sorted       | sorted wins by |
+| ----------------------------------- | ------------ | ------------ | -------------- |
+| file size                           | 20,887,564 B | 14,495,033 B | 30.6%          |
+| bytes read by the join              | 20,545,535 B | 14,068,158 B | 31.5%          |
+| row groups wholly out of range      | 0 of 16      | 8 of 16      | —              |
+| join, labels over half the keys †   | not measured | not measured | —              |
+| join, labels over every other key † | not measured | not measured | —              |
+
+**† Not measured, and withdrawn rather than restated.** The run that produced a figure here
+gave the label frame timestamps that fell below the feature rows' timestamps for their key, so
+a single label of 500,000 matched anything: what it timed was a decode-and-build-side sort, not
+a point-in-time join. The bytes and the file sizes are decode-side and do not depend on the
+predicate, which is why they stand. The example now places the label timestamps inside the
+feature range and asserts that every label matched, so the next run of `examples/layout.rs`
+measures a join that joins.
+
+Every byte count here reproduced exactly across three runs. Quote those, and leave the join time
+unquoted: the layout's effect on it is the open question this table leaves.
+
+What the layout actually buys is compression, not pruning. Clustered keys are the same value
+over and over, which is what dictionary encoding is for, so the file is 30.6% smaller and there
+are 31.5% fewer bytes to decode. That is what the byte counts show on their own: the two label
+ranges read the same amount from each file, and the sorted file's row groups are not skipped
+from the join at all, which is the opposite of what row group skipping would produce.
+
+**Pruning is real, and it needs a static predicate rather than a join.** The same sorted file
+under `WHERE user_id <= 499999` reads 3,150,108 B against the unsorted file's 10,008,816 B,
+3.18x, which is about what skipping 8 of 16 row groups predicts. The unsorted file can skip
+none, because every one of its row groups spans the whole key space. Both figures reproduced
+exactly. So for a scan that filters on the key, sorting is worth even more than the table above
+says, and it is the same recommendation for the same underlying reason.
+
+**A sorted Parquet beats an unsorted Vortex**, still, but for the reason above: clustered keys
+compress, and 30% fewer bytes beats any format's decoder.
 
 ### Iceberg and Delta
 
@@ -266,10 +353,27 @@ warehouse source is best-effort, with the snapshot id recorded and a metadata-on
 ## Reproducing these
 
 Each spike was a scratch crate or virtualenv outside the repository, so none of them are
-committed. They are small enough to rebuild when a claim needs rechecking.
+committed, with one exception: the layout measurement is `examples/layout.rs`, because it is a
+claim worth rechecking rather than a one-off. They are small enough to rebuild when a claim needs
+rechecking.
 
 - **DuckDB**: in this repository, `ENTITIES=500000 cargo run --release -p feather-core
   --features offline --example duckdb_input`. That is where the 34.4 ms figure comes from.
+  The same caveat as the layout table's join rows applies to it: that example's label
+  timestamps fall below the feature rows' for their key, so the figure is a decode and
+  build-side-sort cost, not a point-in-time join.
+- **Layout**: in this repository, `cargo run --release -p feather-core --features offline
+  --example layout`. It writes the same generated feature table twice, ordered by
+  `(user_id, event_timestamp)` and by a deterministic permutation of the same rows
+  (`(i * 2654435761) % 2000000`, deliberately rather than the order `range()` produced,
+  so no row group has local key structure to begin with), and joins each with the same
+  `ASOF LEFT JOIN`, so the layout is the only variable. Bytes read are the kernel's
+  `rchar` counter, sampled either side of the timed join, because DuckDB's own profile
+  cannot answer it; the row-group counts are read from the file's footer. The program
+  prints a matched-row count and asserts it equals the label count, so the figure is a
+  join that returned features rather than one that returned nulls. `cargo test` does not run
+  examples, so the same invariant is also asserted as an ordinary test, over three label rows
+  and no timing, in `crates/feather-core/src/offline.rs`.
 - **Hand-rolled join**: a crate depending only on `arrow` 58 and `parquet` 58, with the merge as
   a single monotonic cursor over a source sorted by `(key, ts, created)`. The `arrow` API details
   that cost the most time were `lexsort_to_indices(&[SortColumn], limit)` and the fact that

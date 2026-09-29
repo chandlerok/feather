@@ -23,7 +23,7 @@ fn the_python_payload_deserializes_field_for_field() {
 
     assert_eq!(definitions.project, "ads");
 
-    assert_eq!(definitions.views.len(), 2);
+    assert_eq!(definitions.views.len(), 3);
     let view = &definitions.views[0];
     assert_eq!(view.name, "user_clicks");
     assert_eq!(view.entities.len(), 1);
@@ -63,6 +63,26 @@ fn the_python_payload_deserializes_field_for_field() {
     assert_eq!(postgres.features.len(), 1);
     assert_eq!(postgres.features[0].name, "lifetime_value");
     assert_eq!(postgres.features[0].dtype, DType::Float64);
+
+    // The one value that is a new contract rather than an absence of one: the
+    // non-default format's wire name, spelled once in the fixture and read here. The
+    // `null` above is pinned by the null case; `"vortex"` is the string a rename on one
+    // side alone would move, so it is compared across the boundary rather than
+    // asserted twice, once per language.
+    let vortex = &definitions.views[2];
+    assert_eq!(
+        vortex.source,
+        Source::File {
+            path: "s3://lake/clicks.vortex".to_owned(),
+            format: Some("vortex".to_owned()),
+        },
+        "source is {}",
+        vortex.source.description()
+    );
+    assert_eq!(
+        vortex.source_format().expect("format"),
+        feather_core::FileFormat::Vortex
+    );
 
     assert_eq!(definitions.services.len(), 1);
     assert_eq!(definitions.services[0].name, "ranking");

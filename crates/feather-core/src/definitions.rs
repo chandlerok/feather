@@ -88,6 +88,84 @@ impl Entity {
     }
 }
 
+/// DuckDB's published support tier for the extension a file format needs.
+///
+/// A fact about the extension rather than about the project, which is why it is
+/// declared on the format and lives in neither `feather.toml` nor a definition module:
+/// the answer is the same for every project, so either file would only be somewhere
+/// for a project to assert a tier that could be wrong. It is also the reason a format
+/// is allowed to exist here at all without being the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportTier {
+    /// Community supported.
+    Primary,
+    /// Best effort: still bugfixed and shipped with each release.
+    Secondary,
+    /// Maintained outside the DuckDB team, so it is rebuilt per release and an
+    /// extension that lags the engine fails to load rather than degrading.
+    ThirdParty,
+}
+
+impl SupportTier {
+    /// This tier's name, as the error a failed load reports it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "Primary",
+            Self::Secondary => "Secondary",
+            Self::ThirdParty => "third-party maintained",
+        }
+    }
+}
+
+/// The file format a `File` source is read as.
+///
+/// Closed rather than free, because each variant is a reader that exists and a tier
+/// that says whether relying on it is safe. One source picks one, so a project can
+/// read several formats side by side, and the default is the Primary one rather than
+/// whichever was added most recently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileFormat {
+    /// DuckDB's `read_parquet`. Compiled into the bundled engine, and the only
+    /// Primary-tier file format DuckDB publishes.
+    #[default]
+    Parquet,
+    /// DuckDB's `read_vortex`. Loadable rather than compiled in, third-party
+    /// maintained, and pre-1.0, so a source naming it opts into an extension Feather
+    /// neither ships nor builds against.
+    Vortex,
+}
+
+impl FileFormat {
+    /// Every format's wire name, in the order readers are added.
+    const ALL: [Self; 2] = [Self::Parquet, Self::Vortex];
+
+    /// This format's wire name, which is what a source's `format` holds.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Vortex => "vortex",
+        }
+    }
+
+    /// This format's support tier, which is what makes it safe to default to.
+    pub const fn tier(self) -> SupportTier {
+        match self {
+            Self::Parquet => SupportTier::Primary,
+            Self::Vortex => SupportTier::ThirdParty,
+        }
+    }
+
+    /// A format from the name a source declares, or `None` if Feather has no reader for it.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|format| format.as_str() == name)
+    }
+
+    /// Every format's wire name, for an error that has to name them.
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        Self::ALL.into_iter().map(|format| format.as_str())
+    }
+}
+
 /// Where a view's features are read from.
 ///
 /// Discriminated on `type` in the wire form, so each kind carries only its own keys
@@ -97,8 +175,20 @@ impl Entity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Source {
-    /// A Parquet file, local or reached through a URI scheme such as `s3://`.
-    File { path: String },
+    /// A file, local or reached through a URI scheme such as `s3://`.
+    File {
+        path: String,
+        /// The format the file is read as. Absent means [`FileFormat::default`], so a
+        /// project that only reads Parquet never writes the key.
+        ///
+        /// A `String` rather than a [`FileFormat`] because the value has to survive
+        /// deserialization to be reported properly: `serde` cannot reach the sibling
+        /// `path` from a field deserializer, and an unknown format has to name the
+        /// source that declared it rather than fail as a bare "unknown variant".
+        /// [`FeatureView::source_format`] is where it is resolved.
+        #[serde(default)]
+        format: Option<String>,
+    },
     /// A table in a Postgres database.
     ///
     /// The connection is named rather than carried, because credentials belong in
@@ -111,9 +201,12 @@ pub enum Source {
 }
 
 impl Source {
-    /// A local or remote Parquet file.
+    /// A local or remote file in the default format.
     pub fn file(path: impl Into<String>) -> Self {
-        Self::File { path: path.into() }
+        Self::File {
+            path: path.into(),
+            format: None,
+        }
     }
 
     /// A table read from the named Postgres connection.
@@ -148,7 +241,7 @@ impl Source {
     /// How this source is named in an error about it.
     pub fn description(&self) -> String {
         match self {
-            Self::File { path } => path.clone(),
+            Self::File { path, .. } => path.clone(),
             Self::Postgres {
                 connection,
                 schema,
@@ -160,10 +253,18 @@ impl Source {
     /// This kind's string fields, as `(key, value)` pairs.
     ///
     /// The keys are the wire names, so an error about one names the key the author
-    /// wrote rather than the variant it selects.
+    /// wrote rather than the variant it selects. An absent optional contributes no
+    /// pair: there is no value to be empty, and an absent `format` is the default
+    /// rather than a declaration.
     fn string_fields(&self) -> Vec<(&'static str, &str)> {
         match self {
-            Self::File { path } => vec![("path", path)],
+            Self::File { path, format } => {
+                let mut fields = vec![("path", path.as_str())];
+                if let Some(format) = format {
+                    fields.push(("format", format.as_str()));
+                }
+                fields
+            }
             Self::Postgres {
                 connection,
                 schema,
@@ -203,6 +304,29 @@ impl FeatureView {
 
     pub fn field(&self, name: &str) -> Option<&Field> {
         self.features.iter().find(|f| f.name == name)
+    }
+
+    /// The format this view's source is read as, or an error naming the source that
+    /// declared one Feather has no reader for.
+    ///
+    /// Checked here, at load, because an unknown format is a mistake in the
+    /// definition rather than a failure at the first read, and the source is named
+    /// either way. The engine resolves the same format again as a backstop.
+    pub fn source_format(&self) -> Result<FileFormat> {
+        let Source::File { path, format } = &self.source else {
+            // A Postgres table is a table scan rather than a file format, so there is
+            // nothing for a format to decide and the default stands.
+            return Ok(FileFormat::default());
+        };
+        let Some(declared) = format else {
+            return Ok(FileFormat::default());
+        };
+        FileFormat::parse(declared).ok_or_else(|| Error::UnknownSourceFormat {
+            view: self.name.clone(),
+            path: path.clone(),
+            format: declared.clone(),
+            known: FileFormat::names().collect::<Vec<_>>().join(", "),
+        })
     }
 
     /// The single entity this view is keyed on.
@@ -346,6 +470,9 @@ impl Definitions {
                     });
                 }
             }
+            // An unreadable format is refused at load rather than reaching a table
+            // function that does not exist, and `source_format` is what names the view.
+            view.source_format()?;
             if view.ttl_days == Some(0) {
                 return Err(Error::MalformedView {
                     view: view.name.clone(),
@@ -480,6 +607,161 @@ mod tests {
     /// A configured connection, built through the shape the settings loader produces.
     fn connection(json: &str) -> Connection {
         serde_json::from_str(json).expect("connection")
+    }
+
+    /// One project whose view's source is `source`, and nothing else set.
+    fn project_with_source(source: Source) -> Definitions {
+        project(|view| view.source = source)
+    }
+
+    #[test]
+    fn a_file_source_with_no_format_is_parquet() {
+        let view = project_with_source(Source::file("data/user_stats.parquet"))
+            .views
+            .remove(0);
+
+        assert_eq!(view.source_format().expect("format"), FileFormat::Parquet);
+        // The default is the Primary format rather than a preference, which is the only
+        // reason adding a format later cannot quietly change what an old project reads.
+        assert_eq!(FileFormat::default(), FileFormat::Parquet);
+    }
+
+    #[test]
+    fn a_file_source_naming_a_format_resolves_to_it() {
+        let view = project_with_source(Source::File {
+            path: "data/clicks.vortex".to_owned(),
+            format: Some("vortex".to_owned()),
+        })
+        .views
+        .remove(0);
+
+        assert_eq!(view.source_format().expect("format"), FileFormat::Vortex);
+    }
+
+    #[test]
+    fn a_source_read_as_several_formats_resolves_independently() {
+        // One project, two file sources, two formats, so the choice is per source rather
+        // than a setting somewhere that applies to all of them at once.
+        let mut definitions = project_with_source(Source::file("data/user_stats.parquet"));
+        let mut other = definitions.views[0].clone();
+        other.name = "user_clicks_vortex".to_owned();
+        other.source = Source::File {
+            path: "s3://lake/clicks.vortex".to_owned(),
+            format: Some("vortex".to_owned()),
+        };
+        definitions.views.push(other);
+        definitions.validate().expect("valid");
+
+        assert_eq!(
+            definitions
+                .view("user_clicks")
+                .expect("view")
+                .source_format()
+                .expect("parquet"),
+            FileFormat::Parquet
+        );
+        assert_eq!(
+            definitions
+                .view("user_clicks_vortex")
+                .expect("view")
+                .source_format()
+                .expect("vortex"),
+            FileFormat::Vortex
+        );
+    }
+
+    #[test]
+    fn an_unknown_format_is_rejected_at_load_naming_the_source() {
+        let definitions = project_with_source(Source::File {
+            path: "data/clicks.vortex".to_owned(),
+            format: Some("vortx".to_owned()),
+        });
+
+        let error = definitions.validate().expect_err("must fail");
+
+        // Naming the view, the path, and the value is the whole point: a bare "unknown
+        // variant" from serde would say none of them, and a file that is really Parquet
+        // read through the wrong reader fails much later and nowhere near the mistake.
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` reads source `data/clicks.vortex` in format `vortx`, which \
+             Feather does not read; the formats are parquet, vortex"
+        );
+    }
+
+    #[test]
+    fn an_unknown_format_naming_an_unlisted_one_says_what_exists() {
+        // A user reaching for a table format is the likely mistake, so the message has to
+        // say which formats do exist rather than only that this one does not.
+        let definitions = project_with_source(Source::File {
+            path: "data/events".to_owned(),
+            format: Some("iceberg".to_owned()),
+        });
+
+        let error = definitions.validate().expect_err("must fail");
+
+        assert!(error.to_string().contains("parquet, vortex"), "{error}");
+    }
+
+    #[test]
+    fn a_format_is_a_tier_duckdb_publishes() {
+        // The tier is what makes a format safe to default to, and it is a fact about the
+        // extension rather than something a project declares, so it is checked here
+        // against the table the decision document carries.
+        assert_eq!(FileFormat::Parquet.tier(), SupportTier::Primary);
+        assert_eq!(FileFormat::Vortex.tier(), SupportTier::ThirdParty);
+        assert_eq!(FileFormat::Parquet.tier().as_str(), "Primary");
+        assert_eq!(FileFormat::Vortex.tier().as_str(), "third-party maintained");
+        assert_eq!(
+            FileFormat::names().collect::<Vec<_>>(),
+            ["parquet", "vortex"]
+        );
+        assert_eq!(FileFormat::parse("parquet"), Some(FileFormat::Parquet));
+        assert_eq!(FileFormat::parse("PARQUET"), None);
+    }
+
+    #[test]
+    fn an_absent_format_key_means_the_default() {
+        // What a binding that leaves an unset optional out produces, which is the other
+        // spelling of the same thing the Python layer writes as a null.
+        let definitions = Definitions::from_json(
+            r#"{"project":"ads","views":[{"name":"user_clicks",
+                "entities":[{"name":"user_id","join_key":"user_id"}],
+                "source":{"type":"file","path":"data/user_stats.parquet"},
+                "features":[{"name":"click_count","dtype":"int64"}]}]}"#,
+        )
+        .expect("valid");
+
+        assert_eq!(
+            definitions
+                .view("user_clicks")
+                .expect("view")
+                .source_format()
+                .expect("parquet"),
+            FileFormat::Parquet
+        );
+    }
+
+    #[test]
+    fn an_empty_format_is_refused_when_the_json_is_read() {
+        // The core is the authority on the rule that no source field is empty, and
+        // Python enforces it with `NonEmptyStr`. A binding that does not would
+        // otherwise get the reader's error instead of the sibling one, and the sibling
+        // one is what names the field the author wrote. `from_json` validates, so the
+        // binding is refused here rather than handed a `Definitions` it has to
+        // remember to check; reaching this through `from_json` is what pins that.
+        let error = Definitions::from_json(
+            r#"{"project":"ads","views":[{"name":"user_clicks",
+                "entities":[{"name":"user_id","join_key":"user_id"}],
+                "source":{"type":"file","path":"data/user_stats.parquet","format":""},
+                "features":[{"name":"click_count","dtype":"int64"}]}]}"#,
+        )
+        .expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "view `user_clicks` declares an empty `format` in its source"
+        );
     }
 
     #[test]

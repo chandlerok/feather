@@ -84,6 +84,20 @@ class UserStats(FeatureView):
 """
 
 
+UNKNOWN_FORMAT = """
+from feather import Entity, FeatureView, Field, FileSource, feature_view
+from feather.types import Int64
+
+user_entity = Entity(name="user_id", join_key="user_id")
+stats_source = FileSource(path="{stats}", format="iceberg")
+
+
+@feature_view(name="stats", entity=user_entity, source=stats_source)
+class Stats(FeatureView):
+    lifetime_value = Field(Int64)
+"""
+
+
 def micros(values: list[int]) -> pl.Series:
     """Build a microsecond timestamp column from epoch counts.
 
@@ -503,3 +517,31 @@ def test_a_source_naming_an_unconfigured_connection_fails_at_construction(
 
     with pytest.raises(ValueError, match="names connection `absent`"):
         FeatureStore(config)
+
+
+def test_a_source_naming_an_unknown_format_fails_at_construction(tmp_path: Path) -> None:
+    """An unreadable format is a mistake in the definition, so it fails at load.
+
+    The alternative is falling back to the default, which reads an Iceberg-named file as
+    Parquet and fails much later as a decode error with nothing near the name that
+    caused it. The message has to name the source, because a project can have several.
+    """
+    (tmp_path / "definitions").mkdir()
+    stats = tmp_path / "stats.parquet"
+    pl.DataFrame(
+        {
+            "user_id": [1, 2],
+            "event_timestamp": micros([BASE, BASE]),
+            "lifetime_value": [1000, 2000],
+        }
+    ).write_parquet(stats)
+    (tmp_path / "definitions/stats.py").write_text(
+        UNKNOWN_FORMAT.format(stats=stats), encoding="utf-8"
+    )
+    config = tmp_path / "feather.toml"
+    config.write_text('project = "ads"\ndefinitions = ["definitions/stats.py"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="in format `iceberg`") as raised:
+        FeatureStore(config)
+    assert str(stats) in str(raised.value)
+    assert "parquet, vortex" in str(raised.value)
