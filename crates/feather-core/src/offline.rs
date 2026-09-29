@@ -2608,7 +2608,9 @@ mod tests {
         assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
         assert!(error.to_string().contains("view `user_clicks`"), "{error}");
         assert!(
-            std::error::Error::source(&error).is_some(),
+            std::error::Error::source(&error)
+                .and_then(|inner| inner.downcast_ref::<duckdb::Error>())
+                .is_some(),
             "the scanner's own error is the source of this one, not only its text: {error}"
         );
         assert!(

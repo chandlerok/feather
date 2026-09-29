@@ -217,8 +217,10 @@ pub enum Error {
     /// what makes one failing Postgres view distinguishable from another.
     ///
     /// `reason` is the scanner's error rather than its rendered text, so the chain survives
-    /// the wrapping and `Error::source` reaches DuckDB's own error. Boxing is the same size
-    /// decision [`Error::ExtensionUnavailable`] makes, for the same reason.
+    /// the wrapping and `Error::source` reaches DuckDB's own error. It is boxed because a
+    /// `#[source]` has to be an `Error` and the scanner's rendered text is a `String`, which
+    /// is not one; the box also leaves the variant with the two `String`s it already had, so
+    /// the ceiling asserted above is this variant's to cross and not this variant's to reach.
     #[cfg(feature = "offline")]
     #[error("view `{view}` could not read {location}: {reason}")]
     UnreadableSource {
