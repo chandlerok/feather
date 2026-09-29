@@ -2616,12 +2616,12 @@ mod tests {
             boxed.is_some(),
             "the scanner's own error is the source of this one, not only its text: {error}"
         );
-        // The binding is what pins the node's inner type, and it does so at compile time: the
-        // annotation only holds if the box derefs to `duckdb::Error`. There is deliberately no
-        // second assertion comparing the message against the node's own text, because the
-        // message is rendered from the same field the node points at, so that comparison holds
-        // for any value in the box and would not notice a wrong one.
-        let _scanner: &duckdb::Error = &**boxed.expect("asserted above");
+        // The downcast's type argument is the claim, and `is_some` is what tests it: the node
+        // behind the chain is a `Box<duckdb::Error>`, not some other error, and not a bare
+        // `duckdb::Error` either. There is deliberately no further assertion comparing the
+        // message against the node's own text, because the message is rendered from the same
+        // field the node points at, so that comparison holds for any value in the box and
+        // would not notice a wrong one.
         assert!(
             error
                 .to_string()
