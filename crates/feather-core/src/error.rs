@@ -247,7 +247,7 @@ pub enum Error {
     /// whose widest variant carries an Arrow `Type`, so it runs to tens of bytes; added
     /// to the three fields above it this variant crossed the 128 bytes at which
     /// `clippy::result_large_err` starts reporting every function that returns a
-    /// `Result<_, Error>`. The other source fields are `std::io::Error` at eight
+    /// `Result<_, Error>`. The other two `#[source]` fields are `std::io::Error` at eight
     /// bytes and never came close. One heap cell on the error path is the cheap half
     /// of that trade; the other half is that the enum is now sized by the pre-existing
     /// four-`String` variants, which the assertion above holds in place.
