@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -357,5 +358,8 @@ def test_a_push_encodes_every_dtype_the_core_declares(tmp_path: Path) -> None:
     )
     assert frame["visits"].to_list() == [4]
     # The read is declared to return the feature as a microsecond timestamp, so the pushed
-    # value is read back as one rather than as the integer it was given as.
-    assert frame["last_seen"].to_list() == [seen]
+    # value comes back as a datetime rather than as the integer it was given as. The declared
+    # type carries no timezone, so the datetime is naive, and it is built from a timedelta
+    # rather than a float so a large epoch keeps its microseconds.
+    expected = datetime(1970, 1, 1) + timedelta(microseconds=seen)
+    assert frame["last_seen"].to_list() == [expected]

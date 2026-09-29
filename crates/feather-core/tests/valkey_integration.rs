@@ -164,10 +164,11 @@ async fn a_guarded_write_lands_when_nothing_is_recorded() -> Result<()> {
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
 
     let applied = store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 42, "gold", 1000, None,
+            &project, clicks, b"u1", 42, "gold", base, None,
         )])
         .await?;
 
@@ -188,15 +189,16 @@ async fn a_guarded_write_is_refused_at_the_same_timestamp() -> Result<()> {
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
 
     let first = store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 42, "gold", 1000, None,
+            &project, clicks, b"u1", 42, "gold", base, None,
         )])
         .await?;
     let second = store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 99, "silver", 1000, None,
+            &project, clicks, b"u1", 99, "silver", base, None,
         )])
         .await?;
 
@@ -216,15 +218,22 @@ async fn a_guarded_write_is_refused_behind_a_newer_one() -> Result<()> {
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
 
     store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 42, "gold", 2000, None,
+            &project,
+            clicks,
+            b"u1",
+            42,
+            "gold",
+            base + 1_000,
+            None,
         )])
         .await?;
     let applied = store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 99, "silver", 1000, None,
+            &project, clicks, b"u1", 99, "silver", base, None,
         )])
         .await?;
 
@@ -239,15 +248,22 @@ async fn a_guarded_write_lands_ahead_of_an_older_one() -> Result<()> {
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
 
     store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 42, "gold", 1000, None,
+            &project, clicks, b"u1", 42, "gold", base, None,
         )])
         .await?;
     let applied = store
         .write(&[guarded_batch(
-            &project, clicks, b"u1", 99, "silver", 2000, None,
+            &project,
+            clicks,
+            b"u1",
+            99,
+            "silver",
+            base + 1_000,
+            None,
         )])
         .await?;
 
@@ -264,14 +280,23 @@ async fn one_batch_is_refused_without_holding_up_the_others() -> Result<()> {
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
 
     store
-        .write(&[guarded_batch(&project, clicks, b"u1", 1, "a", 5000, None)])
+        .write(&[guarded_batch(
+            &project,
+            clicks,
+            b"u1",
+            1,
+            "a",
+            base + 5_000,
+            None,
+        )])
         .await?;
     let applied = store
         .write(&[
-            guarded_batch(&project, clicks, b"u1", 99, "stale", 1000, None),
-            guarded_batch(&project, clicks, b"u2", 99, "fresh", 6000, None),
+            guarded_batch(&project, clicks, b"u1", 99, "stale", base, None),
+            guarded_batch(&project, clicks, b"u2", 99, "fresh", base + 6_000, None),
         ])
         .await?;
 
@@ -314,9 +339,10 @@ async fn a_guarded_write_sets_and_clears_the_servers_field_expiry() -> Result<()
         ])
         .await?;
 
-    // A guarded rewrite of the same timestamp, this time with no expiry, which is the shape a
-    // view that drops its `ttl_days` produces. The guard lets it through because the timestamp
-    // is not older than what is recorded.
+    // A guarded rewrite this time with no expiry, which is the shape a view that drops its
+    // `ttl_days` produces. It has to claim a newer timestamp to land, because the guard refuses
+    // an equal one; that refusal is the rule the other guard tests pin, and this test has to
+    // respect it rather than contradict it.
     let rewritten = encode_vector(clicks, 2, "y");
     let applied = store
         .write(&[WriteBatch::guarded(
@@ -326,14 +352,10 @@ async fn a_guarded_write_sets_and_clears_the_servers_field_expiry() -> Result<()
                 rewritten.clone(),
                 None,
             )],
-            FreshnessGuard::for_view("clicks", event),
+            FreshnessGuard::for_view("clicks", event + 1),
         )])
         .await?;
-    assert_eq!(
-        applied,
-        vec![true],
-        "an equal timestamp still lands a guarded rewrite"
-    );
+    assert_eq!(applied, vec![true], "a newer guarded rewrite lands");
 
     let live = store
         .read(&[
@@ -395,19 +417,20 @@ async fn a_push_through_the_core_lands_and_is_refused_when_stale() -> Result<()>
     let views = views(&[("clicks", Some(30))]);
     let clicks = views.get("clicks").unwrap();
     let mut store = ValkeyStore::connect(&url()).await?;
+    let base = now_micros();
     use arrow::array::StringArray;
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(vec![7])),
         Arc::new(StringArray::from(vec!["gold"])),
     ];
 
-    let first = push_record(&mut store, &project, clicks, b"u1", &columns, 1000).await?;
+    let first = push_record(&mut store, &project, clicks, b"u1", &columns, base).await?;
     assert!(first);
     assert_eq!(stored_count(&store, &project, &views, b"u1").await, 7);
 
-    assert!(!push_record(&mut store, &project, clicks, b"u1", &columns, 1000).await?);
+    assert!(!push_record(&mut store, &project, clicks, b"u1", &columns, base).await?);
     assert!(
-        push_record(&mut store, &project, clicks, b"u1", &columns, 1001).await?,
+        push_record(&mut store, &project, clicks, b"u1", &columns, base + 1).await?,
         "a newer push lands"
     );
     Ok(())
