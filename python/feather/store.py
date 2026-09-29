@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from feather.definitions import (
+    FeatureService,
     FeatureStoreConfig,
     FeatureView,
     Field,
@@ -61,10 +62,12 @@ class FeatureStore:
             ImportError: If a definition module fails to import.
         """
         settings = load_settings(path)
+        views, services = _import_definitions(settings.definitions, Path(path).parent)
         definitions = config_to_wire(
             FeatureStoreConfig(
                 project=settings.project,
-                views=_import_views(settings.definitions, Path(path).parent),
+                views=views,
+                services=services,
             )
         )
         # Imported here rather than at module scope, so that importing `feather`
@@ -305,12 +308,20 @@ def _why_not_arrow(entity_df: object) -> str:
     )
 
 
-def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]:
-    """Import the modules a project declares, and collect the views they define.
+def _import_definitions(
+    modules: Sequence[str], root: Path
+) -> tuple[list[type[FeatureView]], list[FeatureService]]:
+    """Import the modules a project declares, and collect what they define.
 
     Loaded by path rather than by module name. A definition module depends only on
     ``feather`` by design, so it needs no package context, and loading it this way
     puts nothing on ``sys.path``.
+
+    Both views and services, from one walk and one import of each module. A service
+    declared in a definitions module and left out of here is invisible to
+    :meth:`FeatureStore.serve`, which resolves the service's field set from the wire
+    model, so collecting views alone is what would make ``serve()`` raise for every
+    project that declares a service.
 
     Args:
         modules: The paths ``feather.toml`` lists.
@@ -318,13 +329,15 @@ def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]
             resolved against.
 
     Returns:
-        The declared views, in declaration order, module by module.
+        The declared views and the declared services, in declaration order, module by
+        module.
 
     Raises:
         FileNotFoundError: If a listed module does not exist.
         ImportError: If a module fails to import.
     """
     views: list[type[FeatureView]] = []
+    services: list[FeatureService] = []
     for module in modules:
         path = Path(module)
         if not path.is_absolute():
@@ -334,17 +347,21 @@ def _import_views(modules: Sequence[str], root: Path) -> list[type[FeatureView]]
             raise ImportError(f"cannot load a definition module from {path}")
         loaded = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(loaded)
-        # Filtered by `__module__` rather than taking every value, so a view
-        # imported into a second module is collected once, where it was declared.
-        views.extend(
-            value
-            for value in vars(loaded).values()
-            if isinstance(value, type)
-            and issubclass(value, FeatureView)
-            and value is not FeatureView
-            and value.__module__ == spec.name
-        )
-    return views
+        # Classes are filtered by `__module__` rather than taking every value, so a view
+        # imported into a second module is collected once, where it was declared. A
+        # service is an instance rather than a class, so the same test reads its type's
+        # module.
+        for value in vars(loaded).values():
+            if isinstance(value, FeatureService):
+                services.append(value)
+            elif (
+                isinstance(value, type)
+                and issubclass(value, FeatureView)
+                and value is not FeatureView
+                and value.__module__ == spec.name
+            ):
+                views.append(value)
+    return views, services
 
 
 __all__ = ["FeatureStore", "MissingPolicy"]

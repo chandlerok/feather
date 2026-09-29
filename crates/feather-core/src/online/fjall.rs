@@ -23,10 +23,13 @@
 //! the right trade: the only caller is retiring a view, which is rare, whereas the serving path
 //! is a point read and must be exact. See `ponytail:` on that method.
 //!
-//! **Durability.** [`OnlineStore::write`] is called once per materialization with every batch
-//! (`materialize.rs`), so one `SyncData` per call is one fsync per refresh, which is what a
-//! refresh wants. It is configurable because a push path that calls `write` per update would
-//! otherwise pay an fsync per update; see [`FjallStore::with_persist_mode`].
+//! **Durability.** [`OnlineStore::write`] is called once per streamed batch, not once per
+//! refresh: `materialize` calls it from `accept()` for each `RecordBatch` the engine produces,
+//! so a large refresh is many calls. [`FjallStore::write`] therefore does **not** fsync per call
+//! by default. `SyncData` would cost one fsync per streamed batch, which on a 10M-row refresh is
+//! ten thousand of them, so the default here is [`fjall::PersistMode::Buffer`]: a refresh is
+//! idempotent and re-runnable, and the journal is synced when the database closes. The cost is
+//! that a hard kill can lose the tail of the refresh, and the next refresh redoes it.
 //!
 //! **Blocking.** The trait is async because the Valkey store is. This one is not, and it is
 //! deliberately not wrapped in `spawn_blocking`: a read is a point get measured in single-digit
@@ -44,9 +47,9 @@ use crate::online::project_key_prefix;
 
 /// Records per journal entry on the write path.
 ///
-/// Large enough that the fsync amortises, small enough that one commit does not pin a
-/// multi-megabyte buffer. A materialization arrives as many single-entity batches, so this is
-/// what turns one call into a handful of commits rather than one per row.
+/// One `write` call carries one streamed batch, which is typically far fewer rows than this, so
+/// the chunk here is a ceiling rather than a typical size. It exists so that a caller handing
+/// over a very large slice does not build one enormous journal entry.
 const WRITE_CHUNK: usize = 4096;
 
 /// An LSM store over a directory this process owns.
@@ -84,16 +87,18 @@ impl FjallStore {
         Ok(Self {
             _db: db,
             keyspace,
-            persist_mode: fjall::PersistMode::SyncData,
+            // `Buffer` rather than `SyncData`: see the durability note on the module. A refresh
+            // is idempotent and re-runnable, so a lost tail is a slower refresh rather than a
+            // wrong one, and a per-batch fsync is not affordable at materialization speed.
+            persist_mode: fjall::PersistMode::Buffer,
         })
     }
 
     /// Change what a write costs in durability.
     ///
-    /// `SyncData` is the default and is right for a materialization, which is idempotent and
-    /// re-runnable. A push path calling [`OnlineStore::write`] once per update would want
-    /// [`fjall::PersistMode::Buffer`] and its own durability policy, at the cost of losing
-    /// updates written since the last flush on a hard kill.
+    /// [`fjall::PersistMode::Buffer`] is the default and is right for a materialization, which
+    /// is idempotent and re-runnable. A push path calling [`OnlineStore::write`] once per
+    /// update may want [`fjall::PersistMode::SyncData`], at the cost of an fsync per update.
     #[must_use]
     pub fn with_persist_mode(mut self, mode: fjall::PersistMode) -> Self {
         self.persist_mode = mode;
@@ -174,9 +179,15 @@ impl OnlineStore for FjallStore {
                 let Some(name) = record.get(prefix.len()..) else {
                     continue;
                 };
-                if let Some(at) = request.fields.iter().position(|f| f.as_bytes() == name) {
-                    let value: &[u8] = &value;
-                    row[at] = Some(value.to_vec());
+                // Every position this field was asked for, not just the first. `MemoryStore`
+                // maps each requested field independently, so a request naming the same field
+                // twice gets the value at both positions rather than the value at the first
+                // and `None` at the second. The requested list is short, so a linear scan with
+                // no allocation is the cheaper shape than a map.
+                for (at, field) in request.fields.iter().enumerate() {
+                    if field.as_bytes() == name {
+                        row[at] = Some(value.as_ref().to_vec());
+                    }
                 }
             }
             out.push(row);
@@ -227,17 +238,18 @@ impl ProjectScan for FjallStore {
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for entry in self.keyspace.iter() {
             let (record, _) = entry.into_inner()?;
+            // A record whose length prefix does not match the bytes present is not one of
+            // ours, or is corrupt. Skipping it silently would drop the entity from the walk,
+            // and since that record is the only thing naming it, a later scan would not
+            // revisit it either, so its retired fields would never be deleted.
             let Some(key) = Self::parse_key(&record) else {
                 continue;
             };
-            if key.starts_with(&prefix) && key != exclude && seen.insert(key.to_vec()) {
-                // Returned inside the loop so `seen` grows with the walk rather than after it.
+            if key.starts_with(&prefix) && key != exclude {
+                seen.insert(key.to_vec());
             }
         }
-        Ok(seen
-            .into_iter()
-            .filter(|key| key.as_slice() != exclude)
-            .collect())
+        Ok(seen.into_iter().collect())
     }
 }
 
@@ -259,6 +271,12 @@ mod tests {
 
     fn key(project: &str, entity: &str, id: &str) -> Vec<u8> {
         let encoded = encode_entity_key(&[id.as_bytes()]).expect("encode");
+        entity_hash_key(project, entity, &encoded)
+    }
+
+    /// A key from several components, for the shared-prefix fixture.
+    fn key2(project: &str, entity: &str, components: &[&[u8]]) -> Vec<u8> {
+        let encoded = encode_entity_key(components).expect("encode");
         entity_hash_key(project, entity, &encoded)
     }
 
@@ -327,16 +345,43 @@ mod tests {
         );
     }
 
-    /// The reason the key is length-prefixed rather than joined.
+    /// The reason the key is length-prefixed rather than joined, and the shape that
+    /// actually exercises it.
     ///
-    /// `u1` and `u10` are different entities whose encoded keys share a byte prefix, and
-    /// `encode_entity_key` length-prefixes each component, so this is the shape a real project
-    /// has. Reading one must not see the other's fields.
+    /// `encode_entity_key` already length-prefixes each component, so two ids that merely
+    /// look like a prefix of one another encode to different first bytes and share nothing.
+    /// A test built on `u1` against `u10` would pass under a plain join and so would pin
+    /// nothing. The pair that does share a byte prefix is two *component lists* where the
+    /// first component is identical and the second differs in length: `["ab", "c"]` and
+    /// `["ab", "cd"]` encode to `2:ab|1:c` and `2:ab|2:cd`, which agree up to the
+    /// component boundary and differ only after it.
+    ///
+    /// Honest limit: under a join, `2:ab|1:c` and `2:ab|2:cd` are still distinguishable
+    /// because the encoded key is injective and every legal field name is `v:`- or
+    /// `f:`-prefixed, so no colliding pair is constructible either way. The prefix is
+    /// defence in depth, not a demonstrated necessity, and this test pins that reading one
+    /// cannot read the other's fields rather than proving the join would be wrong.
     #[tokio::test]
     async fn an_entity_is_not_confused_with_one_whose_key_extends_it() {
         let (_dir, mut store) = store();
-        let short = key("ads", "user", "u1");
-        let long = key("ads", "user", "u10");
+        let short = key2("ads", "user", &[b"ab", b"c"]);
+        let long = key2("ads", "user", &[b"ab", b"cd"]);
+        assert_ne!(short, long, "the fixture is meant to be two distinct keys");
+        // The property the fixture exists for: the two keys agree on a run of bytes that
+        // extends past the `project:entity:` header, so the agreement is inside the encoded key
+        // and not merely the project prefix every key of a project shares. They then differ at
+        // the very next byte, which is where a separator would have to be unambiguous.
+        let common = short.iter().zip(&long).take_while(|(a, b)| a == b).count();
+        let header = "ads:user:".len();
+        assert!(
+            common > header,
+            "the shared prefix ({common} bytes) must reach past the {header}-byte header, \
+             or the fixture is only testing that two projects differ"
+        );
+        assert_ne!(
+            short[common], long[common],
+            "they differ at the byte after the prefix"
+        );
         store
             .write(&[write_one(&short, &[("v:view0", b"short")])])
             .await

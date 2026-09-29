@@ -79,11 +79,34 @@ reader without a fan-out.
 
 ## Reproducing
 
+Three of the four pieces ship, and the fourth does not. The runnable part:
+
 ```bash
 cargo build --release -p feather-serve --examples
+# fill_store <entities> <views> <dir>
 ./target/release/examples/fill_store 200000 4 /tmp/feather-serve-bench
-WORKERS=4 CONC=8 SECS=12 EPR=8 /tmp/run_measure.sh
+# serve_rust <dir> <addr> <tokio workers>
+./target/release/examples/serve_rust /tmp/feather-serve-bench 127.0.0.1:8815 4 &
+# bench_client <addr> <clients> <seconds> <entities per request>
+./target/release/examples/bench_client 127.0.0.1:8815 8 12 8
 ```
 
-The Python host is a throwaway pyo3 probe at `/tmp/gilprobe`, built against this crate by path.
-It is not part of the workspace; the real binding belongs in `feather-py`.
+Every argument is positional. There is no runner script and there are no environment variables;
+an earlier draft of this section showed both, and neither exists.
+
+**The Python host does not ship.** The rows above labelled "Python (pyo3, GIL released)" and
+the `python thread progressed` log came from a throwaway pyo3 module built against this crate by
+path, living outside the repository. It is not in the diff, so **the Python-host column cannot be
+reproduced from what is here.** The part that is reproducible is that `serve_rust` is the same
+`feather_serve::serve` call a Python `FeatureStore.serve()` makes, differing only in the host
+process, which is why comparing the two isolates the cost of hosting in Python.
+
+Reproducing it needs a pyo3 module that calls `feather_serve::serve`, which is what
+`crates/feather-py` now does through `_core.serve`. A measurement harness built the same way
+would belong here rather than in `/tmp`; until one lands, treat the Python column as the number
+it is: a reading from a prototype that this change does not ship.
+
+The point-read figures in the comparison above come from a separate standalone bench that is also
+not in this diff. The 5.5us warm and ~150us cold readings for the store are reproducible with
+`fill_store` plus `bench_client`; the Valkey figures are Feast's published numbers for a Redis
+Cluster, not a measurement taken here.

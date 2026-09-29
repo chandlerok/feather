@@ -24,7 +24,6 @@ feather-core = { path = "../feather-core", default-features = false, features = 
 futures-util.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = [
   "rt-multi-thread",
   "net",

@@ -372,6 +372,21 @@ impl Settings {
         }
         if let Some(store) = &self.store {
             check_present(&store.path, "store.path")?;
+            // A zero block cache or write buffer is not a small store, it is a broken one: the
+            // first reaches the builder as a cache that holds nothing and the second as a
+            // flush size it cannot flush at.
+            for (key, value) in [
+                ("store.cache_bytes", store.cache_bytes),
+                ("store.memtable_bytes", store.memtable_bytes),
+            ] {
+                if let Some(value) = value {
+                    if value == 0 {
+                        return Err(Error::MalformedSettings {
+                            reason: format!("{key} must be greater than zero"),
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -585,6 +600,7 @@ fn is_environment_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Store;
 
     const LOCAL: &str = r#"
 project = "ad_recommendations"
@@ -636,6 +652,47 @@ field_expiration = true
             "SET" => Ok("value".to_owned()),
             _ => Err(std::env::VarError::NotPresent),
         })
+    }
+
+    #[test]
+    fn a_store_table_parses_and_fills_in_its_own_defaults() {
+        let text = format!("{LOCAL}\n[store]\npath = \".feather/online\"\n");
+        let settings = parse_settings(&text).expect("valid");
+
+        let store = settings.store.as_ref().expect("the store is configured");
+        assert_eq!(store.path, ".feather/online");
+        assert_eq!(store.cache(), Store::DEFAULT_CACHE_BYTES);
+        assert_eq!(store.memtable(), Store::DEFAULT_MEMTABLE_BYTES);
+    }
+
+    #[test]
+    fn an_explicit_store_size_is_kept() {
+        let text = format!("{LOCAL}\n[store]\npath = \"d\"\ncache_bytes = 1\nmemtable_bytes = 2\n");
+        let settings = parse_settings(&text).expect("valid");
+        let store = settings.store.as_ref().expect("configured");
+        assert_eq!(store.cache(), 1);
+        assert_eq!(store.memtable(), 2);
+    }
+
+    /// A zero block cache or write buffer is not a small store, it is a broken one, and it
+    /// reaches the builder as such if the schema does not stop it here.
+    #[test]
+    fn a_zero_store_size_is_rejected() {
+        for key in ["cache_bytes", "memtable_bytes"] {
+            let text = format!("{LOCAL}\n[store]\npath = \"d\"\n{key} = 0\n");
+            let error = parse_settings(&text).expect_err("zero is not a size");
+            assert!(
+                error.to_string().contains(&format!("store.{key}")),
+                "{error} should name the key"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_store_path_is_rejected() {
+        let text = format!("{LOCAL}\n[store]\npath = \"  \"\n");
+        let error = parse_settings(&text).expect_err("empty is not a path");
+        assert!(error.to_string().contains("store.path"), "{error}");
     }
 
     #[test]

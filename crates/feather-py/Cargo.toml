@@ -49,11 +49,20 @@ tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net
 # could not use one would fail at the first online call with "this build has no Valkey support".
 # Local mode still needs nothing, and the extra dependency is redis plus the tokio the store
 # already runs on.
-default = ["offline", "valkey"]
+# `serve` and `fjall` are default because both are load-bearing for a project that
+# actually serves: without `serve` no wheel has `_core.serve` and `FeatureStore.serve()`
+# is a RuntimeError, and without `fjall` nothing can write the database `serve()` opens,
+# so `feather refresh` would populate a map that dies with the process and every read
+# would come back null. Neither implies `offline`, and neither drags in DuckDB: a
+# `serve`-only build links `feather-serve` and nothing else.
+default = ["offline", "valkey", "fjall", "serve"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
 # tests the engines, and so a build can drop DuckDB with --no-default-features.
 offline = ["feather-core/offline", "dep:tokio"]
 valkey = ["feather-core/valkey"]
+# The embedded store, which the materialization path needs so a refresh writes the
+# database `serve()` opens.
+fjall = ["feather-core/fjall"]
 # Serving over Arrow Flight. Does not imply `offline`: a project that only reads
 # online features never runs a point-in-time join, so it should not pay for the engine.
 serve = ["dep:feather-serve", "dep:tokio"]

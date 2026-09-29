@@ -58,6 +58,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or(VIEWS);
+    // The fill writes the views the fixture declares. A caller asking for a different count is
+    // refused rather than silently ignored, because a printed figure that does not match the
+    // store it describes is exactly what makes a measurement unreproducible.
+    if views_count != VIEWS {
+        return Err(format!(
+            "the bench fixture declares {VIEWS} views; `fill_store`'s second argument is \
+             {views_count}, which would print a figure the store does not match"
+        )
+        .into());
+    }
     let dir = PathBuf::from(
         std::env::args()
             .nth(3)

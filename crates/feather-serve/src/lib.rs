@@ -419,3 +419,187 @@ where
         .serve_with_shutdown(addr, shutdown)
         .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
+
+    /// A view with one float64 feature per name, keyed on one entity.
+    fn view(name: &str, features: &[&str]) -> FeatureView {
+        FeatureView {
+            name: name.to_owned(),
+            entities: vec![Entity::new("user_id", "user_id")],
+            source: Source::file("data/x.parquet"),
+            features: features
+                .iter()
+                .map(|f| Field::new((*f).to_owned(), DType::Float64))
+                .collect(),
+            ttl_days: None,
+            timestamp_field: None,
+            created_timestamp_field: None,
+        }
+    }
+
+    fn views(specs: &[(&str, &[&str])]) -> BTreeMap<String, FeatureView> {
+        specs
+            .iter()
+            .map(|(name, features)| ((*name).to_owned(), view(name, features)))
+            .collect()
+    }
+
+    fn spec(features: &[(&str, &str)]) -> ServiceSpec {
+        ServiceSpec {
+            name: "serving".into(),
+            entity_name: "user_id".into(),
+            features: features
+                .iter()
+                .map(|(v, f)| ((*v).to_owned(), (*f).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// Column names in declared order. Bind the schema first: `schema()` hands back an `Arc`,
+    /// so collecting `&str` out of the temporary it returns would borrow a dropped value.
+    fn column_names(resolved: &ResolvedService) -> Vec<String> {
+        let schema = resolved.schema();
+        schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    /// The crate's own doc says a bad reference is caught here, at boot, rather than on the
+    /// first request. That is a claim about behaviour, so it needs a test.
+    #[test]
+    fn resolving_rejects_a_view_the_project_does_not_declare() {
+        let views = views(&[("view0", &["f0"])]);
+        let error =
+            ResolvedService::resolve("ads", &spec(&[("view0", "f0"), ("nope", "f0")]), &views)
+                .err()
+                .expect("an unknown view is a boot failure, not a per-request one");
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn resolving_rejects_a_feature_the_view_does_not_declare() {
+        let views = views(&[("view0", &["f0"])]);
+        let error = ResolvedService::resolve("ads", &spec(&[("view0", "absent")]), &views)
+            .err()
+            .expect("an unknown feature is a boot failure");
+        assert!(error.contains("absent"), "{error}");
+    }
+
+    #[test]
+    fn resolving_rejects_a_service_naming_nothing() {
+        let views = views(&[("view0", &["f0"])]);
+        assert!(
+            ResolvedService::resolve("ads", &spec(&[]), &views).is_err(),
+            "a service with no features has nothing to serve"
+        );
+    }
+
+    /// The store read is grouped by view, so the output order is the interesting property: it
+    /// has to come back in the order the service declared, not the order the grouping produces.
+    #[test]
+    fn columns_come_back_in_the_declared_order_across_a_view_grouped_read() {
+        let views = views(&[("view0", &["a", "b"]), ("view1", &["c"])]);
+        // Interleaved on purpose: view1 sits between two view0 features.
+        let resolved = ResolvedService::resolve(
+            "ads",
+            &spec(&[("view0", "a"), ("view1", "c"), ("view0", "b")]),
+            &views,
+        )
+        .expect("resolves");
+
+        assert_eq!(
+            column_names(&resolved),
+            vec!["view0:a", "view1:c", "view0:b"],
+            "declared order, not grouped-by-view order"
+        );
+    }
+
+    /// Two views may declare a feature of the same name, so the response column is qualified.
+    #[test]
+    fn a_feature_name_shared_by_two_views_is_qualified() {
+        let views = views(&[("view0", &["score"]), ("view1", &["score"])]);
+        let resolved = ResolvedService::resolve(
+            "ads",
+            &spec(&[("view0", "score"), ("view1", "score")]),
+            &views,
+        )
+        .expect("resolves");
+        assert_eq!(column_names(&resolved), vec!["view0:score", "view1:score"]);
+    }
+
+    #[test]
+    fn a_column_carries_the_views_declared_type() {
+        let views = views(&[("view0", &["f0"])]);
+        let resolved =
+            ResolvedService::resolve("ads", &spec(&[("view0", "f0")]), &views).expect("resolves");
+        assert_eq!(
+            resolved.schema().field(0).data_type(),
+            &arrow_type(DType::Float64),
+            "a float64 feature is a float64 column, or a client cannot read the response"
+        );
+    }
+
+    /// A `DoGet` for a service this server did not resolve is rejected rather than served with
+    /// the wrong field set, which would answer every column as a null and read as "no data".
+    #[tokio::test]
+    async fn a_ticket_naming_another_service_is_rejected() {
+        let views = views(&[("view0", &["f0"])]);
+        let resolved =
+            ResolvedService::resolve("ads", &spec(&[("view0", "f0")]), &views).expect("resolves");
+        let store = SharedStore::new(
+            feather_core::online::fjall::FjallStore::open(
+                std::env::temp_dir().join("feather-serve-reject-test"),
+                1 << 20,
+                1 << 20,
+            )
+            .expect("open"),
+        );
+        let service = FeatureFlightService::new(store, resolved);
+
+        let ticket = Ticket {
+            ticket: serde_json::to_vec(&ReadRequest {
+                service: "other".into(),
+                entities: vec![vec![1, 2, 3]],
+            })
+            .expect("encode")
+            .into(),
+        };
+        let error = service
+            .do_get(Request::new(ticket))
+            .await
+            .err()
+            .expect("an unknown service is refused");
+        assert!(error.message().contains("other"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_with_no_entities_is_rejected() {
+        let views = views(&[("view0", &["f0"])]);
+        let resolved =
+            ResolvedService::resolve("ads", &spec(&[("view0", "f0")]), &views).expect("resolves");
+        let store = SharedStore::new(
+            feather_core::online::fjall::FjallStore::open(
+                std::env::temp_dir().join("feather-serve-empty-test"),
+                1 << 20,
+                1 << 20,
+            )
+            .expect("open"),
+        );
+        let service = FeatureFlightService::new(store, resolved);
+
+        let ticket = Ticket {
+            ticket: serde_json::to_vec(&ReadRequest {
+                service: "serving".into(),
+                entities: vec![],
+            })
+            .expect("encode")
+            .into(),
+        };
+        assert!(
+            service.do_get(Request::new(ticket)).await.is_err(),
+            "an empty entity list is refused rather than answered with nothing"
+        );
+    }
+}
