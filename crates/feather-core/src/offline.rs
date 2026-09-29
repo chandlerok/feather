@@ -55,13 +55,14 @@ const LABEL_TS: &str = "feather_ts";
 const MATCHED_TS: &str = "feather_matched_ts";
 
 /// The ambiguity check's output aliases, prefixed for the reason [`MATCHED_TS`] and its
-/// neighbours are.
+/// neighbours are: they are names this module invents inside generated SQL, and a prefix keeps
+/// them out of the namespace a caller's columns live in.
 ///
-/// This check is the one place that names its aliases in a `GROUP BY`, and a name a source
-/// column also carries is resolved by an engine-defined precedence rather than by the alias
-/// winning. A source with an unrelated column called `c` would then be grouped by that column
-/// instead of by the declared created timestamp, which either misses a real tie or refuses a
-/// clean source. Single letters bought nothing here, so they are gone.
+/// No caller column can shadow one of these names today, because the check reads them back
+/// out of a CTE that projects only these three, so a source column is never a candidate for
+/// the outer `GROUP BY` and no engine precedence rule is consulted. The prefix is what keeps
+/// that true if the query is ever restructured to read the base relation directly, which is
+/// the shape where the collision would be real.
 const AMBIGUITY_KEY: &str = "feather_ambiguity_key";
 const AMBIGUITY_TS: &str = "feather_ambiguity_ts";
 const AMBIGUITY_CREATED: &str = "feather_ambiguity_created";
@@ -2231,11 +2232,11 @@ mod tests {
 
     #[test]
     fn a_source_column_named_like_the_old_alias_does_not_hide_a_tie() {
-        // The check aliased the created column `c` and grouped by that name, and a source
-        // carrying a column called `c` as well leaves which one the name means up to the
-        // engine. Resolving it to the source column would group by an unrelated value and miss
-        // the tie, which is the hole the refusal exists to close. The alias is prefixed now,
-        // so the rows are refused whatever this source's other columns are called.
+        // The check groups by names it invents, and this source carries a column called `c`,
+        // which is what an earlier version of the check called the created column. Those names
+        // are prefixed now, and the check reads them from a CTE that projects only the three
+        // aliases, so no column of the source can shadow one. The tied pair is refused
+        // whatever this source's other columns are called.
         let source = Parquet::write(&decoy_tie_breakable_source(&[
             (1, 100, 5, 10),
             (1, 100, 5, 20),
