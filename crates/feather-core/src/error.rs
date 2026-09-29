@@ -207,14 +207,6 @@ pub enum Error {
     },
 
     #[cfg(feature = "offline")]
-    #[error("could not read `{path}`: {source}")]
-    Source {
-        path: String,
-        #[source]
-        source: duckdb::Error,
-    },
-
-    #[cfg(feature = "offline")]
     #[error("view `{view}` failed while its source was scanned: {reason}")]
     StreamInterrupted { view: String, reason: String },
 
@@ -223,12 +215,17 @@ pub enum Error {
     /// The scanner's own text is carried in the message rather than replaced, since it is
     /// the only description of what went wrong; naming the view and the source around it is
     /// what makes one failing Postgres view distinguishable from another.
+    ///
+    /// `reason` is the scanner's error rather than its rendered text, so the chain survives
+    /// the wrapping and `Error::source` reaches DuckDB's own error. Boxing is the same size
+    /// decision [`Error::ExtensionUnavailable`] makes, for the same reason.
     #[cfg(feature = "offline")]
     #[error("view `{view}` could not read {location}: {reason}")]
     UnreadableSource {
         view: String,
         location: String,
-        reason: String,
+        #[source]
+        reason: Box<duckdb::Error>,
     },
 
     /// An extension that could not be installed or loaded.

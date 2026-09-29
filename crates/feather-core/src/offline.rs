@@ -650,13 +650,14 @@ impl Engine {
             }
             Ok(types)
         };
-        // The scanner's text is kept, because it is the only description of what went wrong
+        // The scanner's error is kept, because it is the only description of what went wrong
         // and it may echo part of the conninfo. Wrapping rather than replacing it puts that
-        // text behind a message that says which view was reading.
+        // text behind a message that says which view was reading, and carries it as the
+        // error's own source so the chain below this one is not lost.
         describe().map_err(|error| Error::UnreadableSource {
             view: view.name.clone(),
             location: source_location(view),
-            reason: error.to_string(),
+            reason: Box::new(error),
         })
     }
 
@@ -2606,6 +2607,10 @@ mod tests {
 
         assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
         assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the scanner's own error is the source of this one, not only its text: {error}"
+        );
         assert!(
             error
                 .to_string()
