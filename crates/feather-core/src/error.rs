@@ -111,6 +111,12 @@ pub enum Error {
     #[error("malformed feature reference `{reference}`, expected `view:feature`")]
     MalformedFeatureReference { reference: String },
 
+    #[error("features must name at least one feature")]
+    NoFeaturesRequested,
+
+    #[error("the reference `{reference}` is requested twice")]
+    DuplicateFeatureReference { reference: String },
+
     #[error("no feature view named `{0}`")]
     UnknownView(String),
 

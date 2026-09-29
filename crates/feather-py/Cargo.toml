@@ -37,9 +37,11 @@ pyo3-arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The online store's I/O is asynchronous, so the binding owns a runtime and blocks on it from
-# the Python thread. Optional because every use sits behind `offline` or `serve`: without one
-# of those there is no store or server for a runtime to serve, and an unconditional dependency
-# would make a build carry one it cannot use.
+# the Python thread. Optional because every use sits behind `fjall`, `offline`, or `serve`:
+# without one of those there is no online read, no join, and no server for a runtime to serve,
+# so an unconditional dependency would make a build carry one it cannot use. `rt-multi-thread`
+# because the serving transport runs one request per worker thread; `net` and `time` because
+# that runtime needs them.
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "time"] }
 
 [features]
@@ -51,11 +53,13 @@ tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net
 # `serve`-only build links `feather-serve` and nothing else.
 default = ["offline", "fjall", "serve"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
-# tests the engines, and so a build can drop DuckDB with --no-default-features.
+# tests the engines, and so a build can drop DuckDB with --no-default-features. It gates only
+# the historical join and the refresh: the online read path compiles without it, so a build
+# without this feature carries no DuckDB and still reads and serves.
 offline = ["feather-core/offline", "dep:tokio"]
-# The embedded store, which the materialization path needs so a refresh writes the
-# database `serve()` opens.
-fjall = ["feather-core/fjall"]
+# The embedded store, which the online read path needs, so a build that only reads online
+# features carries no DuckDB. It brings the runtime with it, because the read path runs on it.
+fjall = ["feather-core/fjall", "dep:tokio"]
 # Serving over Arrow Flight. Does not imply `offline`: a project that only reads
 # online features never runs a point-in-time join, so it should not pay for the engine.
 serve = ["dep:feather-serve", "dep:tokio"]

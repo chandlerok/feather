@@ -28,7 +28,8 @@ pub mod settings;
 pub mod value;
 
 pub use definitions::{
-    DType, Definitions, Entity, FeatureService, FeatureView, Field, FileFormat, Source, SupportTier,
+    DType, Definitions, Entity, FeatureService, FeatureView, Field, FileFormat, Reference, Source,
+    SupportTier, parse_references,
 };
 pub use error::{Error, Result};
 pub use key::{
@@ -43,7 +44,7 @@ pub use offline::{Engine as OfflineEngine, JoinOptions, Limits, OnMissing};
 pub use online::fjall::FjallStore;
 pub use online::{
     EntityRequest, Missing, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues,
-    WriteBatch, WrittenField, read_entities,
+    WriteBatch, WrittenField, assemble_online_result, read_entities,
 };
 pub use settings::{Connection, Secret, Settings, Store, load_settings, parse_settings};
 pub use value::{EncodedBatch, SchemaTag, arrow_type, decode_batch, encode_batch};
