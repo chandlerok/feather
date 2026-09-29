@@ -25,6 +25,10 @@ dist/
 feather.toml
 definitions/
 data/
+# Where `FeatureStore.serve()` puts the embedded store when `feather.toml` has no
+# `[store]` table. A database rather than a cache: safe to regenerate from a refresh,
+# but not something to commit and not something to lose without knowing what it was.
+.feather/
 
 .env
 .env.*

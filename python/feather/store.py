@@ -71,7 +71,55 @@ class FeatureStore:
         # still works without the compiled extension. Only this call needs it.
         from feather import _core
 
-        self._store = _core.FeatureStore(str(path), definitions.model_dump_json())
+        self._settings_path = str(path)
+        self._definitions_json = definitions.model_dump_json()
+        self._store = _core.FeatureStore(self._settings_path, self._definitions_json)
+
+    def serve(
+        self,
+        service: str,
+        addr: str = "127.0.0.1:8815",
+        workers: int = 4,
+    ) -> None:
+        """Serve a feature service over Arrow Flight, blocking until stopped.
+
+        The calling process becomes the server, which is the point: a client in any
+        language reads the response with its own Arrow library, so there is no generated
+        shim, and the store lives in this process rather than behind a connection
+        string.
+
+        Blocking, and it never returns. The GIL is released while it runs, so this
+        process's other threads keep going, and the server's own workers use every core.
+
+        This is single-writer by construction. The store is a database that one process
+        opens at a time, so this is the only thing in a deployment that opens it, which
+        is also why a push here is visible to every reader without a fan-out.
+
+        Args:
+            service: The name of a feature service in the project's definitions.
+            addr: The socket to bind. Loopback by default, and the only thing
+                protecting an unauthenticated endpoint until authentication lands.
+            workers: Tokio worker threads, which is how many cores the read path
+                uses.
+
+        Raises:
+            RuntimeError: If this build has no serving support, which is a build
+                choice rather than a project one: serving does not pull in the
+                offline engine, so a `serve`-only wheel is a valid build.
+            ValueError: If the service is not declared, or names a view or feature
+                the definitions do not have. Both are caught here rather than on the
+                first request.
+        """
+        from feather import _core
+
+        serve_impl = getattr(_core, "serve", None)
+        if serve_impl is None:
+            msg = (
+                "this build of feather has no serving support; it is behind the "
+                "`serve` cargo feature, which is not implied by the default one"
+            )
+            raise RuntimeError(msg)
+        serve_impl(self._settings_path, self._definitions_json, service, addr, workers)
 
     def get_historical_features(
         self,

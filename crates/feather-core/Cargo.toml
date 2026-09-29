@@ -44,10 +44,18 @@ redis = { workspace = true, optional = true, features = [
 ] }
 tokio = { workspace = true, optional = true }
 
+# The embedded online store, and the only thing the serving path needs. Twelve
+# direct dependencies, no runtime and no C++, so a serving build stays cheap:
+# that is the property that makes `feather serve` worth having in one process.
+fjall = { workspace = true, optional = true }
+
 [dev-dependencies]
 # Only for the input-mechanism comparison, which needs to write an Arrow batch to
 # Parquet to represent the temp-file route.
 parquet.workspace = true
+# A store test needs a directory it owns, and a database holds an exclusive lock while open,
+# so each one gets its own temporary directory and drops it.
+tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
@@ -56,7 +64,10 @@ default = []
 offline = ["dep:duckdb"]
 # Real Valkey client. Unit tests use the in-memory fake instead.
 valkey = ["dep:redis", "dep:tokio"]
-full = ["offline", "valkey"]
+# The embedded LSM online store. Deliberately not implied by `offline`: the two
+# are independent, and a serving-only build wants this one and nothing else.
+fjall = ["dep:fjall"]
+full = ["offline", "valkey", "fjall"]
 
 [[example]]
 name = "loadtest"

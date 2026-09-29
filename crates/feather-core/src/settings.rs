@@ -280,6 +280,45 @@ pub struct Valkey {
     pub field_expiration: bool,
 }
 
+/// The embedded online store, which a serving process owns.
+///
+/// An LSM rather than an in-memory map, so a dataset larger than memory is a disk read rather
+/// than an eviction, and a restart is a remap rather than a full re-materialization. A database
+/// is opened by one process at a time, which is the constraint that makes the serving process
+/// the only thing that opens it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Store {
+    /// The directory the database lives in, created if absent.
+    pub path: String,
+    /// Resident block cache, in bytes. Defaults to [`Store::DEFAULT_CACHE_BYTES`].
+    #[serde(default)]
+    pub cache_bytes: Option<u64>,
+    /// Write buffer, in bytes. Defaults to [`Store::DEFAULT_MEMTABLE_BYTES`], which is also
+    /// fjall's own default and the one that matters: measured across scattered updates, a
+    /// 4MiB memtable wrote 5.3x the logical bytes and a 64MiB one wrote 1.1x.
+    #[serde(default)]
+    pub memtable_bytes: Option<u64>,
+}
+
+impl Store {
+    /// 64MiB, which is the smallest value that keeps a default-shaped dataset out of a
+    /// compaction death spiral and is a rounding error against a machine with room to serve.
+    pub const DEFAULT_CACHE_BYTES: u64 = 64 << 20;
+    /// fjall's own default, and the one its measurements point at.
+    pub const DEFAULT_MEMTABLE_BYTES: u64 = 64 << 20;
+
+    /// The block cache to open with.
+    pub fn cache(&self) -> u64 {
+        self.cache_bytes.unwrap_or(Self::DEFAULT_CACHE_BYTES)
+    }
+
+    /// The write buffer to open with.
+    pub fn memtable(&self) -> u64 {
+        self.memtable_bytes.unwrap_or(Self::DEFAULT_MEMTABLE_BYTES)
+    }
+}
+
 /// A validated `feather.toml`.
 ///
 /// Unknown keys are rejected, so a typo is a load error rather than a silently
@@ -298,6 +337,10 @@ pub struct Settings {
     pub connections: BTreeMap<String, Connection>,
     #[serde(default)]
     pub valkey: Option<Valkey>,
+    /// The embedded online store. Absent means the in-process map, which is the right default
+    /// for a project that is read from the same process that materializes it.
+    #[serde(default)]
+    pub store: Option<Store>,
 }
 
 impl Settings {
@@ -326,6 +369,9 @@ impl Settings {
         }
         if let Some(valkey) = &self.valkey {
             check_present(&valkey.endpoint, "valkey.endpoint")?;
+        }
+        if let Some(store) = &self.store {
+            check_present(&store.path, "store.path")?;
         }
         Ok(())
     }

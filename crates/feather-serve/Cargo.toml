@@ -1,0 +1,46 @@
+[package]
+name = "feather-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "The serving surface for Feather: Arrow Flight over an embedded online store"
+
+# `autoexamples = false` so `bench_views.rs`, a fixture included by the two runnable examples
+# rather than a program, is not built as an example of its own.
+autoexamples = false
+
+[dependencies]
+# `ipc` because the transport encodes Arrow IPC. Arrow-flight needs it too, so this
+# costs nothing extra; it is declared here because the import is otherwise gated out.
+arrow = { workspace = true, features = ["ipc"] }
+arrow-flight.workspace = true
+# The engine, with `offline` deliberately absent. Serving must not be able to reach
+# DuckDB: a deployment that only serves should not carry a C++ build or a 1.8GB
+# archive, and the `get_historical_features` path is a different concern from this one.
+feather-core = { path = "../feather-core", default-features = false, features = ["fjall"] }
+futures-util.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "net",
+  "macros",
+  "sync",
+  "time",
+] }
+# `transport` for the server and the client channel; `server` is what `serve` needs.
+tonic = { workspace = true, features = ["transport", "server"] }
+tracing.workspace = true
+
+[[example]]
+name = "fill_store"
+
+[[example]]
+name = "serve_rust"
+
+[[example]]
+name = "bench_client"

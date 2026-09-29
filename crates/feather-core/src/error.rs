@@ -262,6 +262,10 @@ pub enum Error {
     #[cfg(feature = "valkey")]
     #[error("valkey: {0}")]
     Valkey(#[from] redis::RedisError),
+
+    #[cfg(feature = "fjall")]
+    #[error("fjall: {0}")]
+    Fjall(#[from] fjall::Error),
 }
 
 /// What a failed extension load says about the format the extension reads.

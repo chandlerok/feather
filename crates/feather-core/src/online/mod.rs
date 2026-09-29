@@ -8,6 +8,9 @@
 
 pub mod memory;
 
+#[cfg(feature = "fjall")]
+pub mod fjall;
+
 #[cfg(feature = "valkey")]
 pub mod valkey;
 
