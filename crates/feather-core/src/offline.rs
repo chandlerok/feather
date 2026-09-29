@@ -665,7 +665,8 @@ impl Engine {
     /// The generated SQL names the created column, so an absent one fails in DuckDB's binder
     /// with a message about a column of a table the caller never named. This says which
     /// source and which column, which is what [`Error::MissingColumn`] carries. It does not
-    /// name the view, so a caller with several views reads the source to tell them apart.
+    /// name the view, unlike [`Error::UnreadableSource`] raised from the same call, so a
+    /// caller running several views over one source has to work out which one failed.
     /// Checked in both read paths, because both build that SQL and neither is the only caller
     /// of it: the join bounds the check to the label frame's keys and a refresh reads the
     /// whole source.
@@ -2261,9 +2262,12 @@ mod tests {
         // The check runs before the query is built, so a view that declares a created column
         // its source lacks is told which source and which column, rather than reaching
         // DuckDB's binder and being told about a table the caller never named. It is not told
-        // which view: `MissingColumn` carries a source and a column, and the view name is not
-        // in the error. Asserted here so a change that starts naming the view, or stops
-        // naming the source, is a decision rather than a drift.
+        // which view: `MissingColumn` carries a source and a column, and no view.
+        //
+        // The expected location is built with the same `source_location` the check calls, so
+        // this does not pin how a location is rendered, only that the check is what raised
+        // this error. The variant is the pin: revert the check and the same fixture gets
+        // DuckDB's binder error instead, which is not a `MissingColumn`.
         let source = Parquet::write(&tie_breakable_source(&[(1, 100, 5, 10)]));
         let mut view = view(&source.string(), None);
         view.created_timestamp_field = Some("inserted_at".to_owned());
