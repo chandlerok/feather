@@ -105,7 +105,7 @@ with warnings.catch_warnings():
         # deprecated `BaseModel.schema()` method. Pyrefly sees the override as
         # inconsistent because that method is not a field; nothing here calls it, and
         # the ignore is audited for staleness by `unused-ignore` in pyproject.toml.
-        schema: NonEmptyStr  # pyrefly: ignore[bad-override]
+        schema: NonEmptyStr  # pyrefly: ignore [bad-override]
         table: NonEmptyStr
 
 
@@ -123,6 +123,14 @@ class FeatureView(DefinitionModel):
     ttl_days: Annotated[int, pydantic.Field(gt=0)] | None = None
     timestamp_field: NonEmptyStr | None = None
     created_timestamp_field: NonEmptyStr | None = None
+    pushable: bool = False
+    """Whether this view accepts a push, and so whether its writes are guarded.
+
+    ``False`` by default: a view nobody pushes to has one writer and no ordering to
+    enforce, so it keeps the plain write path. A push to a view that did not declare
+    this is an error rather than an unguarded write, because the next refresh would
+    revert it.
+    """
 
     @pydantic.model_validator(mode="after")
     def _check(self) -> "FeatureView":

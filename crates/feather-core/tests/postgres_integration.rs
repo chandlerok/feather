@@ -375,6 +375,7 @@ fn file_view(path: &str) -> FeatureView {
         ttl_days: None,
         timestamp_field: None,
         created_timestamp_field: None,
+        pushable: false,
     }
 }
 
@@ -387,6 +388,7 @@ fn postgres_view(table: &str) -> FeatureView {
         ttl_days: None,
         timestamp_field: None,
         created_timestamp_field: None,
+        pushable: false,
     }
 }
 

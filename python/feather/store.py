@@ -190,6 +190,12 @@ class FeatureStore:
         it has seen, and a push is the authority for the window before it does. A push of
         exactly the same timestamp is refused too, so retrying one is safe.
 
+        The view has to declare itself pushable with ``@feature_view(..., pushable=True)``. That
+        one switch both accepts the push and puts the view's refresh under the guard, because the
+        guard is only worth its cost when there is a second writer to order against. A view that
+        did not declare it keeps the plain write path it had before pushes existed, and pushing
+        to it is an error rather than an unguarded write the next refresh would revert.
+
         Only the online store is written. A pushed value is not in the training data until a
         refresh of the same source reaches it, so a feature that is only ever pushed is read at
         serving time from a value training has never seen.
@@ -213,8 +219,9 @@ class FeatureStore:
         Raises:
             TypeError: If ``view`` is not a declared view, a value is not the type its feature
                 declares, or the join key is neither an integer nor a string.
-            ValueError: If the view is not declared, ``values`` does not cover it exactly, or
-                ``entity_key`` does not hold exactly the view's join key.
+            ValueError: If the view is not declared, does not declare itself pushable, ``values``
+                does not cover it exactly, or ``entity_key`` does not hold exactly the view's
+                join key.
             ConnectionError: If ``feather.toml`` declares a Valkey that cannot be reached.
         """
         return self._store.push(

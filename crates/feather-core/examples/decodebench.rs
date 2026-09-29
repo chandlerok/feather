@@ -51,6 +51,7 @@ fn build_view(width: usize) -> FeatureView {
         ttl_days: None,
         timestamp_field: None,
         created_timestamp_field: None,
+        pushable: false,
     }
 }
 

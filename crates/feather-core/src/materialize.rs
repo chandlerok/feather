@@ -377,30 +377,32 @@ impl<S: OnlineStore> LatestBatchSink for StoreSink<'_, S> {
                 self.max_event_timestamp_micros
                     .map_or(event_micros, |highest| highest.max(event_micros)),
             );
-            writes.push(WriteBatch::guarded(
-                key,
-                vec![
-                    WrittenField::new(
-                        value_field(&self.view.name),
-                        encoded.buf[range.clone()].to_vec(),
-                        value_expiry_unix_secs(self.view, event_micros),
-                    ),
-                    // The freshness field is deliberately left unexpired. The read path tells
-                    // `Expired` from `NeverWritten` by comparing this field against the view's
-                    // TTL, and reclaiming it would collapse two states the contract keeps
-                    // apart.
-                    WrittenField::new(
-                        freshness_field(&self.view.name),
-                        encode_freshness(event_micros),
-                        None,
-                    ),
-                ],
-                // The source is the authority over what it has seen, so a row carrying a
-                // timestamp newer than what is stored lands, and a row the source has since
-                // been overtaken on does not. A refresh of a source that lags a push therefore
-                // leaves the pushed value alone, which is what makes the two composable.
-                FreshnessGuard::for_view(&self.view.name, event_micros),
-            ));
+            // The guard is the whole cost of having a second writer, and a view that is not
+            // pushed to has none, so it is declared rather than assumed. An unguarded view
+            // keeps the plain `HSET` path it had before pushes existed.
+            let fields = vec![
+                WrittenField::new(
+                    value_field(&self.view.name),
+                    encoded.buf[range.clone()].to_vec(),
+                    value_expiry_unix_secs(self.view, event_micros),
+                ),
+                // The freshness field is deliberately left unexpired. The read path tells
+                // `Expired` from `NeverWritten` by comparing this field against the view's
+                // TTL, and reclaiming it would collapse two states the contract keeps apart.
+                WrittenField::new(
+                    freshness_field(&self.view.name),
+                    encode_freshness(event_micros),
+                    None,
+                ),
+            ];
+            writes.push(match self.view.pushable {
+                true => WriteBatch::guarded(
+                    key,
+                    fields,
+                    FreshnessGuard::for_view(&self.view.name, event_micros),
+                ),
+                false => WriteBatch::new(key, fields),
+            });
         }
 
         let applied = self.store.write(&writes).await?;
@@ -511,7 +513,18 @@ mod tests {
     }
 
     /// One view over a fixture, with the entity the fixtures are keyed on.
+    ///
+    /// Not pushable, so every other test in this module keeps exercising the plain write path.
+    /// The two push tests below ask for [`a_pushable_view`] instead.
     fn a_view(path: &str, ttl_days: Option<u32>) -> FeatureView {
+        FeatureView {
+            pushable: false,
+            ..a_pushable_view(path, ttl_days)
+        }
+    }
+
+    /// The same, declaring the view pushable so its refresh writes under a guard.
+    fn a_pushable_view(path: &str, ttl_days: Option<u32>) -> FeatureView {
         FeatureView {
             name: "clicks".to_owned(),
             entities: vec![Entity::new("user_id", "user_id")],
@@ -520,6 +533,7 @@ mod tests {
             ttl_days,
             timestamp_field: None,
             created_timestamp_field: None,
+            pushable: true,
         }
     }
 
@@ -595,7 +609,7 @@ mod tests {
         // what a push already landed, so a refresh that overwrote it would silently undo a write
         // that was more recent than anything the source has seen.
         let source = Parquet::write(&source(&[(1, 100, 1)]));
-        let view = a_view(&source.string(), None);
+        let view = a_pushable_view(&source.string(), None);
         let mut store = MemoryStore::new();
 
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![99]))];
@@ -627,12 +641,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refresh_of_an_unpushable_view_does_not_guard() {
+        // The other half of opting in. A view nobody pushes to has one writer, so there is
+        // nothing to order against, and the plain write is what it keeps: no extra `HMGET` per
+        // entity, and a refresh that always overwrites. This is the cost the flag avoids paying
+        // for a capability the project did not ask for.
+        let source = Parquet::write(&source(&[(1, 900, 7)]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+        // A value written directly, standing in for whatever was in the store before. A guarded
+        // refresh would refuse to overwrite it, because this timestamp is older.
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![99]))];
+        store
+            .write(&[WriteBatch::new(
+                key_of(b"1"),
+                vec![WrittenField::new(
+                    value_field("clicks"),
+                    encode_batch(&view.features, &columns, 0..1)
+                        .expect("encode")
+                        .row(0)
+                        .expect("row")
+                        .to_vec(),
+                    None,
+                )],
+            )])
+            .await
+            .expect("seed");
+
+        let report = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("materialize");
+
+        assert_eq!(
+            stored_count(&store, &view, b"1"),
+            Some(7),
+            "an unguarded refresh overwrites, which is the behaviour an unpushed view keeps"
+        );
+        assert_eq!(report.total_rows, 1);
+        assert_eq!(report.total_rows_refused, 0);
+    }
+
+    #[tokio::test]
     async fn a_refresh_overwrites_a_push_the_source_has_caught_up_with() {
         // The other side of the same rule: the source is the authority over everything it has
         // actually seen, so once it holds something newer the refresh wins and the pushed value
         // is gone. A guard that refused everything would freeze the store at its first write.
         let source = Parquet::write(&source(&[(1, 900, 7)]));
-        let view = a_view(&source.string(), None);
+        let view = a_pushable_view(&source.string(), None);
         let mut store = MemoryStore::new();
 
         let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![99]))];

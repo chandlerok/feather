@@ -38,6 +38,12 @@ fn the_python_payload_deserializes_field_for_field() {
     );
     assert_eq!(view.features.len(), 1);
     assert_eq!(view.features[0].name, "click_count");
+    // The flag crosses as a `true`, so a rename or a dropped key on either side shows up here
+    // rather than as a view that silently stops accepting pushes.
+    assert!(
+        view.pushable,
+        "the fixture's first view declares itself pushable"
+    );
     assert_eq!(view.features[0].dtype, DType::Int64);
 
     assert_eq!(view.ttl_days, Some(30));
@@ -113,6 +119,9 @@ fn the_optional_keys_may_be_omitted() {
     assert_eq!(view.ttl_days, None);
     assert_eq!(view.timestamp_field, None);
     assert_eq!(view.created_timestamp_field, None);
+    // Omitted rather than nulled, which is what `#[serde(default)]` is for on a bool: a
+    // binding that leaves the flag out must read as "not pushable", not as an error.
+    assert!(!view.pushable);
     assert!(definitions.services.is_empty());
 }
 

@@ -50,6 +50,9 @@ fn view(name: &str, ttl_days: Option<u32>) -> FeatureView {
         ttl_days,
         timestamp_field: None,
         created_timestamp_field: None,
+        // Pushable, because the test that goes through `push_record` needs a view that declares
+        // it. The guarded batches above do not consult this: they carry their own guard.
+        pushable: true,
     }
 }
 

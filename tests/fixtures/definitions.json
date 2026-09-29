@@ -22,7 +22,8 @@
       ],
       "ttl_days": 30,
       "timestamp_field": null,
-      "created_timestamp_field": null
+      "created_timestamp_field": null,
+      "pushable": true
     },
     {
       "name": "user_stats",
@@ -46,7 +47,8 @@
       ],
       "ttl_days": null,
       "timestamp_field": null,
-      "created_timestamp_field": null
+      "created_timestamp_field": null,
+      "pushable": false
     },
     {
       "name": "user_events",
@@ -69,7 +71,8 @@
       ],
       "ttl_days": null,
       "timestamp_field": null,
-      "created_timestamp_field": null
+      "created_timestamp_field": null,
+      "pushable": false
     }
   ],
   "services": [

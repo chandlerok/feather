@@ -70,6 +70,7 @@ fn view(name: &str) -> FeatureView {
         ttl_days: Some(30),
         timestamp_field: None,
         created_timestamp_field: None,
+        pushable: false,
     }
 }
 

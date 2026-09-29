@@ -291,6 +291,19 @@ pub struct FeatureView {
     pub timestamp_field: Option<String>,
     #[serde(default)]
     pub created_timestamp_field: Option<String>,
+    /// Whether this view accepts a push, and so whether its writes are guarded.
+    ///
+    /// A pushed value and a refresh are two writers for one field, and the guard is what
+    /// keeps them from reverting each other: a write lands only if the event timestamp it
+    /// claims is newer than the one already recorded. A view nobody pushes to has no second
+    /// writer, and the guard costs one extra command per entity on every refresh it does
+    /// have, so it is declared rather than assumed.
+    ///
+    /// `false` is the safe default in the sense that it refuses the capability rather than
+    /// half-supporting it: a push to a view that did not declare it is an error, not an
+    /// unguarded write a refresh could then revert.
+    #[serde(default)]
+    pub pushable: bool,
 }
 
 impl FeatureView {
@@ -590,6 +603,7 @@ mod tests {
             ttl_days: None,
             timestamp_field: None,
             created_timestamp_field: None,
+            pushable: false,
         };
         mutate(&mut view);
         Definitions {

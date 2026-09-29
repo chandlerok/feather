@@ -77,6 +77,12 @@ pub enum Error {
     #[error("field `{name}` is not part of view `{view}`")]
     UnknownFeature { view: String, name: String },
 
+    #[error(
+        "view `{view}` is not pushable; declare it `pushable=True` before pushing to it, so \
+         the guard that makes a push and a refresh composable is in place"
+    )]
+    ViewNotPushable { view: String },
+
     #[error("view `{view}` declares an unsupported number of entities: {count}")]
     UnsupportedEntityCount { view: String, count: usize },
 

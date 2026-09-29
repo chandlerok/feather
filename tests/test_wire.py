@@ -88,7 +88,14 @@ def a_config() -> FeatureStoreConfig:
     """
     return FeatureStoreConfig(
         project="ads",
-        views=[a_view(ttl_days=30), a_postgres_view(), a_vortex_view()],
+        views=[
+            # `user_clicks` declares itself pushable, so the flag crosses the boundary as a
+            # `true` rather than only as the default. The other two leave it off, which is the
+            # shape every view in an existing project has.
+            a_view(ttl_days=30, pushable=True),
+            a_postgres_view(),
+            a_vortex_view(),
+        ],
         services=[FeatureService(name="ranking", features=["user_clicks:click_count"])],
     )
 
@@ -123,6 +130,9 @@ def test_definition_json_uses_the_keys_rust_expects() -> None:
     # Absent optional fields serialize as null, which serde's default handles.
     assert view["timestamp_field"] is None
     assert view["created_timestamp_field"] is None
+    # Both states cross: the first view declares itself pushable, the second does not.
+    assert view["pushable"] is True
+    assert payload["views"][1]["pushable"] is False
     assert payload["services"][0] == {
         "name": "ranking",
         "features": ["user_clicks:click_count"],

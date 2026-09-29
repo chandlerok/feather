@@ -475,8 +475,10 @@ pub async fn read_entities<S: OnlineStore>(
 ///     `true` if the values were written, and `false` if something newer was already recorded.
 ///
 /// Raises:
-///     Error: If the view declares no single entity, or `columns` is not one column per
-///         declared feature, or a column's type is not the one its feature declares.
+///     Error: If the view did not declare itself [`FeatureView::pushable`], which is the check
+///         that makes the guard a property of the definition rather than of the caller. If the
+///         view declares no single entity, or `columns` is not one column per declared feature,
+///         or a column's type is not the one its feature declares.
 pub async fn push_record<S: OnlineStore>(
     store: &mut S,
     project: &str,
@@ -485,6 +487,15 @@ pub async fn push_record<S: OnlineStore>(
     columns: &[ArrayRef],
     event_micros: i64,
 ) -> Result<bool> {
+    // Refused rather than written unguarded. A push to a view whose refresh is not guarded
+    // would be reverted by the next refresh, so accepting it would hand back a `true` for a
+    // write that does not survive; the capability is the view's to declare, not the caller's to
+    // assume.
+    if !view.pushable {
+        return Err(Error::ViewNotPushable {
+            view: view.name.clone(),
+        });
+    }
     let entity = view.entity()?;
     // One row is asked for, so this is a single whole-vector encode: the same blob, in the same
     // layout, with the same schema tag, that a refresh would have written for this entity.
@@ -623,6 +634,9 @@ mod tests {
             ttl_days,
             timestamp_field: None,
             created_timestamp_field: None,
+            // Pushable, because this module's tests are the push tests and `push_record`
+            // refuses a view that did not declare it. The refusal itself is pinned below.
+            pushable: true,
         }
     }
 
@@ -708,6 +722,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+    #[tokio::test]
+    async fn a_view_that_is_not_pushable_is_refused() {
+        // The rule that makes opting in safe. An unguarded push would be reverted by the next
+        // refresh, so accepting one would report a success for a write that does not survive.
+        let mut view = view("clicks", Some(30));
+        view.pushable = false;
+        let mut store = MemoryStore::new();
+
+        let refused = push_record(&mut store, "ads", &view, b"u1", &columns(&[1]), NOW).await;
+
+        assert!(
+            matches!(refused, Err(Error::ViewNotPushable { .. })),
+            "expected ViewNotPushable, got {refused:?}"
+        );
+        assert!(
+            store
+                .fields(&crate::key::entity_hash_key(
+                    "ads",
+                    "user_id",
+                    &encoded_key("u1")
+                ))
+                .is_none(),
+            "a refused push writes nothing at all"
+        );
     }
 
     #[tokio::test]

@@ -258,6 +258,7 @@ fn view(path: &str, ttl_days: Option<u32>) -> FeatureView {
         ttl_days,
         timestamp_field: None,
         created_timestamp_field: None,
+        pushable: false,
     }
 }
 

@@ -1747,6 +1747,7 @@ mod tests {
             ttl_days,
             timestamp_field: None,
             created_timestamp_field: None,
+            pushable: false,
         }
     }
 

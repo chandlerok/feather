@@ -807,9 +807,13 @@ source plus its point-in-time correctness case is not built.
 
 ### The freshness guard: two writers, the newer one wins
 
-There are now two writers, and they disagree about ordering. A refresh recomputes from a source
-that may lag, and a producer may have already pushed something newer than anything the source
-holds. Without a rule, the refresh silently reverts the push.
+A view declares itself `pushable=True` to accept a push, and that declaration is also what puts
+its refresh under a guard. The two are the same switch, because the guard is only worth its cost
+when there is a second writer to order against.
+
+There are now two writers for a pushable view, and they disagree about ordering. A refresh
+recomputes from a source that may lag, and a producer may have already pushed something newer
+than anything the source holds. Without a rule, the refresh silently reverts the push.
 
 The rule is event-time last-writer-wins: a write lands only if the event timestamp it claims is
 newer than the `f:{view}` field already recorded, and an equal timestamp is refused, which is
@@ -841,7 +845,25 @@ the script needs no `struct` library and no second spelling of the timestamp.
 
 A refresh reports what it could not write: `rows_refused` per view and `total_rows_refused`
 across the run, counted out of `rows` rather than added to it. A run with refusals is a normal
-run, not a failure, and the number is how a caller tells the two apart.
+run, not a failure, and the number is how a caller tells the two apart. Both are zero for a view
+that is not pushable, because it never refuses.
+
+### Why the guard is declared rather than assumed
+
+The guard costs one extra `HMGET` per entity on every refresh, and on the plain path the
+alternative is a single field write. A view nobody pushes to has one writer and nothing to
+order, so paying that per entity for a capability no project asked for is a bad default.
+
+`pushable` is therefore the whole gate, and it is checked in both directions:
+
+- **A push to a view that did not declare it is an error**, `Error::ViewNotPushable`, not an
+  unguarded write. Accepting it would return `true` for a value the next refresh reverts, which
+  is worse than refusing.
+- **A refresh of a view that did not declare it writes unguarded**, exactly as it did before
+  pushes existed, so an existing project pays nothing and behaves the same.
+
+That makes the default safe in the sense that matters: the capability is refused rather than
+half-supported. A view opts in by saying so, and pays for exactly what it asks for.
 
 ### Arrow-native pipeline
 

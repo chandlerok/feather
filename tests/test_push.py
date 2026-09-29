@@ -34,7 +34,14 @@ DAY = 86_400_000_000
 FEATURES = ("click_count", "purchase_count")
 """The view's two features, in the order they are declared."""
 
-CLICKS = """
+"""The project's views: one that declares itself pushable, and one that does not.
+
+Two views in one module so the opt-in rule is tested against a real project rather than a
+constructed definition. `clicks` is declared `pushable=True`; `sealed` is the same view with
+that one keyword left off, which is what every view in every existing project looks like.
+"""
+
+PUSHABLE = """
 from feather import Entity, FeatureView, Field, FileSource, feature_view
 from feather.types import Int64
 
@@ -42,8 +49,16 @@ user_entity = Entity(name="user", join_key="user_id")
 clicks_source = FileSource(path="{clicks}")
 
 
-@feature_view(name="clicks", entity=user_entity, source=clicks_source, ttl_days={ttl_days})
+@feature_view(
+    name="clicks", entity=user_entity, source=clicks_source, ttl_days={ttl_days}, pushable=True
+)
 class Clicks(FeatureView):
+    click_count = Field(Int64)
+    purchase_count = Field(Int64)
+
+
+@feature_view(name="sealed", entity=user_entity, source=clicks_source, ttl_days={ttl_days})
+class Sealed(FeatureView):
     click_count = Field(Int64)
     purchase_count = Field(Int64)
 """
@@ -103,7 +118,7 @@ class Project:
         ).write_parquet(clicks)
 
         (tmp_path / "definitions/clicks.py").write_text(
-            CLICKS.format(clicks=clicks, ttl_days=ttl_days), encoding="utf-8"
+            PUSHABLE.format(clicks=clicks, ttl_days=ttl_days), encoding="utf-8"
         )
         config = tmp_path / "feather.toml"
         config.write_text(SETTINGS, encoding="utf-8")
@@ -116,6 +131,7 @@ class Project:
 
         self.store = FeatureStore(config)
         self.Clicks: Any = module.Clicks
+        self.Sealed: Any = module.Sealed
 
     def read(self, user_id: int) -> dict[str, list[Any]]:
         """Read both of the view's features for one entity.
@@ -242,6 +258,24 @@ def test_a_push_of_the_same_timestamp_is_refused(project: Project) -> None:
     assert project.read(7) == {"click_count": [12], "purchase_count": [120]}
 
 
+def test_a_push_to_a_view_that_is_not_pushable_is_refused(project: Project) -> None:
+    # The rule that makes opting in safe. `Sealed` is declared exactly like `Clicks` minus the
+    # one keyword, so the difference between them is the declaration and nothing else. An
+    # unguarded push here would be reverted by the next refresh, so it is an error rather than a
+    # write that reports success and then loses.
+    with pytest.raises(ValueError, match="not pushable"):
+        project.store.push(
+            project.Sealed,
+            {"user_id": 7},
+            {"click_count": 12, "purchase_count": 120},
+            event_timestamp=project.base + DAY,
+        )
+    assert project.read(7) == {
+        "click_count": [None],
+        "purchase_count": [None],
+    }, "a refused push writes nothing"
+
+
 def test_a_refresh_leaves_a_fresher_push_alone(project: Project) -> None:
     # The case the guard exists for. A producer pushed a value the source has not caught up
     # with, and a scheduled refresh runs over the older source row afterwards.
@@ -307,7 +341,7 @@ user_entity = Entity(name="user", join_key="user_id")
 stamps_source = FileSource(path="{stamps}")
 
 
-@feature_view(name="stamps", entity=user_entity, source=stamps_source, ttl_days=30)
+@feature_view(name="stamps", entity=user_entity, source=stamps_source, ttl_days=30, pushable=True)
 class Stamps(FeatureView):
     last_seen = Field(TimestampMicros)
     visits = Field(Int64)

@@ -55,6 +55,8 @@ class _ViewConfig:
         ttl_days: Whole days before a value is stale, or None for no expiry.
         timestamp_field: Source column holding the event timestamp.
         created_timestamp_field: Source column holding the created timestamp.
+        pushable: Whether the view accepts a push, and so whether its writes are
+            guarded.
     """
 
     name: str
@@ -63,6 +65,7 @@ class _ViewConfig:
     ttl_days: int | None
     timestamp_field: str | None
     created_timestamp_field: str | None
+    pushable: bool
 
 
 class Field(Generic[T]):
@@ -130,6 +133,7 @@ def feature_view(
     ttl_days: int | None = None,
     timestamp_field: str | None = None,
     created_timestamp_field: str | None = None,
+    pushable: bool = False,
 ) -> Callable[[S], S]:
     """Declare a feature view around a schema class.
 
@@ -147,6 +151,13 @@ def feature_view(
         timestamp_field: Source column holding the event timestamp. Defaults to
             ``event_timestamp`` in Rust, not here.
         created_timestamp_field: Source column holding the created timestamp.
+        pushable: Accept values pushed straight into the online store for this
+            view, from :meth:`feather.FeatureStore.push`. Declaring it also makes
+            the refresh guard this view's writes on the event timestamp, so a
+            refresh and a push cannot revert each other. ``False`` by default: a
+            view nobody pushes to has one writer, no ordering to enforce, and so
+            keeps the plain write path. Pushing to a view that did not declare it
+            is an error rather than an unguarded write.
 
     Returns:
         A decorator that returns the class unchanged, with its configuration
@@ -167,6 +178,7 @@ def feature_view(
             ttl_days=ttl_days,
             timestamp_field=timestamp_field,
             created_timestamp_field=created_timestamp_field,
+            pushable=pushable,
         )
         fields = view_fields(cls)
         for field in fields:
@@ -227,6 +239,7 @@ def view_to_wire(view: type[FeatureView]) -> _wire.FeatureView:
         ttl_days=config.ttl_days,
         timestamp_field=config.timestamp_field,
         created_timestamp_field=config.created_timestamp_field,
+        pushable=config.pushable,
     )
 
 
