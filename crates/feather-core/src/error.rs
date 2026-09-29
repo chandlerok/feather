@@ -242,10 +242,10 @@ pub enum Error {
     /// format and has no tier, and an `s3://` Parquet source that cannot reach the
     /// extension repository must not be told that `httpfs` reads Parquet.
     ///
-    /// `source` is boxed, unlike every other `#[source]` here, and that is a size
-    /// decision rather than a taste one. `duckdb::Error` is an enum of its own whose
-    /// widest variant carries an Arrow `Type`, so it runs to tens of bytes; added to
-    /// the three fields above it this variant crossed the 128 bytes at which
+    /// `source` is boxed, as [`Error::UnreadableSource`]`'s `reason` is, and that is
+    /// a size decision rather than a taste one. `duckdb::Error` is an enum of its own
+    /// whose widest variant carries an Arrow `Type`, so it runs to tens of bytes; added
+    /// to the three fields above it this variant crossed the 128 bytes at which
     /// `clippy::result_large_err` starts reporting every function that returns a
     /// `Result<_, Error>`. The other source fields are `std::io::Error` at eight
     /// bytes and never came close. One heap cell on the error path is the cheap half
