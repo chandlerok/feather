@@ -35,7 +35,6 @@ FEATURES = ("click_count", "purchase_count")
 """The view's two features, in the order they are declared."""
 
 """The project's views: one that declares itself pushable, and one that does not.
-
 Two views in one module so the opt-in rule is tested against a real project rather than a
 constructed definition. `clicks` is declared `pushable=True`; `sealed` is the same view with
 that one keyword left off, which is what every view in every existing project looks like.
@@ -183,6 +182,30 @@ def project(tmp_path: Path) -> Project:
     return Project(tmp_path)
 
 
+def _view(report: Any, name: str) -> Any:
+    """One view's entry from a refresh report.
+
+    The project declares two views, so a project-wide total says nothing about either one of
+    them. The assertions here are about one view's row, and this is how they name it.
+
+    Args:
+        report: What ``materialize`` returned.
+        name: The view's name.
+
+    Returns:
+        That view's refresh entry.
+
+    Raises:
+        AssertionError: If the report has no entry for that view, which would mean the test was
+            asserting about a view the refresh did not touch.
+    """
+    for entry in report.views:
+        if entry.name == name:
+            return entry
+    names = [entry.name for entry in report.views]
+    raise AssertionError(f"the refresh reported no view named {name!r}; it reported {names}")
+
+
 def test_a_push_is_read_back_by_a_serving_read(project: Project) -> None:
     assert project.push(7, {"click_count": 12, "purchase_count": 120}, project.base + DAY)
     assert project.read(7) == {"click_count": [12], "purchase_count": [120]}
@@ -287,9 +310,12 @@ def test_a_refresh_leaves_a_fresher_push_alone(project: Project) -> None:
         "click_count": [12],
         "purchase_count": [120],
     }, "the refresh must not undo the newer push"
-    assert report.total_rows == 0, "a refused row is not a written row"
-    assert report.total_rows_refused == 1
-    assert report.views[0].rows_refused == 1
+    # Per view, not the project total: this project also declares `sealed`, which nobody pushes
+    # to and whose refresh therefore writes, so `total_rows` is about the whole project and
+    # says nothing about this view. The point is that the pushed view refused its one row.
+    assert _view(report, "clicks").rows == 0, "a refused row is not a written row"
+    assert _view(report, "clicks").rows_refused == 1
+    assert _view(report, "sealed").rows_refused == 0, "an unpushed view never refuses"
 
 
 def test_a_refresh_overwrites_a_push_the_source_has_caught_up_with(project: Project) -> None:
@@ -303,8 +329,8 @@ def test_a_refresh_overwrites_a_push_the_source_has_caught_up_with(project: Proj
         "click_count": [10],
         "purchase_count": [100],
     }, "the source is the authority over what it has seen"
-    assert report.total_rows == 1
-    assert report.total_rows_refused == 0
+    assert _view(report, "clicks").rows == 1
+    assert _view(report, "clicks").rows_refused == 0
 
 
 def test_a_push_older_than_what_is_stored_is_refused(project: Project) -> None:

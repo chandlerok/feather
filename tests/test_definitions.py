@@ -95,6 +95,7 @@ def test_the_compiled_json_is_the_rust_contract() -> None:
         "ttl_days": 30,
         "timestamp_field": None,
         "created_timestamp_field": None,
+        "pushable": False,
     }
 
 
