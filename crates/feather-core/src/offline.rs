@@ -2607,11 +2607,22 @@ mod tests {
 
         assert!(matches!(error, Error::UnreadableSource { .. }), "{error}");
         assert!(error.to_string().contains("view `user_clicks`"), "{error}");
+        // A `#[source]` on a `Box<E>` makes the box the concrete type behind the chain node, so
+        // the downcast names `Box<duckdb::Error>` and the caller derefs it to reach DuckDB's
+        // own error. Naming the inner type would be asking for a node that is not there.
+        let boxed = std::error::Error::source(&error)
+            .and_then(|node| node.downcast_ref::<Box<duckdb::Error>>());
         assert!(
-            std::error::Error::source(&error)
-                .and_then(|inner| inner.downcast_ref::<duckdb::Error>())
-                .is_some(),
+            boxed.is_some(),
             "the scanner's own error is the source of this one, not only its text: {error}"
+        );
+        // The binding is typed as `&duckdb::Error`, which only compiles if the box holds one,
+        // and the message carries that same error's text, so the node is the scanner's own
+        // error rather than some other error in the chain.
+        let scanner: &duckdb::Error = &**boxed.expect("asserted above");
+        assert!(
+            error.to_string().contains(&scanner.to_string()),
+            "the message carries the scanner's own text and the chain node is that error: {error}"
         );
         assert!(
             error

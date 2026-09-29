@@ -217,10 +217,13 @@ pub enum Error {
     /// what makes one failing Postgres view distinguishable from another.
     ///
     /// `reason` is the scanner's error rather than its rendered text, so the chain survives
-    /// the wrapping and `Error::source` reaches DuckDB's own error. It is boxed because a
-    /// `#[source]` has to be an `Error` and the scanner's rendered text is a `String`, which
-    /// is not one; the box also leaves the variant with the two `String`s it already had, so
-    /// the ceiling asserted above is this variant's to cross and not this variant's to reach.
+    /// the wrapping and `Error::source` reaches the scanner's own error, boxed: the concrete
+    /// type behind that node is `Box<duckdb::Error>`, so a caller downcasts to the box and
+    /// derefs it. It is boxed because a `#[source]` has to be an `Error` and the scanner's
+    /// rendered text is a `String`, which is not one. The box also keeps this variant to the
+    /// two `String`s it already had and one pointer, and the 128-byte ceiling is held in
+    /// place by the const assertion at the top of this file rather than by any measurement
+    /// here.
     #[cfg(feature = "offline")]
     #[error("view `{view}` could not read {location}: {reason}")]
     UnreadableSource {
