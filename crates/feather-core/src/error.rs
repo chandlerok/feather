@@ -218,6 +218,22 @@ pub enum Error {
     #[error("view `{view}` failed while its source was scanned: {reason}")]
     StreamInterrupted { view: String, reason: String },
 
+    /// A created timestamp the ambiguity check cannot group by.
+    ///
+    /// Reported against the view rather than the column alone, because the view is what named
+    /// the column: a source carrying a float in the created-timestamp position is a choice the
+    /// definition made, and the reader is told which definition.
+    #[cfg(feature = "offline")]
+    #[error(
+        "view `{view}` uses `{column}` as its created timestamp, and the column is {actual}; \
+         a float is not equal to itself, so rows sharing one cannot be told apart"
+    )]
+    UnsupportedCreatedTimestampType {
+        view: String,
+        column: String,
+        actual: String,
+    },
+
     /// A source that could not be read, attributed to the view that reads it.
     ///
     /// The scanner's own text is carried in the message rather than replaced, since it is

@@ -54,6 +54,23 @@ const LABEL_KEY: &str = "feather_key";
 const LABEL_TS: &str = "feather_ts";
 const MATCHED_TS: &str = "feather_matched_ts";
 
+/// The ambiguity check's output aliases, prefixed for the reason [`MATCHED_TS`] and its
+/// neighbours are.
+///
+/// This check is the one place that names its aliases in a `GROUP BY`, and a name a source
+/// column also carries is resolved by an engine-defined precedence rather than by the alias
+/// winning. A source with an unrelated column called `c` would then be grouped by that column
+/// instead of by the declared created timestamp, which either misses a real tie or refuses a
+/// clean source. Single letters bought nothing here, so they are gone.
+const AMBIGUITY_KEY: &str = "feather_ambiguity_key";
+const AMBIGUITY_TS: &str = "feather_ambiguity_ts";
+const AMBIGUITY_CREATED: &str = "feather_ambiguity_created";
+
+/// How a source is named in a message that has to say which one failed.
+fn source_location(view: &FeatureView) -> String {
+    format!("source `{}`", view.source.description())
+}
+
 /// The columns a materialization scan lays its batches out under.
 ///
 /// Public because the write path names them when it reports a malformed batch, and one
@@ -523,8 +540,9 @@ impl Engine {
 
         self.ensure_source_loaded(view)?;
 
-        let location = format!("source `{}`", view.source.description());
+        let location = source_location(view);
         let described = self.describe_source(view)?;
+        self.check_created_timestamp_type(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -636,9 +654,38 @@ impl Engine {
         // text behind a message that says which view was reading.
         describe().map_err(|error| Error::UnreadableSource {
             view: view.name.clone(),
-            location: format!("source `{}`", view.source.description()),
+            location: source_location(view),
             reason: error.to_string(),
         })
+    }
+
+    /// Refuse a created timestamp the ambiguity check cannot group by.
+    ///
+    /// The check groups by the created column so rows agreeing on it are refused instead of
+    /// sorted, and a `GROUP BY` over a float uses IEEE equality, under which NaN equals
+    /// nothing, not even itself. Two rows whose created timestamps are both NaN are therefore
+    /// two groups of one, so the check passes them and `ORDER BY` picks between them, which is
+    /// the plan-dependent outcome the refusal exists to prevent. Refused here, against the
+    /// declared type, rather than inferred from the sort's behaviour.
+    ///
+    /// Checked in both read paths, because both run the check and neither is the only caller of
+    /// it: the join bounds it to the label frame's keys and a refresh reads the whole source.
+    fn check_created_timestamp_type(&self, view: &FeatureView, described: &TypeMap) -> Result<()> {
+        let Some(created) = &view.created_timestamp_field else {
+            return Ok(());
+        };
+        let actual = described.get(created).ok_or_else(|| Error::MissingColumn {
+            location: source_location(view),
+            column: created.clone(),
+        })?;
+        if matches!(normalize_type(actual).as_str(), "FLOAT" | "DOUBLE") {
+            return Err(Error::UnsupportedCreatedTimestampType {
+                view: view.name.clone(),
+                column: created.clone(),
+                actual: actual.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Put the entity frame into a temporary table with an explicit row index.
@@ -690,7 +737,7 @@ impl Engine {
         // every entity a source holds, not only the ones some label row happened to name.
         let restriction = match scope {
             AmbiguityScope::LabelKeys => {
-                format!(" WHERE k IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
+                format!(" WHERE {AMBIGUITY_KEY} IN (SELECT {LABEL_KEY} FROM {LABELS_TABLE})")
             }
             AmbiguityScope::WholeSource => String::new(),
         };
@@ -707,8 +754,8 @@ impl Engine {
             Some(created) => {
                 let name = quote_ident(created);
                 (
-                    format!(", {name} AS c"),
-                    ", c".to_owned(),
+                    format!(", {name} AS {AMBIGUITY_CREATED}"),
+                    format!(", {AMBIGUITY_CREATED}"),
                     format!("tied on `{created}`"),
                 )
             }
@@ -720,12 +767,12 @@ impl Engine {
         };
         let sql = format!(
             "WITH source AS (
-                 SELECT {key_expr} AS k, {source_ts_value} AS t{created_select} FROM {relation}
+                 SELECT {key_expr} AS {AMBIGUITY_KEY}, {source_ts_value} AS {AMBIGUITY_TS}{created_select} FROM {relation}
                  WHERE {key_expr} IS NOT NULL AND {source_ts_value} IS NOT NULL
              )
-             SELECT CAST(k AS VARCHAR), t, count(*) AS n
+             SELECT CAST({AMBIGUITY_KEY} AS VARCHAR), {AMBIGUITY_TS}, count(*) AS n
              FROM source{restriction}
-             GROUP BY k, t{created_group}
+             GROUP BY {AMBIGUITY_KEY}, {AMBIGUITY_TS}{created_group}
              HAVING count(*) > 1
              LIMIT 1"
         );
@@ -864,8 +911,9 @@ impl Engine {
 
         self.ensure_source_loaded(view)?;
 
-        let location = format!("source `{}`", view.source.description());
+        let location = source_location(view);
         let described = self.describe_source(view)?;
+        self.check_created_timestamp_type(view, &described)?;
 
         let source_key = described
             .get(key_column)
@@ -1662,6 +1710,52 @@ mod tests {
         .expect("source batch")
     }
 
+    /// `user_id, event_timestamp, created_at, count, c`, for a source carrying a column named
+    /// like the alias the ambiguity check used to group the created timestamp by.
+    fn decoy_tie_breakable_source(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("event_timestamp", DataType::Int64, false),
+            Field::new("created_at", DataType::Int64, false),
+            Field::new("count", DataType::Int64, true),
+            Field::new("c", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+                // Distinct per row, so grouping by this column cannot produce the groups
+                // grouping by the created timestamp produces.
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3 * 7))),
+            ],
+        )
+        .expect("source batch")
+    }
+
+    /// `user_id, event_timestamp, created_at, count`, with a floating-point created timestamp,
+    /// so a source whose creation times a warehouse typed as a double can be built.
+    fn float_tie_breakable_source(rows: &[(i64, i64, f64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Int64, false),
+            Field::new("event_timestamp", DataType::Int64, false),
+            Field::new("created_at", DataType::Float64, false),
+            Field::new("count", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+            ],
+        )
+        .expect("source batch")
+    }
+
     /// `user_id, event_timestamp, created_at, count`, for tie breaking.
     fn tie_breakable_source(rows: &[(i64, i64, i64, i64)]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -2022,7 +2116,10 @@ mod tests {
     fn three_rows_at_one_instant_are_ordered_by_their_created_timestamps() {
         // The tie-break is a sort, so a third row is decided the same way a second is, and the
         // middle creation must not win just because it is in the middle. `count` crosses
-        // `created_at`, so picking the wrong row changes the answer.
+        // `created_at`, so picking the wrong row changes the answer. The three-row case was
+        // already decided this way before the refusal landed, so this characterises it rather
+        // than pinning that change: the pair it would have let the plan decide is
+        // `three_rows_nothing_separates_are_refused` beside it.
         let source = Parquet::write(&tie_breakable_source(&[
             (1, 100, 5, 10),
             (1, 100, 9, 20),
@@ -2128,6 +2225,67 @@ mod tests {
 
         assert!(
             matches!(error, Error::AmbiguousTimestamp { rows: 2, .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_source_column_named_like_the_old_alias_does_not_hide_a_tie() {
+        // The check aliased the created column `c` and grouped by that name, and a source
+        // carrying a column called `c` as well leaves which one the name means up to the
+        // engine. Resolving it to the source column would group by an unrelated value and miss
+        // the tie, which is the hole the refusal exists to close. The alias is prefixed now,
+        // so the rows are refused whatever this source's other columns are called.
+        let source = Parquet::write(&decoy_tie_breakable_source(&[
+            (1, 100, 5, 10),
+            (1, 100, 5, 20),
+            (2, 200, 1, 30),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("a tied pair is refused whatever the source's other columns are called");
+
+        assert!(
+            matches!(
+                &error,
+                Error::AmbiguousTimestamp {
+                    key,
+                    timestamp: 100,
+                    rows: 2,
+                    ..
+                } if key == "1"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_floating_point_created_timestamp_is_refused() {
+        // A float is not equal to itself, so a `GROUP BY` on the created column puts two rows
+        // whose created timestamps are both NaN into two groups of one and the check passes
+        // them. `ORDER BY` then places those NaNs next to each other and picks between them,
+        // so the winner is the plan's, which is the outcome the refusal exists to prevent.
+        // Refused against the declared type rather than left to the sort's behaviour.
+        let source = Parquet::write(&float_tie_breakable_source(&[
+            (1, 100, f64::NAN, 10),
+            (1, 100, f64::NAN, 20),
+        ]));
+        let mut view = view(&source.string(), None);
+        view.created_timestamp_field = Some("created_at".to_owned());
+
+        let error = engine()
+            .point_in_time_join(&labels(&[(Some(1), 100)]), &view, &JoinOptions::default())
+            .expect_err("a float created timestamp is not equal to itself, so it cannot group");
+
+        assert!(
+            matches!(
+                &error,
+                Error::UnsupportedCreatedTimestampType { column, actual, .. }
+                    if column == "created_at" && actual == "DOUBLE"
+            ),
             "{error}"
         );
     }
