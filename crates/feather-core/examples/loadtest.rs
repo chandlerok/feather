@@ -166,13 +166,13 @@ async fn run() -> Result<()> {
             let key = entity_hash_key(project, "user_id", &encoded);
             for name in &names {
                 let v = views.get(name).expect("view exists");
-                batches.push(WriteBatch {
-                    key: key.clone(),
-                    fields: vec![
+                batches.push(WriteBatch::new(
+                    key.clone(),
+                    vec![
                         WrittenField::new(value_field(name), encode_vector(v, e), None),
                         WrittenField::new(freshness_field(name), now.to_le_bytes().to_vec(), None),
                     ],
-                });
+                ));
             }
         }
         written += batches.len();

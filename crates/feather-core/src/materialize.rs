@@ -36,7 +36,10 @@ use crate::key::{
     is_entity_hash_key, value_field, views_registry_key,
 };
 use crate::offline::{Engine, LatestBatchSink, SCAN_TS_COLUMN};
-use crate::online::{OnlineStore, ProjectScan, WriteBatch, WrittenField, encode_freshness};
+use crate::online::{
+    FreshnessGuard, OnlineStore, ProjectScan, WriteBatch, WrittenField, encode_freshness,
+    value_expiry_unix_secs,
+};
 use crate::value::encode_batch;
 
 /// What one view's refresh did.
@@ -44,8 +47,15 @@ use crate::value::encode_batch;
 pub struct ViewRefresh {
     /// The view's name, as declared.
     pub name: String,
-    /// Entity rows written, which is one `HSET` per entity.
+    /// Entity rows written, which is one store write per entity. A row whose write was refused
+    /// is not in this count; see `rows_refused`.
     pub rows: u64,
+    /// Entity rows the store refused because something newer was already recorded.
+    ///
+    /// A refresh of a lagging source lands against a value a push wrote after it, and refusing
+    /// is the whole point: overwriting would undo the fresher write. A run with refusals is a
+    /// normal run, not a failure, and the number is how a caller tells the two apart.
+    pub rows_refused: u64,
     /// The newest event timestamp any written row carried, in microseconds since the epoch.
     ///
     /// `None` when the refresh wrote nothing, which is a view whose source had no row with
@@ -65,6 +75,8 @@ pub struct MaterializeReport {
     pub retired: Vec<String>,
     /// Rows written across every refreshed view.
     pub total_rows: u64,
+    /// Rows refused across every refreshed view, because something newer was already recorded.
+    pub total_rows_refused: u64,
     /// How long the whole call took.
     pub elapsed: Duration,
 }
@@ -135,6 +147,7 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
         views.push(ViewRefresh {
             name: view.name.clone(),
             rows: sink.rows,
+            rows_refused: sink.rows_refused,
             max_event_timestamp_micros: sink.max_event_timestamp_micros,
             elapsed: view_started.elapsed(),
         });
@@ -191,18 +204,19 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
     // way: the next refresh reads the same empty registry and diffs the same declared set.
     if !registry.is_empty() {
         store
-            .write(&[WriteBatch {
-                key: registry_key,
-                fields: registry
+            .write(&[WriteBatch::new(
+                registry_key,
+                registry
                     .into_iter()
                     .map(|(name, value)| WrittenField::new(name, value, None))
                     .collect(),
-            }])
+            )])
             .await?;
     }
 
     Ok(MaterializeReport {
         total_rows: views.iter().map(|view| view.rows).sum(),
+        total_rows_refused: views.iter().map(|view| view.rows_refused).sum(),
         elapsed: started.elapsed(),
         views,
         retired,
@@ -292,34 +306,13 @@ fn select_views<'a>(
         .collect())
 }
 
-/// The instant a value stops being readable, in Unix seconds.
-///
-/// Measured from the winning row's event timestamp rather than from the time of the write. A
-/// 40-day-old value under a 30-day TTL has already expired, and an expiry measured from the
-/// write would give it another 30 days of life; the read-time check would then disagree with
-/// what the server holds. `None` for a view that declares no TTL.
-///
-/// Rounded up, so rounding is not what makes the server reclaim a field while the read-time
-/// check would still call it fresh. Rounding down opens a window just under a second wide where
-/// a value the read path would have served is already gone, which reports it as never written
-/// instead. The two sides read different clocks — the server's, against this absolute instant,
-/// and the caller's `now`, against the recorded freshness — so a skew between them is the one
-/// way left for the server to reclaim early, and no rounding direction can cover it.
-fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
-    let ttl_days = view.ttl_days?;
-    // Rounded up rather than down. `i64::div_ceil` is still unstable in this toolchain, so the
-    // half second of arithmetic is spelled out rather than imported behind a feature gate.
-    let remainder = event_micros.rem_euclid(1_000_000) != 0;
-    let seconds = event_micros.div_euclid(1_000_000) + i64::from(remainder);
-    Some(seconds + i64::from(ttl_days) * 86_400)
-}
-
 /// The sink that turns one view's scan into one store write per entity.
 struct StoreSink<'a, S> {
     project: &'a str,
     view: &'a FeatureView,
     store: &'a mut S,
     rows: u64,
+    rows_refused: u64,
     max_event_timestamp_micros: Option<i64>,
 }
 
@@ -331,6 +324,7 @@ impl<'a, S> StoreSink<'a, S> {
             view,
             store,
             rows: 0,
+            rows_refused: 0,
             max_event_timestamp_micros: None,
         }
     }
@@ -383,9 +377,9 @@ impl<S: OnlineStore> LatestBatchSink for StoreSink<'_, S> {
                 self.max_event_timestamp_micros
                     .map_or(event_micros, |highest| highest.max(event_micros)),
             );
-            writes.push(WriteBatch {
+            writes.push(WriteBatch::guarded(
                 key,
-                fields: vec![
+                vec![
                     WrittenField::new(
                         value_field(&self.view.name),
                         encoded.buf[range.clone()].to_vec(),
@@ -401,11 +395,18 @@ impl<S: OnlineStore> LatestBatchSink for StoreSink<'_, S> {
                         None,
                     ),
                 ],
-            });
+                // The source is the authority over what it has seen, so a row carrying a
+                // timestamp newer than what is stored lands, and a row the source has since
+                // been overtaken on does not. A refresh of a source that lags a push therefore
+                // leaves the pushed value alone, which is what makes the two composable.
+                FreshnessGuard::for_view(&self.view.name, event_micros),
+            ));
         }
 
-        self.store.write(&writes).await?;
-        self.rows += encoded.len() as u64;
+        let applied = self.store.write(&writes).await?;
+        let refused = applied.iter().filter(|landed| !**landed).count() as u64;
+        self.rows += (applied.len() as u64) - refused;
+        self.rows_refused += refused;
         Ok(())
     }
 }
@@ -426,6 +427,7 @@ mod tests {
     use crate::offline::{Engine, Limits};
     use crate::online::ReadRequest;
     use crate::online::memory::MemoryStore;
+    use crate::online::push_record;
     use crate::value::{SchemaTag, decode_batch};
 
     static FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -585,6 +587,74 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("a clock after 1970")
             .as_micros() as i64
+    }
+
+    #[tokio::test]
+    async fn a_refresh_leaves_a_fresher_push_alone() {
+        // The whole reason the refresh writes under a guard. The source's only row is older than
+        // what a push already landed, so a refresh that overwrote it would silently undo a write
+        // that was more recent than anything the source has seen.
+        let source = Parquet::write(&source(&[(1, 100, 1)]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![99]))];
+        assert!(
+            push_record(&mut store, "ads", &view, b"1", &columns, 500)
+                .await
+                .expect("push")
+        );
+
+        let report = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("materialize");
+
+        assert_eq!(
+            stored_count(&store, &view, b"1"),
+            Some(99),
+            "a refresh of a source that lags a push must not undo the push"
+        );
+        assert_eq!(report.total_rows, 0, "a refused row is not a written row");
+        assert_eq!(report.total_rows_refused, 1);
+        assert_eq!(report.views[0].rows, 0);
+        assert_eq!(report.views[0].rows_refused, 1);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_overwrites_a_push_the_source_has_caught_up_with() {
+        // The other side of the same rule: the source is the authority over everything it has
+        // actually seen, so once it holds something newer the refresh wins and the pushed value
+        // is gone. A guard that refused everything would freeze the store at its first write.
+        let source = Parquet::write(&source(&[(1, 900, 7)]));
+        let view = a_view(&source.string(), None);
+        let mut store = MemoryStore::new();
+
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![99]))];
+        assert!(
+            push_record(&mut store, "ads", &view, b"1", &columns, 500)
+                .await
+                .expect("push")
+        );
+
+        let report = materialize(
+            &mut store,
+            &an_engine(),
+            "ads",
+            std::slice::from_ref(&view),
+            &[],
+        )
+        .await
+        .expect("materialize");
+
+        assert_eq!(stored_count(&store, &view, b"1"), Some(7));
+        assert_eq!(report.total_rows, 1);
+        assert_eq!(report.total_rows_refused, 0);
     }
 
     #[tokio::test]
@@ -823,7 +893,7 @@ mod tests {
     }
 
     impl OnlineStore for CountingWalk {
-        async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+        async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>> {
             self.inner.write(batches).await
         }
 
@@ -919,10 +989,10 @@ mod tests {
         // Something else under the same project prefix, holding a field named like a retired
         // view's. A walk that deleted blindly would send `HDEL` at it.
         store
-            .write(&[WriteBatch {
-                key: b"ads:meta".to_vec(),
-                fields: vec![WrittenField::new(value_field("stats"), b"x".to_vec(), None)],
-            }])
+            .write(&[WriteBatch::new(
+                b"ads:meta".to_vec(),
+                vec![WrittenField::new(value_field("stats"), b"x".to_vec(), None)],
+            )])
             .await
             .expect("stray key");
 

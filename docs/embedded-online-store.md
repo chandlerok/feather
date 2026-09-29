@@ -148,6 +148,19 @@ issue [#9](https://github.com/chandlerok/feather/issues/9). If incremental mater
 becomes a near-term goal, the mutable in-process store becomes the long-term shape and the
 mmap'd artifact is demoted to a cold tier.
 
+A second writer arrived without changing the assumption, and it is worth being explicit about
+why. A push writes one entity's whole vector for one view, so the store is still overwritten
+in place and still carries one value per (entity, view) with nothing to reconcile. What the
+push adds is a _second_ writer, and two writers need an ordering rule: both writes are guarded
+on the event timestamp and both refuse to overwrite something newer, so the source stays the
+authority over what it has seen and a push is the authority for the window before it does.
+The mutable store is therefore already the shape this design wants, rather than a concession
+to it. See "The freshness guard" in the architecture document.
+
+Neither writer needs a second copy of anything, which is what keeps this design's costs where
+they were. `delete_fields` still only has retired views to remove, and `scan_entity_keys` still
+only has to find their fields.
+
 ## Costs
 
 - **Memory is the limit, and it is per process.** State it as a number rather than discovering

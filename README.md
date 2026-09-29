@@ -6,10 +6,14 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
 > and the online serving layer are built and measured against Valkey, the position a
-> deployment graduates to, and materialization writes a view's values into the online store
-> from its source. The point-in-time join is built over local
+> deployment graduates to, materialization writes a view's values into the online store
+> from its source, and a push writes one entity's whole vector for one view straight
+> into that store, guarded so a refresh and a push each defer to the newer of the two.
+> The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
-> refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
+> refresh, the push, and the online read to Python. A pushed value is online only: it is not
+> in the training data until a refresh of the same source reaches it.
+> Warehouse sources read through an Iceberg REST
 > catalog are design only. There is no served API yet, and the `feather` command is not on
 > PyPI either, so `pip install feather-py polars` is a line that will work rather than one that
 > works today; everything after it runs.

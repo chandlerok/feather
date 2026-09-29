@@ -51,6 +51,11 @@ class ViewRefresh:
 
     name: str
     rows: int
+    """Entity rows written, which is one store write per entity. A row whose write was refused
+    is not in this count; see ``rows_refused``."""
+    rows_refused: int
+    """Entity rows the store refused because something newer was already recorded, which is a
+    refresh of a source that lags a push rather than a failure."""
     max_event_timestamp_micros: int | None
     """The newest event timestamp any written row carried, in microseconds since the epoch, or
     ``None`` when the refresh wrote no rows."""
@@ -64,6 +69,8 @@ class MaterializeReport:
     """The views a previous refresh declared and this one does not, whose fields were removed.
     Empty on every run but the one that follows a rename or a removal."""
     total_rows: int
+    total_rows_refused: int
+    """Rows refused across every refreshed view, because something newer was already recorded."""
     elapsed_seconds: float
 
 class FeatureStore:
@@ -83,6 +90,35 @@ class FeatureStore:
         Raises:
             ValueError: If a named view is not declared, or a source cannot be read as its view
                 declares it.
+            ConnectionError: If the settings declare a Valkey that cannot be reached.
+        """
+        ...
+    def push(
+        self,
+        view: str,
+        entity_key: dict[str, object],
+        values: dict[str, object],
+        event_timestamp: int,
+    ) -> bool:
+        """Write one entity's whole value vector for one view into the online store.
+
+        Args:
+            view: The view to write, by its declared name.
+            entity_key: The entity's join key, under the name the view's entity declares. One
+                push names one entity, so this is one value.
+            values: One value per declared feature, by name, in any order. A feature left out or
+                named that the view does not declare is an error rather than a partial write.
+            event_timestamp: The event timestamp these values describe, in microseconds since
+                the epoch.
+
+        Returns:
+            ``True`` if the values were written, ``False`` if something newer was already
+            recorded for this entity and view.
+
+        Raises:
+            TypeError: If a value is not the type its feature declares, or the join key is
+                neither an integer nor a string.
+            ValueError: If the view is not declared, or ``values`` does not cover it exactly.
             ConnectionError: If the settings declare a Valkey that cannot be reached.
         """
         ...

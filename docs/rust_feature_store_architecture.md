@@ -786,6 +786,63 @@ flag for incremental materialization after a schema change
 is fixed by the next refresh, because every value is rewritten with the new encoding.
 Re-materialization is the migration.
 
+### Push: one entity, one view, outside the refresh
+
+A push writes one entity's whole value vector for one view, from a caller that already holds
+the values. It is the write a refresh would have made later for that entity, in the same
+encoding, under the same key. It is how a value computed by a streaming producer, or outside
+the project entirely, reaches the online store before its source catches up.
+
+`FeatureStore.push(View, entity_key, values, event_timestamp=...)` covers the view in full. A
+view's features share one stored field, so a subset would be a read-modify-write of that field,
+and a read-modify-write races the refresh writing the same field. The trade is the reason
+Feast's Redis store stores one field per feature instead; that layout serves a partial write
+naturally and costs a per-view round trip, which is the thing this layout exists to avoid.
+A caller holding a subset reads the stored vector, patches it, and pushes the whole result.
+
+The push is only online. A pushed value is not in the training data until a refresh of the
+same source reaches it, so a feature that is only ever pushed is served from a value training
+has never seen. Closing that means appending to the offline side as well, and an appendable
+source plus its point-in-time correctness case is not built.
+
+### The freshness guard: two writers, the newer one wins
+
+There are now two writers, and they disagree about ordering. A refresh recomputes from a source
+that may lag, and a producer may have already pushed something newer than anything the source
+holds. Without a rule, the refresh silently reverts the push.
+
+The rule is event-time last-writer-wins: a write lands only if the event timestamp it claims is
+newer than the `f:{view}` field already recorded, and an equal timestamp is refused, which is
+what makes both a retried push and a re-run refresh safe. The source stays the authority over
+everything it has actually seen, and a push is the authority for the window before it does.
+
+This is the one mechanism with real consensus behind it. Feast arrived at the same place in
+[#1961](https://github.com/feast-dev/feast/pull/1961), whose stated motivation is this
+problem: "the use case here comes into play when there are multiple ways to ingest into the
+OnlineStore (i.e. materialization, direct/streaming ingestion) so timing could be different in
+different scenarios so we are checking the event timestamp to make sure only the latest
+features are written." It is still the default in `RedisOnlineStore.online_write_batch`, with a
+`skip_dedup` flag to turn it off and an in-code note that the read-then-write window is a rare
+race.
+
+What differs is where the comparison happens. Feast reads the timestamp and then writes, which
+leaves that window open. Here the guard travels with the batch, and a store that cannot decide
+it atomically with the write is a store that cannot honour the guard:
+
+- **Valkey** evaluates `GUARDED_WRITE_SCRIPT` in `online/valkey.rs`: read the freshness field,
+  compare, and write, in one script. A pipeline does not stand in for it, because
+  `redis::pipe()` batches commands into one write without wrapping them in `MULTI`/`EXEC`.
+- **The in-process store** compares under the `&mut self` the call already holds, which makes it
+  atomic there for the same reason.
+
+The comparison is on the eight little-endian bytes `encode_freshness` writes, byte by byte from
+the most significant end, which is a numeric comparison of a non-negative `i64`. That is why
+the script needs no `struct` library and no second spelling of the timestamp.
+
+A refresh reports what it could not write: `rows_refused` per view and `total_rows_refused`
+across the run, counted out of `rows` rather than added to it. A run with refusals is a normal
+run, not a failure, and the number is how a caller tells the two apart.
+
 ### Arrow-native pipeline
 
 The write path never leaves Arrow and never builds a row-oriented intermediate:
@@ -1404,6 +1461,27 @@ is a reclamation optimization.
 
 See "Materialization". The evidence is three independent Feast bugs in watermark handling and
 one permanent-corruption variant.
+
+### An event-time guard, not a second copy of the value
+
+**Rejected:** an override namespace with precedence, where a push is written to a separate field
+and the read path prefers it.
+
+That is the feature-flag shape, and it is the right shape for "force this customer's value for
+24 hours". It is not what a push is for here: a push is the same value earlier, not a different
+value, and the online store is already a store of record with per-field expiry, so
+`push` plus a view's `ttl_days` covers the bounded case without a second copy.
+
+It costs more than it looks. A second namespace is a second set of fields to reclaim, a
+precedence rule in the hot read path, and a second answer to "which value is this" that a
+schema change has to keep consistent. No feature store has converged on it; Feast's maintainers
+resisted proliferating view types for the neighbouring distinction
+([#4365](https://github.com/feast-dev/feast/issues/4365), closed 2024), and the ecosystem's
+actual consensus is the event-time guard that this took instead.
+
+**Also rejected:** a partial push that patches the stored vector in place. It is a
+read-modify-write of the one field a view's features share, so it races the refresh writing
+that field, and the race loses whichever write is second. A push covers the view instead.
 
 ### Arrow end to end, no protobuf
 

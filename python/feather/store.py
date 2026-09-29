@@ -26,7 +26,7 @@ from feather.settings import DEFAULT_PATH, load_settings
 
 if TYPE_CHECKING:
     import os
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from feather._core import ArrowStreamExportable, MaterializeReport
 
@@ -163,6 +163,67 @@ class FeatureStore:
         """
         return self._store.materialize(None if views is None else list(views))
 
+    def push(
+        self,
+        view: type[FeatureView],
+        entity_key: Mapping[str, Any],
+        values: Mapping[str, Any],
+        *,
+        event_timestamp: int,
+    ) -> bool:
+        """Write one entity's whole value vector for one view into the online store.
+
+        A push is the write a refresh would have made later, for one entity, from a caller that
+        already holds the values: the same fields, in the same encoding, under the same key. It
+        is how a value computed outside the project, or computed by a streaming producer, reaches
+        the online store before the source catches up.
+
+        ``values`` covers the view in full. A view's features share one stored field, so writing
+        a subset would mean reading the stored vector and writing it back, and that races the
+        refresh writing the same field. A value may be ``None``, which is a null for that feature
+        rather than a gap in the push.
+
+        The write is guarded on the event timestamp, which is what makes a push and a refresh
+        composable rather than competing. Both refuse to overwrite something newer: a push is
+        refused when a newer value is already stored, and a refresh of a source that lags a push
+        is refused for the same entity and view. The source stays the authority over everything
+        it has seen, and a push is the authority for the window before it does. A push of
+        exactly the same timestamp is refused too, so retrying one is safe.
+
+        Only the online store is written. A pushed value is not in the training data until a
+        refresh of the same source reaches it, so a feature that is only ever pushed is read at
+        serving time from a value training has never seen.
+
+        Args:
+            view: The declared view to write, as its class. A view is passed as the object the
+                project declares rather than as its name, so a rename or a typo is caught here
+                instead of becoming a runtime lookup of a string.
+            entity_key: The entity's join key, under the name the view's entity declares. One
+                push names one entity, so this is one value.
+            values: One value per feature the view declares, by name, in any order. A feature
+                left out, or a name the view does not declare, is an error rather than a partial
+                write.
+            event_timestamp: The event timestamp these values describe, in microseconds since
+                the epoch, matching every other timestamp in this library.
+
+        Returns:
+            ``True`` if the values were written, and ``False`` if something newer was already
+            recorded for this entity and view, in which case nothing was written.
+
+        Raises:
+            TypeError: If ``view`` is not a declared view, a value is not the type its feature
+                declares, or the join key is neither an integer nor a string.
+            ValueError: If the view is not declared, ``values`` does not cover it exactly, or
+                ``entity_key`` does not hold exactly the view's join key.
+            ConnectionError: If ``feather.toml`` declares a Valkey that cannot be reached.
+        """
+        return self._store.push(
+            _view_name(view),
+            dict(entity_key),
+            dict(values),
+            event_timestamp,
+        )
+
     def get_online_features(
         self,
         entity_df: ArrowStreamExportable,
@@ -234,6 +295,23 @@ def _references(features: Sequence[Field[Any]]) -> list[str]:
     if len(set(references)) != len(references):
         raise ValueError("the same feature is requested twice")
     return references
+
+
+def _view_name(view: object) -> str:
+    """The wire name of a declared view class.
+
+    Args:
+        view: The declared view, as the project wrote it.
+
+    Returns:
+        The name the view was declared under, which is what the key layout namespaces with.
+
+    Raises:
+        TypeError: If the argument is not a declared view class.
+    """
+    if not (isinstance(view, type) and issubclass(view, FeatureView)) or view is FeatureView:
+        raise TypeError(f"expected a declared feature view such as UserClicks, got {view!r}")
+    return view.__feather_view__.name
 
 
 def _why_not_arrow(entity_df: object) -> str:

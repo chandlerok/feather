@@ -18,8 +18,8 @@ use arrow::array::ArrayRef;
 
 use crate::definitions::FeatureView;
 use crate::error::{Error, Result};
-use crate::key::{freshness_field, value_field};
-use crate::value::{SchemaTag, decode_batch};
+use crate::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
+use crate::value::{SchemaTag, decode_batch, encode_batch};
 
 /// One field of a write: its value, and when it stops being readable.
 ///
@@ -60,6 +60,43 @@ impl WrittenField {
     }
 }
 
+/// The precondition a guarded write carries: land only if nothing fresher is already there.
+///
+/// A view's freshness field, `f:{view}`, is the newest event timestamp any write has recorded
+/// for that view and entity. Comparing the timestamp a write is claiming against it is what
+/// makes a refresh and a push composable: a refresh recomputes from a source that may lag, and
+/// without the comparison it would overwrite a value that is newer than anything the source
+/// holds. The same comparison is what makes a push safe to retry, since a repeat of the same
+/// push is refused rather than rewriting a byte-identical value.
+///
+/// The guard is on the whole batch rather than on each field because the thing being compared
+/// is per view and entity, which is the unit a batch is written at. A batch without one always
+/// lands, which is what the project registry and a first write need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessGuard {
+    /// The freshness field to compare, which is `f:{view}`.
+    pub field: String,
+    /// The event timestamp this write is claiming, in microseconds since the epoch.
+    pub event_micros: i64,
+}
+
+impl FreshnessGuard {
+    /// A guard on one view's freshness, for a write claiming `event_micros`.
+    ///
+    /// Args:
+    ///     view: The view whose freshness is being guarded.
+    ///     event_micros: The event timestamp the write is claiming.
+    ///
+    /// Returns:
+    ///     The guard.
+    pub fn for_view(view: &str, event_micros: i64) -> Self {
+        Self {
+            field: freshness_field(view),
+            event_micros,
+        }
+    }
+}
+
 /// One write: a hash key and the fields to set in it.
 ///
 /// "Set" rather than "insert", because a field already in the hash is overwritten. That is
@@ -68,6 +105,48 @@ impl WrittenField {
 pub struct WriteBatch {
     pub key: Vec<u8>,
     pub fields: Vec<WrittenField>,
+    /// The condition this write has to beat, or `None` to write unconditionally.
+    pub guard: Option<FreshnessGuard>,
+}
+
+impl WriteBatch {
+    /// A write that lands whenever it is issued.
+    ///
+    /// Args:
+    ///     key: The hash key.
+    ///     fields: The fields to set in it. Fields not named are left alone.
+    ///
+    /// Returns:
+    ///     The batch.
+    pub fn new(key: Vec<u8>, fields: Vec<WrittenField>) -> Self {
+        Self {
+            key,
+            fields,
+            guard: None,
+        }
+    }
+
+    /// A write that lands only if nothing fresher is already recorded.
+    ///
+    /// Args:
+    ///     key: The hash key.
+    ///     fields: The fields to set in it. Fields not named are left alone.
+    ///     guard: The condition to beat, from [`FreshnessGuard::for_view`].
+    ///
+    /// Returns:
+    ///     The batch.
+    pub fn guarded(key: Vec<u8>, fields: Vec<WrittenField>, guard: FreshnessGuard) -> Self {
+        Self {
+            key,
+            fields,
+            guard: Some(guard),
+        }
+    }
+
+    /// Whether this write has to beat a recorded freshness.
+    pub const fn is_guarded(&self) -> bool {
+        self.guard.is_some()
+    }
 }
 
 /// One `HMGET`: a hash key and the fields to read from it.
@@ -87,7 +166,17 @@ pub trait OnlineStore {
     /// A field may carry an absolute expiry. A store that cannot honour one writes the value
     /// anyway: the read-time TTL check in [`read_entities`] is what decides whether a value is
     /// served, so an unexpired leftover costs reclamation and never correctness.
-    async fn write(&mut self, batches: &[WriteBatch]) -> Result<()>;
+    ///
+    /// A batch carrying a [`FreshnessGuard`] lands only if the guard's field is absent or holds
+    /// an older timestamp, and the store has to decide that atomically with the write: a guard
+    /// read and then written is a lost update, which is the one failure the guard exists to
+    /// prevent. A store that cannot do this cannot honour the guard, and says so rather than
+    /// writing anyway.
+    ///
+    /// Returns:
+    ///     One entry per batch, in the order given, saying whether it landed. A refused batch
+    ///     wrote nothing, and a batch without a guard always lands.
+    async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>>;
 
     /// Read fields from hashes, one `HMGET` per request, in request order.
     ///
@@ -353,6 +442,92 @@ pub async fn read_entities<S: OnlineStore>(
     Ok(out)
 }
 
+/// Write one entity's whole vector for one view into the online store.
+///
+/// A push is the write a refresh would have made later, for one entity, by a caller that
+/// already holds the values. It covers a view in full rather than a subset of it, and that is
+/// what keeps it one atomic write: a view's features share a single field, so a partial write
+/// would be a read-modify-write of that field, and a read-modify-write races the refresh
+/// writing the same field. A caller holding a subset reads the stored vector, patches it, and
+/// pushes the whole result, which is the same two round trips it would have cost anyway.
+///
+/// The write is guarded on [`FreshnessGuard`], so a push is refused rather than overwriting
+/// something newer, and a refresh reaching the same entity with an older event timestamp is
+/// refused in turn. The source stays the authority over everything it has actually seen, and a
+/// push is the authority for the window before the source catches up.
+///
+/// Only the online store is written. A pushed value is therefore not in the training data until
+/// a refresh of the same source reaches it, which is a training-serving skew for a feature that
+/// is only ever pushed. Closing that would mean appending to the offline side as well, and the
+/// appendable source and its point-in-time correctness case are not built.
+///
+/// Args:
+///     store: The store to write to.
+///     project: The project name, which namespaces the key.
+///     view: The view being pushed. Its features in declaration order are `columns`.
+///     entity_component: The entity's join-key value, as
+///         [`crate::key::entity_key_component`] produces it.
+///     columns: One single-value column per declared feature, in declaration order.
+///     event_micros: The event timestamp these values describe, in microseconds since the
+///         epoch.
+///
+/// Returns:
+///     `true` if the values were written, and `false` if something newer was already recorded.
+///
+/// Raises:
+///     Error: If the view declares no single entity, or `columns` is not one column per
+///         declared feature, or a column's type is not the one its feature declares.
+pub async fn push_record<S: OnlineStore>(
+    store: &mut S,
+    project: &str,
+    view: &FeatureView,
+    entity_component: &[u8],
+    columns: &[ArrayRef],
+    event_micros: i64,
+) -> Result<bool> {
+    let entity = view.entity()?;
+    // One row is asked for, so this is a single whole-vector encode: the same blob, in the same
+    // layout, with the same schema tag, that a refresh would have written for this entity.
+    let encoded = encode_batch(&view.features, columns, 0..1)?;
+    let blob = encoded
+        .row(0)
+        .map(<[u8]>::to_vec)
+        .ok_or(Error::RowOutOfRange {
+            row: 0,
+            len: encoded.len(),
+        })?;
+
+    let key = entity_hash_key(
+        project,
+        &entity.name,
+        &encode_entity_key(&[entity_component])?,
+    );
+    let fields = vec![
+        WrittenField::new(
+            value_field(&view.name),
+            blob,
+            value_expiry_unix_secs(view, event_micros),
+        ),
+        // The freshness field is deliberately left unexpired, for the same reason a refresh
+        // leaves it unexpired: reclaiming it would collapse `expired` and `never written`,
+        // which the read path keeps apart.
+        WrittenField::new(
+            freshness_field(&view.name),
+            encode_freshness(event_micros),
+            None,
+        ),
+    ];
+
+    let mut applied = store
+        .write(&[WriteBatch::guarded(
+            key,
+            fields,
+            FreshnessGuard::for_view(&view.name, event_micros),
+        )])
+        .await?;
+    Ok(applied.pop().unwrap_or(false))
+}
+
 /// v1 supports exactly one entity per view, and a single request must resolve to a
 /// single entity name because that name is part of the hash key.
 fn shared_entity_name<'a>(
@@ -381,12 +556,40 @@ fn shared_entity_name<'a>(
     })
 }
 
-fn read_micros(bytes: &[u8]) -> Result<i64> {
+/// Read back a freshness timestamp the way [`encode_freshness`] writes one.
+///
+/// The inverse of that function, and the reason a store can compare a guarded write's claim
+/// against what it already holds. It is crate-visible rather than public because nothing
+/// outside the crate decodes a freshness field, and a store that does is a server-side script
+/// rather than Rust.
+pub(crate) fn read_micros(bytes: &[u8]) -> Result<i64> {
     let array: [u8; 8] = bytes.try_into().map_err(|_| Error::MalformedValue {
         field: "freshness".to_owned(),
         reason: format!("expected 8 bytes, got {}", bytes.len()),
     })?;
     Ok(i64::from_le_bytes(array))
+}
+
+/// The instant a value stops being reclaimable by the server, in Unix seconds.
+///
+/// Measured from the winning row's event timestamp rather than from the time of the write. A
+/// 40-day-old value under a 30-day TTL has already expired, and an expiry measured from the
+/// write would give it another 30 days of life; the read-time check would then disagree with
+/// what the server holds. `None` for a view that declares no TTL.
+///
+/// Rounded up, so rounding is not what makes the server reclaim a field while the read-time
+/// check would still call it fresh. Rounding down opens a window just under a second wide where
+/// a value the read path would have served is already gone, which reports it as never written
+/// instead. The two sides read different clocks — the server's, against this absolute instant,
+/// and the caller's `now`, against the recorded freshness — so a skew between them is the one
+/// way left for the server to reclaim early, and no rounding direction can cover it.
+pub(crate) fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
+    let ttl_days = view.ttl_days?;
+    // Rounded up rather than down. `i64::div_ceil` is still unstable in this toolchain, so the
+    // half second of arithmetic is spelled out rather than imported behind a feature gate.
+    let remainder = event_micros.rem_euclid(1_000_000) != 0;
+    let seconds = event_micros.div_euclid(1_000_000) + i64::from(remainder);
+    Some(seconds + i64::from(ttl_days) * 86_400)
 }
 
 /// Encode a freshness timestamp the way the read path expects it.
@@ -449,6 +652,9 @@ mod tests {
 
     /// `seed` and `request` take the join key value and encode it, so the hash a fixture writes
     /// and the hash a read looks up cannot be spelled differently.
+    ///
+    /// Guarded, like every other writer: a fixture that wrote unconditionally would let a later
+    /// stale write land, and the guard is exactly what the push tests are here to pin.
     async fn seed(
         store: &mut MemoryStore,
         project: &str,
@@ -459,9 +665,9 @@ mod tests {
     ) {
         let key = crate::key::entity_hash_key(project, "user_id", &encoded_key(entity));
         store
-            .write(&[WriteBatch {
+            .write(&[WriteBatch::guarded(
                 key,
-                fields: vec![
+                vec![
                     WrittenField::new(value_field(&view.name), encoded_vector(view, value), None),
                     WrittenField::new(
                         freshness_field(&view.name),
@@ -469,9 +675,198 @@ mod tests {
                         None,
                     ),
                 ],
-            }])
+                FreshnessGuard::for_view(&view.name, freshness),
+            )])
             .await
             .unwrap();
+    }
+
+    /// One single-value column per declared feature, which is the shape a push is given.
+    fn columns(values: &[i64]) -> Vec<ArrayRef> {
+        values
+            .iter()
+            .map(|value| Arc::new(Int64Array::from(vec![*value])) as ArrayRef)
+            .collect()
+    }
+
+    /// Push one entity's vector, and report what the guard decided.
+    async fn push(
+        store: &mut MemoryStore,
+        project: &str,
+        view: &FeatureView,
+        entity: &str,
+        value: i64,
+        event_micros: i64,
+    ) -> bool {
+        push_record(
+            store,
+            project,
+            view,
+            entity.as_bytes(),
+            &columns(&[value]),
+            event_micros,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_push_is_read_back_by_the_serving_read() {
+        let views = views(&[("clicks", Some(30))]);
+        let view = views.get("clicks").unwrap();
+        let mut store = MemoryStore::new();
+
+        assert!(push(&mut store, "ads", view, "u1", 99, NOW).await);
+
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "u1")], NOW)
+            .await
+            .unwrap();
+        match &out[0][0] {
+            ViewValues::Present {
+                columns,
+                freshness_micros,
+            } => {
+                assert_eq!(*freshness_micros, NOW);
+                assert_eq!(
+                    columns[0]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    99
+                );
+            }
+            other => panic!("expected Present, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_writes_the_expiry_the_ttl_asks_for() {
+        let views = views(&[("clicks", Some(30))]);
+        let view = views.get("clicks").unwrap();
+        let mut store = MemoryStore::new();
+        push(&mut store, "ads", view, "u1", 1, NOW).await;
+
+        let key = crate::key::entity_hash_key("ads", "user_id", &encoded_key("u1"));
+        // Thirty days after the event, not thirty days after the write, so an old push does not
+        // buy itself another lease.
+        let expected = value_expiry_unix_secs(view, NOW);
+        assert_eq!(store.field_expiry(&key, &value_field("clicks")), expected);
+    }
+
+    #[tokio::test]
+    async fn a_push_at_the_stored_timestamp_is_refused() {
+        let views = views(&[("clicks", Some(30))]);
+        let view = views.get("clicks").unwrap();
+        let mut store = MemoryStore::new();
+        seed(&mut store, "ads", view, "u1", 1, NOW).await;
+
+        // The same claim a second time, so a retry of a push that already landed writes nothing.
+        assert!(!push(&mut store, "ads", view, "u1", 2, NOW).await);
+
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "u1")], NOW)
+            .await
+            .unwrap();
+        match &out[0][0] {
+            ViewValues::Present { columns, .. } => assert_eq!(
+                columns[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            ),
+            other => panic!("expected Present, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_older_than_what_is_stored_is_refused() {
+        let views = views(&[("clicks", Some(30))]);
+        let view = views.get("clicks").unwrap();
+        let mut store = MemoryStore::new();
+        seed(&mut store, "ads", view, "u1", 1, NOW).await;
+
+        // A producer replaying an old event, which is what a lagging source looks like from here.
+        assert!(!push(&mut store, "ads", view, "u1", 2, NOW - 1_000).await);
+    }
+
+    #[tokio::test]
+    async fn a_push_newer_than_what_is_stored_lands() {
+        let views = views(&[("clicks", Some(30))]);
+        let view = views.get("clicks").unwrap();
+        let mut store = MemoryStore::new();
+        seed(&mut store, "ads", view, "u1", 1, NOW).await;
+
+        assert!(push(&mut store, "ads", view, "u1", 2, NOW + 1_000).await);
+
+        let out = read_entities(&store, "ads", &views, &[request("clicks", "u1")], NOW)
+            .await
+            .unwrap();
+        match &out[0][0] {
+            ViewValues::Present { columns, .. } => assert_eq!(
+                columns[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                2
+            ),
+            other => panic!("expected Present, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_only_touches_its_own_views_fields() {
+        // One hash holds every view of an entity, so a push writing one view must leave the
+        // others alone. That is what `OnlineStore::write` promising to leave unmentioned fields
+        // alone is for, and a guard that failed to check before writing would break it.
+        let views = views(&[("a", Some(30)), ("b", Some(30))]);
+        let mut store = MemoryStore::new();
+        seed(&mut store, "ads", views.get("a").unwrap(), "u1", 1, NOW).await;
+        seed(&mut store, "ads", views.get("b").unwrap(), "u1", 2, NOW).await;
+
+        assert!(
+            push(
+                &mut store,
+                "ads",
+                views.get("a").unwrap(),
+                "u1",
+                3,
+                NOW + 1_000
+            )
+            .await
+        );
+
+        for (name, expected) in [("a", 3), ("b", 2)] {
+            let out = read_entities(
+                &store,
+                "ads",
+                &views,
+                &[EntityRequest {
+                    encoded_key: encoded_key("u1"),
+                    views: vec![ViewRequest {
+                        view: name.to_owned(),
+                        fields: vec!["count".to_owned()],
+                    }],
+                }],
+                NOW,
+            )
+            .await
+            .unwrap();
+            match &out[0][0] {
+                ViewValues::Present { columns, .. } => assert_eq!(
+                    columns[0]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    expected,
+                    "view {name}"
+                ),
+                other => panic!("expected Present for {name}, got {other:?}"),
+            }
+        }
     }
 
     fn request(view_name: &str, entity: &str) -> EntityRequest {
@@ -569,7 +964,7 @@ mod tests {
     }
 
     impl OnlineStore for CountingStore {
-        async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+        async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>> {
             self.inner.write(batches).await
         }
 
@@ -656,23 +1051,23 @@ mod tests {
         for entity in ["u1", "u2"] {
             let key = crate::key::entity_hash_key("ads", "user_id", &encoded_key(entity));
             store
-                .write(&[WriteBatch {
-                    key: key.clone(),
-                    fields: vec![WrittenField::new(
+                .write(&[WriteBatch::new(
+                    key.clone(),
+                    vec![WrittenField::new(
                         crate::key::value_field("clicks"),
                         vec![1],
                         None,
                     )],
-                }])
+                )])
                 .await
                 .unwrap();
             keys.push(key);
         }
         store
-            .write(&[WriteBatch {
-                key: registry.clone(),
-                fields: vec![WrittenField::new("clicks", vec![2], None)],
-            }])
+            .write(&[WriteBatch::new(
+                registry.clone(),
+                vec![WrittenField::new("clicks", vec![2], None)],
+            )])
             .await
             .unwrap();
 

@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch};
+use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, read_micros};
 use crate::error::Result;
 
 /// One field's bytes and the expiry the write asked for.
@@ -111,8 +111,26 @@ impl MemoryStore {
 }
 
 impl OnlineStore for MemoryStore {
-    async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+    async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>> {
+        let mut applied = Vec::with_capacity(batches.len());
         for batch in batches {
+            // A guard is decided here, against this store's own map, which is what makes it
+            // atomic here: nothing else can write between the comparison and the merge below,
+            // because both happen under the one `&mut self` the call already holds. The server
+            // has to earn the same property with a script.
+            if let Some(guard) = &batch.guard {
+                let stored = self
+                    .hashes
+                    .get(batch.key.as_slice())
+                    .and_then(|fields| fields.get(&guard.field))
+                    .map(read_micros)
+                    .transpose()?;
+                if stored.is_some_and(|recorded| recorded >= guard.event_micros) {
+                    applied.push(false);
+                    continue;
+                }
+            }
+
             // Taken out and put back so the fields can be re-sorted in place: one merge per
             // batch, not one per field. A batch names one entity but may carry only some of that
             // entity's fields, which is what `materialize` does when it writes one batch per row
@@ -143,8 +161,9 @@ impl OnlineStore for MemoryStore {
                     entries: entries.into_boxed_slice(),
                 },
             );
+            applied.push(true);
         }
-        Ok(())
+        Ok(applied)
     }
 
     async fn read(&self, requests: &[ReadRequest]) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
@@ -231,23 +250,23 @@ mod tests {
         let mut store = MemoryStore::new();
 
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: vec![WrittenField::new(
+            .write(&[WriteBatch::new(
+                key.clone(),
+                vec![WrittenField::new(
                     "v:clicks",
                     b"one".to_vec(),
                     Some(1_700_000_000),
                 )],
-            }])
+            )])
             .await
             .expect("a write with an expiry");
         assert_eq!(store.field_expiry(&key, "v:clicks"), Some(1_700_000_000));
 
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: vec![WrittenField::new("v:clicks", b"two".to_vec(), None)],
-            }])
+            .write(&[WriteBatch::new(
+                key.clone(),
+                vec![WrittenField::new("v:clicks", b"two".to_vec(), None)],
+            )])
             .await
             .expect("a write with no expiry");
 
@@ -272,20 +291,20 @@ mod tests {
         let mut store = MemoryStore::new();
 
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: vec![
+            .write(&[WriteBatch::new(
+                key.clone(),
+                vec![
                     WrittenField::new("v:zeta", b"z".to_vec(), None),
                     WrittenField::new("v:alpha", b"a".to_vec(), None),
                 ],
-            }])
+            )])
             .await
             .expect("a write out of order");
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: vec![WrittenField::new("v:zeta", b"z2".to_vec(), None)],
-            }])
+            .write(&[WriteBatch::new(
+                key.clone(),
+                vec![WrittenField::new("v:zeta", b"z2".to_vec(), None)],
+            )])
             .await
             .expect("a second write");
 
@@ -309,10 +328,7 @@ mod tests {
         let mut store = MemoryStore::new();
 
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: Vec::new(),
-            }])
+            .write(&[WriteBatch::new(key.clone(), Vec::new())])
             .await
             .expect("a write with no fields");
 
@@ -331,13 +347,13 @@ mod tests {
         let mut store = MemoryStore::new();
 
         store
-            .write(&[WriteBatch {
-                key: key.clone(),
-                fields: vec![
+            .write(&[WriteBatch::new(
+                key.clone(),
+                vec![
                     WrittenField::new("v:clicks", b"one".to_vec(), None),
                     WrittenField::new("v:views", b"two".to_vec(), None),
                 ],
-            }])
+            )])
             .await
             .expect("a two-field write");
 

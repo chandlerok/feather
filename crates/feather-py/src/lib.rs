@@ -15,7 +15,7 @@
 //! decision it makes is re-checked by the core.
 
 use feather_core::Error as CoreError;
-use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyValueError};
+use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
 mod demo;
@@ -23,7 +23,7 @@ mod demo;
 #[cfg(feature = "offline")]
 use std::collections::{BTreeMap, HashMap};
 #[cfg(feature = "offline")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "offline")]
 use arrow::array::new_null_array;
@@ -47,6 +47,7 @@ use feather_core::online::valkey::ValkeyStore;
 #[cfg(feature = "offline")]
 use feather_core::online::{
     EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues, WriteBatch,
+    push_record,
 };
 #[cfg(feature = "offline")]
 use feather_core::settings::Valkey as ValkeySettings;
@@ -55,6 +56,181 @@ use feather_core::{
     Definitions, FeatureView, JoinOptions, Limits, OfflineEngine, OnMissing, entity_key_component,
     materialize as materialize_project, read_entities, value,
 };
+
+/// One single-value Arrow column per declared feature, in declaration order.
+///
+/// A push writes a whole view's vector, so the columns are the view's features in its own order
+/// and the names have already been resolved: a value under a name the view does not declare, or
+/// a declared feature with no value, is an error here rather than a short vector the codec would
+/// reject with a message that does not name the view.
+///
+/// A value may be `None`, which encodes as a null. That is how a push states that a feature has
+/// no value for this entity, which is different from leaving it out of the vector.
+///
+/// Args:
+///     fields: The view's declared features, in order.
+///     values: The caller's values, by feature name.
+///
+/// Returns:
+///     One one-row column per declared feature, in declaration order.
+///
+/// Raises:
+///     ValueError: If a declared feature has no value, or a value names a feature the view does
+///         not declare.
+///     TypeError: If a value is not the type its feature declares.
+#[cfg(feature = "offline")]
+fn push_columns(
+    py: Python<'_>,
+    fields: &[feather_core::Field],
+    values: &HashMap<String, Py<PyAny>>,
+) -> PyResult<Vec<ArrayRef>> {
+    for name in values.keys() {
+        if !fields.iter().any(|field| &field.name == name) {
+            return Err(PyValueError::new_err(format!(
+                "`{name}` is not a feature of this view; a push writes the view in full, so its \
+             values are {}",
+                fields
+                    .iter()
+                    .map(|field| format!("`{}`", field.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
+
+    let mut columns = Vec::with_capacity(fields.len());
+    for field in fields {
+        let value = values.get(&field.name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "`{}` has no value; a push writes the view in full, and a subset would mean \
+             reading the stored vector and writing it back, which races a refresh",
+                field.name
+            ))
+        })?;
+        columns.push(push_column(py, field, value)?);
+    }
+    Ok(columns)
+}
+
+/// The entity's join-key component, encoded the way the read path encodes it.
+///
+/// A push names the entity as a single value rather than through a frame, so the conversion
+/// goes through the core's own encoder instead of spelling the rule out here: an integer is its
+/// decimal form and a string is its UTF-8 bytes, and a value written under a key built any
+/// other way is a value no later read can find. That is why this builds a one-row column and
+/// calls `entity_key_component`, rather than converting the Python value directly.
+///
+/// v1 keys one hash per entity, so the view declares exactly one join key and the caller's map
+/// has to hold that key and nothing else. A float is refused rather than truncated, because a
+/// truncated join key addresses an entity that does not exist.
+///
+/// Args:
+///     py: The calling thread's token, which the extraction needs.
+///     join_key: The join key the view's entity declares.
+///     entity_key: The caller's entity, by join key.
+///
+/// Returns:
+///     The component's bytes, ready for the core's key encoder.
+///
+/// Raises:
+///     ValueError: If the map does not hold exactly the declared join key.
+///     TypeError: If the value is neither an integer nor a string.
+#[cfg(feature = "offline")]
+fn push_entity_key(
+    py: Python<'_>,
+    join_key: &str,
+    entity_key: &HashMap<String, Py<PyAny>>,
+) -> PyResult<Vec<u8>> {
+    if entity_key.len() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "one push names one entity, so its join key map holds `{join_key}` and nothing else; \
+         it was given {}",
+            entity_key.len()
+        )));
+    }
+    let value = entity_key
+        .get(join_key)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "the join key map has no `{join_key}`, which is the key this view is keyed on"
+            ))
+        })?
+        .bind(py);
+
+    let column: ArrayRef = if let Ok(integer) = value.extract::<i64>() {
+        Arc::new(Int64Array::from(vec![integer]))
+    } else if let Ok(text) = value.extract::<String>() {
+        Arc::new(arrow::array::StringArray::from(vec![text]))
+    } else {
+        return Err(PyTypeError::new_err(format!(
+            "`{join_key}` is {}, and an entity key is an integer or a string",
+            value.get_type().name()?
+        )));
+    };
+    entity_key_component(column.as_ref(), 0).map_err(core_error)
+}
+
+/// One single-value Arrow column for a declared feature, from the caller's Python value.
+///
+/// The declared dtype picks the Arrow type and the extraction, so a value of the wrong type is
+/// a `TypeError` naming it rather than a column the encoder rejects with a message about a
+/// declared type. A `None` is a null, which is a value the push states rather than a gap in
+/// what it was given.
+///
+/// Args:
+///     py: The calling thread's token, which the extraction needs.
+///     field: The feature the value is for.
+///     value: The caller's value, by name.
+///
+/// Returns:
+///     A one-row column of the type `field.dtype` maps to.
+///
+/// Raises:
+///     TypeError: If the value is not the type its feature declares.
+#[cfg(feature = "offline")]
+fn push_column(
+    py: Python<'_>,
+    field: &feather_core::Field,
+    value: &Py<PyAny>,
+) -> PyResult<ArrayRef> {
+    use arrow::array::{BooleanArray, Float64Array, StringArray, TimestampMicrosecondArray};
+    use feather_core::DType;
+
+    // Read before the type is looked at, because `None` has no type to check against.
+    if value.is_none(py) {
+        return Ok(new_null_array(&value::arrow_type(field.dtype), 1));
+    }
+
+    // Each arm is the exact array the codec downcasts to for that dtype, and `arrow_type` is
+    // what the codec compares the column against, so a `TimestampMicros` feature needs a
+    // timestamp array rather than the integer one an `Int64` feature needs. Bound to a typed
+    // local rather than returned from the match, so the coercion to `ArrayRef` is stated.
+    let array: ArrayRef = match field.dtype {
+        DType::Int64 => {
+            let row = value.extract::<i64>(py)?;
+            Arc::new(Int64Array::from(vec![row]))
+        }
+        DType::TimestampMicros => {
+            let row = value.extract::<i64>(py)?;
+            Arc::new(TimestampMicrosecondArray::from(vec![row]))
+        }
+        DType::Float64 => {
+            let row = value.extract::<f64>(py)?;
+            Arc::new(Float64Array::from(vec![row]))
+        }
+        DType::Boolean => {
+            let row = value.extract::<bool>(py)?;
+            Arc::new(BooleanArray::from(vec![row]))
+        }
+        DType::Utf8 => {
+            let row = value.extract::<String>(py)?;
+            // `&str` rather than the owned `String`, which is the form `encode_vector` in
+            // `tests/valkey_integration.rs` already builds.
+            Arc::new(StringArray::from(vec![row.as_str()]))
+        }
+    };
+    Ok(array)
+}
 
 /// Read and validate a `feather.toml`, returned as JSON.
 ///
@@ -174,7 +350,7 @@ enum Online {
 
 #[cfg(feature = "offline")]
 impl OnlineStore for Online {
-    async fn write(&mut self, batches: &[WriteBatch]) -> feather_core::Result<()> {
+    async fn write(&mut self, batches: &[WriteBatch]) -> feather_core::Result<Vec<bool>> {
         match self {
             Online::Memory(store) => store.write(batches).await,
             #[cfg(feature = "valkey")]
@@ -639,13 +815,89 @@ impl FeatureStore {
                 .map(|view| ViewRefresh {
                     name: view.name,
                     rows: view.rows,
+                    rows_refused: view.rows_refused,
                     max_event_timestamp_micros: view.max_event_timestamp_micros,
                     elapsed_seconds: view.elapsed.as_secs_f64(),
                 })
                 .collect(),
             retired: report.retired,
             total_rows: report.total_rows,
+            total_rows_refused: report.total_rows_refused,
             elapsed_seconds: report.elapsed.as_secs_f64(),
+        })
+    }
+
+    /// Write one entity's whole vector for one view into the online store.
+    ///
+    /// A push is the write a refresh would have made later, for one entity, from a caller that
+    /// already holds the values. `values` has to cover the view in full: a view's features
+    /// share one stored field, so writing a subset would be a read-modify-write of that field
+    /// and would race the refresh writing the same field.
+    ///
+    /// Args:
+    ///     view: The view to write, by its declared name.
+    ///     entity_key: The entity's join-key value. v1 keys one hash per entity, so this is one
+    ///         value, under the name the view's entity declares.
+    ///     values: One value per declared feature, by name, in any order. A feature left out or
+    ///         named that the view does not declare is an error rather than a partial write.
+    ///     event_timestamp: The event timestamp these values describe, in microseconds since
+    ///         the epoch.
+    ///
+    /// Returns:
+    ///     `true` if the values were written, and `false` if something newer was already
+    ///     recorded for this entity and view, in which case nothing was written.
+    ///
+    /// Raises:
+    ///     TypeError: If a value is not the type its feature declares, or the join key is
+    ///         neither an integer nor a string.
+    ///     ValueError: If the view is not declared, or `values` does not cover it exactly.
+    ///     ConnectionError: If the settings declare a Valkey that cannot be reached.
+    ///     OSError: If another thread panicked while holding this store.
+    #[pyo3(signature = (view, entity_key, values, event_timestamp))]
+    fn push(
+        &self,
+        py: Python<'_>,
+        view: &str,
+        entity_key: HashMap<String, Py<PyAny>>,
+        values: HashMap<String, Py<PyAny>>,
+        event_timestamp: i64,
+    ) -> PyResult<bool> {
+        // Three steps, because `Python` is `!Send` and `with_inner` needs a `Send` closure.
+        // Resolving the view takes the lock and returns an owned copy, so the conversion runs
+        // with the GIL held and the store lock free, and the write takes the lock again with
+        // the GIL released. That is the order the lock wants anyway: the conversion is Python
+        // work with no I/O in it, and the write is one store round trip that should not hold
+        // the GIL.
+        let view = self.with_inner(py, |inner| {
+            Ok(inner.definitions.view(view).map_err(core_error)?.clone())
+        })?;
+
+        let entity = view.entity().map_err(core_error)?;
+        let join_key = entity.join_key.clone();
+        let columns = push_columns(py, &view.features, &values)?;
+        let component = push_entity_key(py, &join_key, &entity_key)?;
+
+        self.with_inner(py, |inner| {
+            open_online(inner)?;
+            let Inner {
+                runtime,
+                online,
+                project,
+                ..
+            } = &mut *inner;
+            let store = online
+                .as_mut()
+                .expect("open_online leaves a store in place");
+            runtime
+                .block_on(push_record(
+                    store,
+                    project,
+                    &view,
+                    &component,
+                    &columns,
+                    event_timestamp,
+                ))
+                .map_err(core_error)
         })
     }
 
@@ -847,9 +1099,14 @@ struct ViewRefresh {
     /// The view's name, as declared.
     #[pyo3(get)]
     name: String,
-    /// Entity rows written, which is one store write per entity.
+    /// Entity rows written, which is one store write per entity. A row whose write was refused
+    /// is not in this count; see `rows_refused`.
     #[pyo3(get)]
     rows: u64,
+    /// Entity rows the store refused because something newer was already recorded, which is a
+    /// refresh of a source that lags a push rather than a failure.
+    #[pyo3(get)]
+    rows_refused: u64,
     /// The newest event timestamp any written row carried, in microseconds since the epoch, or
     /// `None` when the refresh wrote nothing.
     #[pyo3(get)]
@@ -873,6 +1130,9 @@ struct MaterializeReport {
     /// Rows written across every refreshed view.
     #[pyo3(get)]
     total_rows: u64,
+    /// Rows refused across every refreshed view, because something newer was already recorded.
+    #[pyo3(get)]
+    total_rows_refused: u64,
     /// How long the whole call took.
     #[pyo3(get)]
     elapsed_seconds: f64,

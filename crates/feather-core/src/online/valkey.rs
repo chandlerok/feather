@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use redis::RedisResult;
 use redis::aio::ConnectionManager;
 
-use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, WrittenField};
+use super::{OnlineStore, ProjectScan, ReadRequest, WriteBatch, WrittenField, encode_freshness};
 use crate::error::Result;
 
 /// Commands per pipeline flush. Large enough to amortise the round trip, small
@@ -127,15 +127,52 @@ impl ValkeyStore {
 }
 
 impl OnlineStore for ValkeyStore {
-    async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+    async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>> {
+        let mut applied = vec![false; batches.len()];
+        let mut offset = 0;
         for group in batches.chunks(self.chunk) {
-            let mut pipeline = redis::pipe();
-            for batch in group {
-                queue_write(&mut pipeline, batch, self.field_expiry);
+            // Guarded and unguarded writes go down two pipelines rather than one, so that a
+            // reply is attributable to a batch by position. A refresh writes only guarded
+            // batches and the project registry is the only unguarded write, so one of the two
+            // is empty in practice and this costs a single round trip either way.
+            let mut guarded: Vec<usize> = Vec::new();
+            let mut plain: Vec<usize> = Vec::new();
+            for (at, batch) in group.iter().enumerate() {
+                if batch.is_guarded() {
+                    guarded.push(at);
+                } else {
+                    plain.push(at);
+                }
             }
-            let _: redis::Value = pipeline.query_async(&mut self.connection).await?;
+
+            if !plain.is_empty() {
+                let mut pipeline = redis::pipe();
+                for at in &plain {
+                    queue_write(&mut pipeline, &group[*at], self.field_expiry);
+                }
+                let _: redis::Value = pipeline.query_async(&mut self.connection).await?;
+                for at in plain {
+                    applied[offset + at] = true;
+                }
+            }
+
+            if !guarded.is_empty() {
+                let mut pipeline = redis::pipe();
+                for at in &guarded {
+                    queue_guarded_write(&mut pipeline, &group[*at], self.field_expiry);
+                }
+                // The script answers 1 for a write it made and 0 for one the guard refused, and
+                // it is the only command in this pipeline, so the replies line up with the
+                // guarded batches in order.
+                let replies: Vec<i64> = pipeline.query_async(&mut self.connection).await?;
+                for (at, reply) in guarded.iter().zip(replies) {
+                    applied[offset + at] = reply != 0;
+                }
+            }
+
+            offset += group.len();
         }
-        Ok(())
+        Ok(applied)
     }
 
     async fn read(&self, requests: &[ReadRequest]) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
@@ -175,6 +212,120 @@ impl OnlineStore for ValkeyStore {
         Ok(())
     }
 }
+
+/// Queue the commands that write one batch, guarded or not.
+///
+/// A guarded batch goes down as a single [`GUARDED_WRITE_SCRIPT`] evaluation, because the
+/// freshness comparison and the write have to be one step. Reading the field first and then
+/// writing is a lost update, which is the one failure the guard exists to prevent, and a
+/// pipeline does not prevent it: `redis::pipe()` batches commands into one write without
+/// wrapping them in `MULTI`/`EXEC`, so another connection can write between the read and the
+/// write. A script is atomic, so the check and the write cannot be interleaved with anything.
+///
+/// `EVAL` rather than `EVALSHA` because the difference is a lookup: the server keys its
+/// compiled-script cache by the body's SHA-1, which `EVAL` computes, so a repeated body is
+/// served from that cache and `EVALSHA` only saves the computation. That is not worth a script
+/// load on connect, a `NOSCRIPT` recovery path, and a retry of the whole chunk.
+fn queue_guarded_write(pipeline: &mut redis::Pipeline, batch: &WriteBatch, expiry: FieldExpiry) {
+    let Some(guard) = &batch.guard else {
+        queue_write(pipeline, batch, expiry);
+        return;
+    };
+
+    let mut command = redis::cmd("EVAL");
+    command
+        .arg(GUARDED_WRITE_SCRIPT)
+        .arg(1)
+        .arg(&batch.key)
+        .arg(&guard.field)
+        // The claim goes over the wire in the encoding the read path decodes, so the script
+        // compares like for like rather than being handed a second spelling of the timestamp.
+        .arg(encode_freshness(guard.event_micros))
+        .arg(expiry_mode(expiry))
+        .arg(batch.fields.len());
+    for field in &batch.fields {
+        command.arg(&field.name).arg(&field.value);
+        match field.expires_at_unix_secs {
+            Some(at) => {
+                command.arg(at);
+            }
+            // An empty string rather than a sentinel, because a field that never expires and a
+            // field whose expiry the server cannot set take different paths in the script and
+            // both have to be sayable.
+            None => {
+                command.arg("");
+            }
+        }
+    }
+    pipeline.add_command(command);
+}
+
+/// The number the script reads as "how to write a field that carries an expiry".
+const fn expiry_mode(expiry: FieldExpiry) -> usize {
+    match expiry {
+        FieldExpiry::None => 0,
+        FieldExpiry::Expireat => 1,
+        FieldExpiry::Setex => 2,
+    }
+}
+
+/// Write a batch only if nothing fresher is recorded, in one step.
+///
+/// The check and the write are inside the same script, which is what makes the guard atomic.
+/// See [`queue_guarded_write`] for why a pipeline cannot stand in for it.
+const GUARDED_WRITE_SCRIPT: &str = r#"
+local key = KEYS[1]
+local mode = tonumber(ARGV[3])
+local count = tonumber(ARGV[4])
+
+local recorded = redis.call('HMGET', key, ARGV[1])
+local current = recorded and recorded[1]
+-- A freshness field that is absent, or that is not the eight bytes a freshness is written as,
+-- is not something this guard can compare, and the write stands rather than being refused for
+-- good by a value it cannot read. Every writer goes through this script, so a field is either
+-- absent or exactly eight bytes.
+if current and #current == 8 then
+  local refused = true
+  -- Little-endian, so the most significant byte is the last one, and comparing from the back is
+  -- a numeric comparison of non-negative i64. A negative timestamp would compare as its two's
+  -- complement, and no source produces one.
+  for i = 8, 1, -1 do
+    local mine = string.byte(ARGV[2], i)
+    local theirs = string.byte(current, i)
+    if mine ~= theirs then
+      refused = mine < theirs
+      break
+    end
+  end
+  -- Every byte equal leaves `refused` set, so a repeat of the same write is refused rather
+  -- than rewriting bytes the store already holds.
+  if refused then
+    return 0
+  end
+end
+
+local at = 4
+for _ = 1, count do
+  local name = ARGV[at + 1]
+  local value = ARGV[at + 2]
+  local expires_at = ARGV[at + 3]
+  at = at + 3
+  if mode == 2 and expires_at ~= '' then
+    redis.call('HSETEX', key, 'EXAT', expires_at, 'FIELDS', 1, name, value)
+  else
+    -- A plain HSET clears whatever expiry the server holds for that field, which is the
+    -- behaviour `queue_write` documents and the memory store mirrors.
+    redis.call('HSET', key, name, value)
+    if mode == 1 and expires_at ~= '' then
+      -- `HEXPIREAT key unix-time-seconds [NX|XX|GT|LT] FIELDS numfields field`, so the
+      -- timestamp sits between the key and `FIELDS`. The same order `queue_write` uses.
+      redis.call('HEXPIREAT', key, expires_at, 'FIELDS', 1, name)
+    end
+  end
+end
+
+return 1
+"#;
 
 /// Queue the commands that write one batch.
 ///

@@ -41,8 +41,8 @@ pub use offline::{Engine as OfflineEngine, JoinOptions, Limits, OnMissing};
 #[cfg(feature = "valkey")]
 pub use online::valkey::ValkeyStore;
 pub use online::{
-    EntityRequest, Missing, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues,
-    WriteBatch, WrittenField, read_entities,
+    EntityRequest, FreshnessGuard, Missing, OnlineStore, ProjectScan, ReadRequest, ViewRequest,
+    ViewValues, WriteBatch, WrittenField, push_record, read_entities,
 };
 pub use settings::{Connection, Secret, Settings, Valkey, load_settings, parse_settings};
 pub use value::{EncodedBatch, SchemaTag, arrow_type, decode_batch, encode_batch};

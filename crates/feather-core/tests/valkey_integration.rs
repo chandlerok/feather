@@ -19,8 +19,8 @@ use feather_core::definitions::{DType, Entity, FeatureView, Field, Source};
 use feather_core::key::{encode_entity_key, entity_hash_key, freshness_field, value_field};
 use feather_core::online::valkey::FieldExpiry;
 use feather_core::online::{
-    EntityRequest, Missing, OnlineStore, ReadRequest, ViewRequest, ViewValues, WriteBatch,
-    WrittenField, read_entities,
+    EntityRequest, FreshnessGuard, Missing, OnlineStore, ReadRequest, ViewRequest, ViewValues,
+    WriteBatch, WrittenField, push_record, read_entities,
 };
 use feather_core::value::{SchemaTag, encode_batch};
 use feather_core::{Error, Result, ValkeyStore};
@@ -87,13 +87,330 @@ fn encode_vector(view: &FeatureView, count: i64, label: &str) -> Vec<u8> {
 /// own expiry is asserted against the in-memory store and in `materialize.rs`.
 fn write_batch(project: &str, entity: &[u8], fields: Vec<(String, Vec<u8>)>) -> WriteBatch {
     let encoded = encode_entity_key(&[entity]).expect("encode key");
-    WriteBatch {
-        key: entity_hash_key(project, "user_id", &encoded),
-        fields: fields
+    WriteBatch::new(
+        entity_hash_key(project, "user_id", &encoded),
+        fields
             .into_iter()
             .map(|(name, value)| WrittenField::new(name, value, None))
             .collect(),
+    )
+}
+
+/// A guarded write of one view's value and freshness, as `push_record` and a refresh both issue.
+fn guarded_batch(
+    project: &str,
+    view: &FeatureView,
+    entity: &[u8],
+    count: i64,
+    label: &str,
+    event_micros: i64,
+    expires_at_unix_secs: Option<i64>,
+) -> WriteBatch {
+    let encoded = encode_entity_key(&[entity]).expect("encode key");
+    WriteBatch::guarded(
+        entity_hash_key(project, "user_id", &encoded),
+        vec![
+            WrittenField::new(
+                value_field(&view.name),
+                encode_vector(view, count, label),
+                expires_at_unix_secs,
+            ),
+            WrittenField::new(
+                freshness_field(&view.name),
+                event_micros.to_le_bytes().to_vec(),
+                None,
+            ),
+        ],
+        FreshnessGuard::for_view(&view.name, event_micros),
+    )
+}
+
+/// The `count` the store holds for one entity, read back the way the serving read decodes it.
+async fn stored_count(
+    store: &ValkeyStore,
+    project: &str,
+    views: &BTreeMap<String, FeatureView>,
+    entity: &[u8],
+) -> i64 {
+    let encoded = encode_entity_key(&[entity]).expect("encode key");
+    let out = read_entities(
+        store,
+        project,
+        views,
+        &[EntityRequest {
+            encoded_key: encoded,
+            views: vec![ViewRequest {
+                view: "clicks".to_owned(),
+                fields: vec!["count".to_owned()],
+            }],
+        }],
+        now_micros(),
+    )
+    .await
+    .expect("read");
+    match &out[0][0] {
+        ViewValues::Present { columns, .. } => columns[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("an int64 column")
+            .value(0),
+        other => panic!("expected Present, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_guarded_write_lands_when_nothing_is_recorded() -> Result<()> {
+    let project = project("guard-first");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+
+    let applied = store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 42, "gold", 1000, None,
+        )])
+        .await?;
+
+    assert_eq!(
+        applied,
+        vec![true],
+        "the first guarded write has nothing to beat"
+    );
+    assert_eq!(stored_count(&store, &project, &views, b"u1").await, 42);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_guarded_write_is_refused_at_the_same_timestamp() -> Result<()> {
+    // A push retried, or a refresh re-run over unchanged source rows. Refusing is what makes
+    // both safe to repeat.
+    let project = project("guard-equal");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+
+    let first = store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 42, "gold", 1000, None,
+        )])
+        .await?;
+    let second = store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 99, "silver", 1000, None,
+        )])
+        .await?;
+
+    assert_eq!(first, vec![true]);
+    assert_eq!(second, vec![false], "an equal timestamp is not newer");
+    assert_eq!(
+        stored_count(&store, &project, &views, b"u1").await,
+        42,
+        "a refused write leaves the stored value alone"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_guarded_write_is_refused_behind_a_newer_one() -> Result<()> {
+    let project = project("guard-older");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+
+    store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 42, "gold", 2000, None,
+        )])
+        .await?;
+    let applied = store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 99, "silver", 1000, None,
+        )])
+        .await?;
+
+    assert_eq!(applied, vec![false]);
+    assert_eq!(stored_count(&store, &project, &views, b"u1").await, 42);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_guarded_write_lands_ahead_of_an_older_one() -> Result<()> {
+    let project = project("guard-newer");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+
+    store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 42, "gold", 1000, None,
+        )])
+        .await?;
+    let applied = store
+        .write(&[guarded_batch(
+            &project, clicks, b"u1", 99, "silver", 2000, None,
+        )])
+        .await?;
+
+    assert_eq!(applied, vec![true]);
+    assert_eq!(stored_count(&store, &project, &views, b"u1").await, 99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_batch_is_refused_without_holding_up_the_others() -> Result<()> {
+    // A refresh writes one batch per entity, so a single refused row must not cost the whole
+    // write. The replies are positional, which is what the chunked pipeline depends on.
+    let project = project("guard-mixed");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+
+    store
+        .write(&[guarded_batch(&project, clicks, b"u1", 1, "a", 5000, None)])
+        .await?;
+    let applied = store
+        .write(&[
+            guarded_batch(&project, clicks, b"u1", 99, "stale", 1000, None),
+            guarded_batch(&project, clicks, b"u2", 99, "fresh", 6000, None),
+        ])
+        .await?;
+
+    assert_eq!(applied, vec![false, true]);
+    assert_eq!(stored_count(&store, &project, &views, b"u1").await, 1);
+    assert_eq!(stored_count(&store, &project, &views, b"u2").await, 99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_guarded_write_sets_and_clears_the_servers_field_expiry() -> Result<()> {
+    // The script writes a value and its expiry in one step, so it has to agree with
+    // `queue_write` about both halves: set the expiry the write asked for, and let the plain
+    // `HSET` clear it when a later write asks for none.
+    // `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pins the same rule for the
+    // unguarded path, and the two together are what keep the script from being a second,
+    // divergent writer.
+    const TTL_SECS: i64 = 3;
+
+    let project = project("guard-expiry");
+    let views = views(&[("clicks", None)]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+    assert_ne!(
+        store.field_expiry(),
+        FieldExpiry::None,
+        "this test needs a server with hash field expiration"
+    );
+
+    let event = now_micros();
+    let deadline = event / 1_000_000 + TTL_SECS;
+    let rewritten_key = entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?);
+    let control_key = entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u2"])?);
+    store
+        .write(&[
+            guarded_batch(&project, clicks, b"u1", 1, "x", event, Some(deadline)),
+            // The same field with the same expiry on another entity, never rewritten, as the
+            // control the reclaimed field is compared against.
+            guarded_batch(&project, clicks, b"u2", 3, "z", event, Some(deadline)),
+        ])
+        .await?;
+
+    // A guarded rewrite of the same timestamp, this time with no expiry, which is the shape a
+    // view that drops its `ttl_days` produces. The guard lets it through because the timestamp
+    // is not older than what is recorded.
+    let rewritten = encode_vector(clicks, 2, "y");
+    let applied = store
+        .write(&[WriteBatch::guarded(
+            rewritten_key.clone(),
+            vec![WrittenField::new(
+                value_field("clicks"),
+                rewritten.clone(),
+                None,
+            )],
+            FreshnessGuard::for_view("clicks", event),
+        )])
+        .await?;
+    assert_eq!(
+        applied,
+        vec![true],
+        "an equal timestamp still lands a guarded rewrite"
+    );
+
+    let live = store
+        .read(&[
+            ReadRequest {
+                key: rewritten_key.clone(),
+                fields: vec![value_field("clicks")],
+            },
+            ReadRequest {
+                key: control_key.clone(),
+                fields: vec![value_field("clicks")],
+            },
+        ])
+        .await?;
+    assert_eq!(
+        live[0][0].as_deref(),
+        Some(rewritten.as_slice()),
+        "the guarded rewrite lands while the field is still inside its expiry"
+    );
+    assert!(
+        live[1][0].is_some(),
+        "the control is inside its expiry too, so it is still readable here"
+    );
+
+    let remaining = deadline - now_micros() / 1_000_000;
+    std::thread::sleep(Duration::from_secs(remaining.max(0) as u64 + 1));
+
+    let after = store
+        .read(&[
+            ReadRequest {
+                key: rewritten_key,
+                fields: vec![value_field("clicks")],
+            },
+            ReadRequest {
+                key: control_key,
+                fields: vec![value_field("clicks")],
+            },
+        ])
+        .await?;
+    assert!(
+        after[0][0].as_deref() == Some(rewritten.as_slice()),
+        "the rewrite cleared the field's TTL, so it outlives the deadline, got {:?}",
+        after[0][0]
+    );
+    assert!(
+        after[1][0].is_none(),
+        "the control still carries its expiry, so the script asked for one and the server took \
+         it, got {:?}",
+        after[1][0]
+    );
+
+    cleanup(&mut store, &project, clicks, &[b"u1", b"u2"]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_push_through_the_core_lands_and_is_refused_when_stale() -> Result<()> {
+    // The shape the Python surface issues, end to end through the real store.
+    let project = project("push-core");
+    let views = views(&[("clicks", Some(30))]);
+    let clicks = views.get("clicks").unwrap();
+    let mut store = ValkeyStore::connect(&url()).await?;
+    use arrow::array::StringArray;
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![7])),
+        Arc::new(StringArray::from(vec!["gold"])),
+    ];
+
+    let first = push_record(&mut store, &project, clicks, b"u1", &columns, 1000).await?;
+    assert!(first);
+    assert_eq!(stored_count(&store, &project, &views, b"u1").await, 7);
+
+    assert!(!push_record(&mut store, &project, clicks, b"u1", &columns, 1000).await?);
+    assert!(
+        push_record(&mut store, &project, clicks, b"u1", &columns, 1001).await?,
+        "a newer push lands"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -230,7 +547,7 @@ struct Counting {
 }
 
 impl OnlineStore for Counting {
-    async fn write(&mut self, batches: &[WriteBatch]) -> Result<()> {
+    async fn write(&mut self, batches: &[WriteBatch]) -> Result<Vec<bool>> {
         self.inner.write(batches).await
     }
 
@@ -442,9 +759,9 @@ async fn the_server_reclaims_an_expired_value_and_keeps_its_freshness() -> Resul
     let now = now_micros();
     let yesterday = now / 1_000_000 - 86_400;
     store
-        .write(&[WriteBatch {
-            key: entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?),
-            fields: vec![
+        .write(&[WriteBatch::new(
+            entity_hash_key(&project, "user_id", &encode_entity_key(&[b"u1"])?),
+            vec![
                 WrittenField::new(
                     value_field("clicks"),
                     encode_vector(clicks, 42, "gold"),
@@ -452,7 +769,7 @@ async fn the_server_reclaims_an_expired_value_and_keeps_its_freshness() -> Resul
                 ),
                 WrittenField::new(freshness_field("clicks"), now.to_le_bytes().to_vec(), None),
             ],
-        }])
+        )])
         .await?;
 
     let out = read_entities(
@@ -516,23 +833,23 @@ async fn rewriting_a_field_without_an_expiry_clears_the_servers_expiry() -> Resu
     let deadline = now_micros() / 1_000_000 + TTL_SECS;
     store
         .write(&[
-            WriteBatch {
-                key: rewritten_key.clone(),
-                fields: vec![WrittenField::new(
+            WriteBatch::new(
+                rewritten_key.clone(),
+                vec![WrittenField::new(
                     value_field("clicks"),
                     encode_vector(clicks, 1, "x"),
                     Some(deadline),
                 )],
-            },
+            ),
             // The same field with the same expiry on another entity, never rewritten.
-            WriteBatch {
-                key: control_key.clone(),
-                fields: vec![WrittenField::new(
+            WriteBatch::new(
+                control_key.clone(),
+                vec![WrittenField::new(
                     value_field("clicks"),
                     encode_vector(clicks, 3, "z"),
                     Some(deadline),
                 )],
-            },
+            ),
         ])
         .await?;
 
@@ -540,14 +857,14 @@ async fn rewriting_a_field_without_an_expiry_clears_the_servers_expiry() -> Resu
     // `HSET`.
     let rewritten = encode_vector(clicks, 2, "y");
     store
-        .write(&[WriteBatch {
-            key: rewritten_key.clone(),
-            fields: vec![WrittenField::new(
+        .write(&[WriteBatch::new(
+            rewritten_key.clone(),
+            vec![WrittenField::new(
                 value_field("clicks"),
                 rewritten.clone(),
                 None,
             )],
-        }])
+        )])
         .await?;
 
     let live = store
