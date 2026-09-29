@@ -262,24 +262,6 @@ fn conninfo_value(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-/// The Valkey connection.
-///
-/// Valkey is the only _shared_ store that can be configured, so no `type` discriminates it.
-/// `tls` has no default: a security flag guessed wrong is worse than one an operator had to
-/// write down.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Valkey {
-    pub endpoint: String,
-    pub tls: bool,
-    /// Needs a server that can expire a hash field: `HEXPIREAT` landed in Redis 7.4 and
-    /// `HSETEX` in Redis 8.0, and Valkey carries the family from 9.0. `false` is the
-    /// conservative default, since a server without either falls back to the read-time TTL
-    /// check, which is authoritative either way.
-    #[serde(default)]
-    pub field_expiration: bool,
-}
-
 /// The embedded online store, which a serving process owns.
 ///
 /// An LSM rather than an in-memory map, so a dataset larger than memory is a disk read rather
@@ -322,8 +304,8 @@ impl Store {
 /// A validated `feather.toml`.
 ///
 /// Unknown keys are rejected, so a typo is a load error rather than a silently
-/// ignored setting. An absent `valkey` is local mode: an in-process DuckDB over
-/// local files, served from the in-process online store.
+/// ignored setting. An absent `store` is local mode: an in-process DuckDB over local
+/// files, served from an in-process online store.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -335,8 +317,6 @@ pub struct Settings {
     /// module.
     #[serde(default)]
     pub connections: BTreeMap<String, Connection>,
-    #[serde(default)]
-    pub valkey: Option<Valkey>,
     /// The embedded online store. Absent means the in-process map, which is the right default
     /// for a project that is read from the same process that materializes it.
     #[serde(default)]
@@ -366,9 +346,6 @@ impl Settings {
         for (name, connection) in &self.connections {
             check_present(name, "a connection name")?;
             connection.validate(name)?;
-        }
-        if let Some(valkey) = &self.valkey {
-            check_present(&valkey.endpoint, "valkey.endpoint")?;
         }
         if let Some(store) = &self.store {
             check_present(&store.path, "store.path")?;
@@ -632,10 +609,8 @@ user = "fs_runner"
 password = "${POSTGRES_PASSWORD}"
 ssl_mode = "verify-full"
 
-[valkey]
-endpoint = "valkey-cluster.internal.svc:6379"
-tls = true
-field_expiration = true
+[store]
+path = ".feather/online"
 "#;
 
     /// A lookup that resolves only `SNOWFLAKE_PASSWORD` and `POSTGRES_PASSWORD`.
@@ -702,7 +677,7 @@ field_expiration = true
         assert_eq!(settings.project, "ad_recommendations");
         assert_eq!(settings.definitions, ["definitions/user_clicks.py"]);
         assert!(settings.connections.is_empty());
-        assert!(settings.valkey.is_none());
+        assert!(settings.store.is_none());
     }
 
     #[test]
@@ -745,10 +720,8 @@ field_expiration = true
             other => panic!("expected postgres, got {other:?}"),
         }
 
-        let valkey = settings.valkey.expect("valkey");
-        assert_eq!(valkey.endpoint, "valkey-cluster.internal.svc:6379");
-        assert!(valkey.tls);
-        assert!(valkey.field_expiration);
+        let store = settings.store.expect("store");
+        assert_eq!(store.path, ".feather/online");
     }
 
     #[test]
@@ -948,12 +921,11 @@ field_expiration = true
 
     #[test]
     fn a_nested_key_path_appears_in_the_error() {
-        let text =
-            format!("{LOCAL}\n[valkey]\nendpoint = \"${{UNSET_FOR_THE_TEST}}\"\ntls = true\n");
+        let text = format!("{LOCAL}\n[store]\npath = \"${{UNSET_FOR_THE_TEST}}\"\n");
         let error = parse_settings_with(&text, &|_| Err(std::env::VarError::NotPresent))
             .expect_err("must fail");
 
-        assert!(error.to_string().contains("valkey.endpoint"), "{error}");
+        assert!(error.to_string().contains("store.path"), "{error}");
     }
 
     #[test]
@@ -971,8 +943,8 @@ field_expiration = true
     }
 
     #[test]
-    fn an_unknown_key_in_valkey_is_rejected() {
-        let text = format!("{LOCAL}\n[valkey]\nendpoint = \"e\"\ntls = true\nnope = 1\n");
+    fn an_unknown_key_in_a_store_is_rejected() {
+        let text = format!("{LOCAL}\n[store]\npath = \"d\"\nnope = 1\n");
         let error = parse_settings(&text).expect_err("must fail");
 
         assert!(error.to_string().contains("nope"), "{error}");
@@ -1005,10 +977,10 @@ field_expiration = true
 
     #[test]
     fn an_empty_required_field_is_rejected() {
-        let text = format!("{LOCAL}\n[valkey]\nendpoint = \"\"\ntls = true\n");
+        let text = format!("{LOCAL}\n[store]\npath = \"\"\n");
         let error = parse_settings(&text).expect_err("must fail");
 
-        assert_eq!(error.to_string(), "valkey.endpoint must not be empty");
+        assert_eq!(error.to_string(), "store.path must not be empty");
     }
 
     #[test]

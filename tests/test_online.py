@@ -58,13 +58,12 @@ class Purchases(FeatureView):
 SETTINGS = """
 project = "{project}"
 definitions = ["definitions/clicks.py"]
-{valkey}
+{store}
 """
 
-VALKEY = """
-[valkey]
-endpoint = "127.0.0.1:6379"
-tls = false
+STORE = """
+[store]
+path = "{store_path}"
 """
 
 
@@ -116,7 +115,7 @@ def make_project(
     ttl_days: int = 30,
     age_days: int = 1,
     project: str = "ads",
-    valkey: bool = False,
+    store: bool = False,
 ) -> Project:
     """Write a one-view project over Parquet, and open a store on it.
 
@@ -125,7 +124,8 @@ def make_project(
         ttl_days: The view's `ttl_days`.
         age_days: How old the newest source row is, in days.
         project: The project name, which namespaces every online key.
-        valkey: Whether `feather.toml` declares a Valkey.
+        store: Whether `feather.toml` declares an embedded store. The path is unique
+            per project, so two tests in one run cannot open each other's database.
 
     Returns:
         The project.
@@ -150,7 +150,11 @@ def make_project(
     )
     config = tmp_path / "feather.toml"
     config.write_text(
-        SETTINGS.format(project=project, valkey=VALKEY if valkey else ""), encoding="utf-8"
+        SETTINGS.format(
+            project=project,
+            store=STORE.format(store_path=tmp_path / "store" / project) if store else "",
+        ),
+        encoding="utf-8",
     )
 
     spec = importlib.util.spec_from_file_location("clicks", tmp_path / "definitions/clicks.py")
@@ -323,15 +327,14 @@ def test_a_missing_join_key_column_is_refused(project: Project) -> None:
         )
 
 
-@pytest.mark.integration
 def test_a_renamed_view_is_retired_and_leaves_the_registry(tmp_path: Path) -> None:
     """A rename, over a store that outlives one `FeatureStore`, which local mode cannot be.
 
-    The registry is in Valkey, so a second store over the same project sees what the first one
-    wrote. In local mode the store is per instance, so this is the only place the retire path can
-    be exercised end to end; the Rust suite pins the rule itself.
+    The registry is in the embedded store, so a second store over the same project sees what the
+    first one wrote. In local mode the store is per instance, so this is the only place the
+    retire path can be exercised end to end; the Rust suite pins the rule itself.
     """
-    project = make_project(tmp_path, project=f"feathertest_retire_{uuid.uuid4().hex}", valkey=True)
+    project = make_project(tmp_path, project=f"feathertest_retire_{uuid.uuid4().hex}", store=True)
     project.store.materialize()
 
     module = tmp_path / "definitions/clicks.py"
@@ -348,14 +351,13 @@ def test_a_renamed_view_is_retired_and_leaves_the_registry(tmp_path: Path) -> No
     assert second.retired == [], "a retired name leaves the registry, so it retires once"
 
 
-@pytest.mark.integration
-def test_a_refresh_and_a_read_round_trip_through_valkey(tmp_path: Path) -> None:
-    """The same round trip against a real Valkey, which is what `mise run test:integration` runs.
+def test_a_refresh_and_a_read_round_trip_through_the_store(tmp_path: Path) -> None:
+    """The same round trip against the embedded store rather than a per-instance map.
 
-    The project name carries a nonce so a leftover key from another run cannot be read back as
-    this run's value.
+    The project name carries a nonce so a leftover record from another run cannot be read back
+    as this run's value.
     """
-    project = make_project(tmp_path, project=f"feathertest_online_{uuid.uuid4().hex}", valkey=True)
+    project = make_project(tmp_path, project=f"feathertest_online_{uuid.uuid4().hex}", store=True)
     report = project.store.materialize()
 
     frame = pl.DataFrame(
@@ -366,7 +368,7 @@ def test_a_refresh_and_a_read_round_trip_through_valkey(tmp_path: Path) -> None:
     )
 
     assert report.views[0].rows == 3
-    assert frame["click_count"].to_list() == [10, 20, 5, None], "read back through Valkey"
+    assert frame["click_count"].to_list() == [10, 20, 5, None], "read back from the store"
 
     # A second store over the same project sees the same values, which is only possible if the
     # first one wrote them into the server rather than into its own process.
@@ -379,7 +381,6 @@ def test_a_refresh_and_a_read_round_trip_through_valkey(tmp_path: Path) -> None:
     assert project.store.materialize().retired == []
 
 
-@pytest.mark.integration
 def test_two_threads_sharing_one_store_do_not_deadlock(tmp_path: Path) -> None:
     """A second thread waits for the store's lock, rather than deadlocking on it.
 
@@ -392,7 +393,7 @@ def test_two_threads_sharing_one_store_do_not_deadlock(tmp_path: Path) -> None:
     really do contend for the lock instead of the test relying on luck to overlap them.
     """
     rows = 100_000
-    make_project(tmp_path, project=f"feathertest_threads_{uuid.uuid4().hex}", valkey=True)
+    make_project(tmp_path, project=f"feathertest_threads_{uuid.uuid4().hex}", store=True)
     base = now_micros() - DAY
     pl.DataFrame(
         {

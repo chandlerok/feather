@@ -11,7 +11,7 @@
 //! to build:
 //!
 //! - `offline`: DuckDB point-in-time joins and materialization
-//! - `valkey`: the real Valkey online store
+//! - `fjall`: the embedded LSM online store
 //!
 //! Run `cargo test --all-features` to exercise everything.
 
@@ -38,11 +38,11 @@ pub use key::{
 pub use materialize::{MaterializeReport, ViewRefresh, materialize};
 #[cfg(feature = "offline")]
 pub use offline::{Engine as OfflineEngine, JoinOptions, Limits, OnMissing};
-#[cfg(feature = "valkey")]
-pub use online::valkey::ValkeyStore;
+#[cfg(feature = "fjall")]
+pub use online::fjall::FjallStore;
 pub use online::{
     EntityRequest, Missing, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues,
     WriteBatch, WrittenField, read_entities,
 };
-pub use settings::{Connection, Secret, Settings, Store, Valkey, load_settings, parse_settings};
+pub use settings::{Connection, Secret, Settings, Store, load_settings, parse_settings};
 pub use value::{EncodedBatch, SchemaTag, arrow_type, decode_batch, encode_batch};

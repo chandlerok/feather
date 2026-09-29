@@ -13,7 +13,7 @@
 //! roughly 327,000ns of wall clock, most of which is the round trip. Any decode
 //! figure well under that is noise in the profile.
 //!
-//! No features required: this is pure encoding, no Valkey and no DuckDB.
+//! No features required: this is pure encoding, no store and no DuckDB.
 
 use std::sync::Arc;
 use std::time::Instant;

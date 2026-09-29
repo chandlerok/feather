@@ -1,6 +1,6 @@
 //! Embedded LSM-backed [`OnlineStore`].
 //!
-//! fjall has no hash type, so the one-hash-per-entity layout that a Valkey read is a single
+//! fjall has no hash type, so the one-hash-per-entity layout that a hash store reads with a
 //! `HMGET` against is here a run of adjacent keys. That run is what the key encoding below is
 //! for, and getting it right is most of what this module does.
 //!
@@ -31,7 +31,7 @@
 //! idempotent and re-runnable, and the journal is synced when the database closes. The cost is
 //! that a hard kill can lose the tail of the refresh, and the next refresh redoes it.
 //!
-//! **Blocking.** The trait is async because the Valkey store is. This one is not, and it is
+//! **Blocking.** The trait is async so a networked store fits it. This one is not, and it is
 //! deliberately not wrapped in `spawn_blocking`: a read is a point get measured in single-digit
 //! microseconds when the working set is cached, so blocking a runtime worker for that is cheaper
 //! than a task hop. The ceiling is the cold case, where a read that misses the block cache and

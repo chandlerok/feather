@@ -102,19 +102,6 @@ Connection = Annotated[
 """A named credential set, discriminated on ``type``."""
 
 
-class Valkey(pydantic.BaseModel):
-    """The Valkey connection.
-
-    The only shared store that can be configured, so nothing discriminates it.
-    """
-
-    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
-
-    endpoint: NonEmptyStr
-    tls: bool
-    field_expiration: bool = False
-
-
 class Store(pydantic.BaseModel):
     """The embedded online store, which a serving process owns.
 
@@ -134,8 +121,8 @@ class Store(pydantic.BaseModel):
 class FeatherSettings(pydantic.BaseModel):
     """A validated ``feather.toml``.
 
-    An absent ``valkey`` is local mode: an in-process DuckDB over local files, served
-    from the in-process online store.
+    An absent ``store`` is local mode: an in-process DuckDB over local files, served from
+    an in-process online store.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
@@ -143,7 +130,6 @@ class FeatherSettings(pydantic.BaseModel):
     project: NonEmptyStr
     definitions: Annotated[list[NonEmptyStr], pydantic.Field(min_length=1)]
     connections: dict[NonEmptyStr, Connection] = pydantic.Field(default_factory=dict)
-    valkey: Valkey | None = None
     store: Store | None = None
 
 
@@ -177,6 +163,5 @@ __all__ = [
     "PostgresConnection",
     "S3Connection",
     "SnowflakeConnection",
-    "Valkey",
     "load_settings",
 ]

@@ -37,29 +37,22 @@ pyo3-arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The online store's I/O is asynchronous, so the binding owns a runtime and blocks on it from
-# the Python thread. `rt-multi-thread` because the Valkey client's connection manager drives a
-# reactor on its workers; `net` and `time` because that reactor needs them. Optional because
-# every use sits behind `offline`: without that feature there is no store for a runtime to
-# serve, and an unconditional dependency would make a build carry one it cannot use.
+# the Python thread. Optional because every use sits behind `offline` or `serve`: without one
+# of those there is no store or server for a runtime to serve, and an unconditional dependency
+# would make a build carry one it cannot use.
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "time"] }
 
 [features]
-# `valkey` is a default here, unlike in feather-core, because the Python surface is the one a
-# project's `feather.toml` is read by: a settings file may declare a Valkey, and a wheel that
-# could not use one would fail at the first online call with "this build has no Valkey support".
-# Local mode still needs nothing, and the extra dependency is redis plus the tokio the store
-# already runs on.
 # `serve` and `fjall` are default because both are load-bearing for a project that
 # actually serves: without `serve` no wheel has `_core.serve` and `FeatureStore.serve()`
 # is a RuntimeError, and without `fjall` nothing can write the database `serve()` opens,
 # so `feather refresh` would populate a map that dies with the process and every read
 # would come back null. Neither implies `offline`, and neither drags in DuckDB: a
 # `serve`-only build links `feather-serve` and nothing else.
-default = ["offline", "valkey", "fjall", "serve"]
+default = ["offline", "fjall", "serve"]
 # Forwarded so that `cargo test --workspace --all-features` still builds and
 # tests the engines, and so a build can drop DuckDB with --no-default-features.
 offline = ["feather-core/offline", "dep:tokio"]
-valkey = ["feather-core/valkey"]
 # The embedded store, which the materialization path needs so a refresh writes the
 # database `serve()` opens.
 fjall = ["feather-core/fjall"]

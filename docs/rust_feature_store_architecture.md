@@ -2,8 +2,8 @@
 
 This document describes the intended architecture for an opinionated, high-performance
 open-source alternative to Feast. It strips out multi-provider abstraction and specializes
-on a native Rust core, with DuckDB for historical computation and an in-process online store
-that scales out to Valkey.
+on a native Rust core, with DuckDB for historical computation and an embedded online store that
+a feature server owns.
 
 Scope note: this is a design document with a partial implementation. The definition layer,
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
@@ -494,10 +494,12 @@ written down.
 
 #### Where the store lives
 
-The store is in-process by default. `feather.toml` with no `[valkey]` table serves from an
-in-process store, and Valkey is what a deployment adds when one process is no longer enough:
-when the dataset outgrows one process, or when several processes need to share one writable
-store.
+The store is embedded and in-process. `feather.toml` with no `[store]` table serves from an
+in-process map that dies with the process; a `[store]` table names a directory, and both a
+materialization and `FeatureStore.serve()` open it. It is a database that one process opens at a
+time, so the server is the only thing that opens it, and that is what replaces a shared tier: a
+reader in any language goes to the server, not to the store. A point read costs single-digit
+microseconds warm, where a networked KV store pays a round trip per entity.
 
 The relationship is substitution rather than layering. The in-process store is not a cache in
 front of Valkey, and Valkey is not a store with a local copy in front of it: a deployment picks
@@ -525,11 +527,20 @@ what decides whether a value is served, so an unexpired leftover costs reclamati
 correctness". An in-process store therefore needs no per-field TTL, which is the one feature that
 made Valkey uniquely suitable.
 
-The default is `MemoryStore`, once a test double. It was promoted rather than joined by a second
-in-process store, so that there is one implementation of these semantics to keep honest. See
-[`embedded-online-store.md`](./embedded-online-store.md).
+The in-process store is the embedded LSM, `FjallStore`, and `MemoryStore` is the test double.
+The two are not both production positions: an earlier decision made the in-process store the
+default to keep one implementation of these semantics honest, and adding the LSM under that rule
+means demoting `MemoryStore` rather than joining it. See
+[`embedded-online-store.md`](./embedded-online-store.md) and
+[`serving-transport.md`](./serving-transport.md).
 
 #### Serving measurements
+
+**Superseded.** The figures below were measured against a shared Valkey, which is no longer a
+position. The serving path is now an embedded store behind Arrow Flight, and its measurements,
+including the read cost and the cost of hosting the server in Python, are in
+[`serving-transport.md`](./serving-transport.md). They are kept here as the record of the
+networked-store numbers, which are the baseline the embedded store is measured against.
 
 Measured against Valkey directly, on a container limited to 2 CPUs and 512MiB with `maxmemory`
 384MiB and `allkeys-lru`, over 100k entities across 4 views of 8 features each, with 66-byte
@@ -545,9 +556,10 @@ Single-entity p99 is sub-millisecond across four views, which is the one-`HMGET`
 rule and the fixed-stride encoding doing their job. The 17.7ms tail maximum on single reads is
 unexplained and worth investigating.
 
-Reproduce with `mise run bench:load`, which prints hardware, key cardinality, and payload size
-alongside the numbers so a figure cannot be quoted without them. Compare against
-`mise run bench:valkey` for the server's own ceiling on the same container.
+These were reproduced with `mise run bench:load` against a Valkey container, which the removal
+of the tier took with it. The current serving benchmark is `mise run bench:load`, which builds
+the `feather-serve` examples; `docs/serving-transport.md` records how to run it and which parts
+of its harness ship.
 
 These numbers are from one host and one container shape. Treat them as an order of magnitude,
 not a guarantee.

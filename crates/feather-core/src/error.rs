@@ -261,10 +261,6 @@ pub enum Error {
         source: Box<duckdb::Error>,
     },
 
-    #[cfg(feature = "valkey")]
-    #[error("valkey: {0}")]
-    Valkey(#[from] redis::RedisError),
-
     #[cfg(feature = "fjall")]
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),

@@ -83,7 +83,7 @@ testpaths = ["tests"]
 # requiring the Rust extension to be built and installed first.
 pythonpath = ["python"]
 markers = [
-  "integration: requires a running Valkey container",
+  "integration: requires a running container (RustFS or Postgres)",
   "load: measures throughput or latency, not run by default",
 ]
 addopts = "-q"

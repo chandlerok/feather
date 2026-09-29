@@ -80,8 +80,8 @@ run = [
 ]
 
 [tasks."test:integration"]
-description = "Integration tests against a real Valkey container"
-depends = ["valkey:up"]
+description = "Integration tests against real containers"
+depends = ["s3:up", "postgres:up"]
 run = "uv run pytest -m integration"
 
 [tasks.check]
@@ -89,20 +89,6 @@ description = "Everything a CI run would do"
 depends = ["format:check", "lint", "test"]
 
 # ---------------------------------------------------------------- containers
-
-[tasks."valkey:up"]
-description = "Start Valkey with production-shaped resource limits"
-run = "docker compose up -d --wait valkey"
-
-[tasks."valkey:down"]
-description = "Stop Valkey and delete its volume"
-run = "docker compose down -v"
-
-[tasks."valkey:logs"]
-run = "docker compose logs -f valkey"
-
-[tasks."valkey:cli"]
-run = "docker compose exec valkey valkey-cli"
 
 # The bucket cannot come from the server. RUSTFS_DEFAULT_BUCKETS is ignored by the image
 # (the variable reaches the container and no bucket appears), rustfs 1.0.0 has no
@@ -131,10 +117,10 @@ echo "RustFS at 127.0.0.1:9000 did not accept a connection within 30s" >&2
 exit 1
 '''
 
-# This compose version rejects a service argument to `down`, so, as with `valkey:down`,
-# stopping one container stops the project and deletes both volumes.
+# This compose version rejects a service argument to `down`, so stopping one container
+# stops the project and deletes every volume.
 [tasks."s3:down"]
-description = "Stop RustFS and Valkey and delete their volumes"
+description = "Stop RustFS and delete its volumes"
 run = "docker compose down -v"
 
 [tasks."s3:logs"]
@@ -160,17 +146,11 @@ run = "docker compose logs -f postgres"
 description = "Rust micro-benchmarks"
 run = "cargo bench --workspace --all-features"
 
-[tasks."bench:valkey"]
-description = "Raw Valkey ceiling, for comparison against our read path"
-depends = ["valkey:up"]
-run = "docker compose exec valkey valkey-benchmark -h 127.0.0.1 -p 6379 -n 200000 -c 50 -t get,set -q"
-
 [tasks."bench:load"]
-description = "Load test the online read path against real Valkey"
-depends = ["valkey:up"]
-# Only the valkey feature: the load test measures the online path, and pulling in
+description = "Load test the serving path, against the embedded store"
+# Only the fjall feature: the serving benchmark measures the online path, and pulling in
 # bundled DuckDB would add minutes to the build for nothing.
-run = "cargo run --release -p feather-core --features valkey --example loadtest"
+run = "cargo build --release -p feather-serve --examples"
 
 # --------------------------------------------------------------------- watch
 

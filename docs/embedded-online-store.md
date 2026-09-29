@@ -1,9 +1,18 @@
 # The embedded online store
 
-**Status: decided.** The in-process store is the online store, and Valkey is the same store
-shared across processes. This records why, what it removes, and the one assumption it rests on.
+**Status: superseded.** This records the decision to make an in-process store the default and
+Valkey the shared tier, and the reasoning behind it. That framing no longer holds: the shared
+Valkey tier has been removed, and what shipped instead is an embedded LSM (`fjall`, behind the
+`fjall` feature) plus `FeatureStore.serve()`, which makes the calling process an Arrow Flight
+feature server. The store is a database one process opens at a time, and that server is the only
+thing that opens it, so there is no longer a "shared across processes" position to graduate to.
 
-## The decision
+Read this for why an in-process store became the default and why a two-tier cache was rejected,
+both of which still hold. For the current shape, see `docs/serving-transport.md` and the
+"Online serving layer" section of `docs/rust_feature_store_architecture.md`. What follows is kept
+as the record of a decision that has since changed, so the reasoning is not lost.
+
+## The decision (historical)
 
 `feather.toml` with no `[valkey]` table serves from an in-process store.
 
@@ -24,7 +33,10 @@ is the default now, and it is written to be served from.
 
 A deployment moves to Valkey at the scale where one process stops being enough: the dataset no
 longer fits that process's memory, or several processes need to share one writable store. It is
-the same trade SQLite and Postgres present.
+the same trade SQLite and Postgres present. (Superseded: both of those are now answered by the
+embedded store and the server rather than by a second store. The dataset-outgrows-memory case is
+what the LSM is for; several processes sharing one writable store is what the server is for,
+because the server is the only thing that opens the database.)
 
 ## Why one copy deletes work
 
@@ -75,11 +87,13 @@ path.
 ## What was built
 
 `MemoryStore` was promoted rather than joined by a second in-process store, because two
-implementations of the same semantics drift and the drift is invisible. What it mirrors is the
+implementations of the same semantics drift and the drift is invisible. (Superseded: the embedded
+LSM is now the in-process store, and `MemoryStore` is the test double. The anti-drift argument
+still stands, which is why `MemoryStore` was demoted rather than joined.) What it mirrors is the
 server's `HSET` behaviour, which
-`rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pins against a real Valkey in
-`tests/valkey_integration.rs`. That test never constructs `MemoryStore`: it observes the server's
-own reclamation, and the mirror of the one rule the two tests share is
+`rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pinned against a real Valkey in
+`tests/valkey_integration.rs` (both removed with the tier). The mirror of the one rule the two
+tests shared is
 `a_write_without_an_expiry_clears_a_recorded_one` in
 `crates/feather-core/src/online/memory.rs`. That store is the only in-process implementation
 there is to keep honest.
@@ -123,10 +137,10 @@ read latency that page faults rather than lookups explain.
   generation built from current declarations never contains those fields. `hash_fields` becomes a
   manifest read, since the project registry is metadata rather than a hash.
 
-## The upgrade to Valkey
+## The upgrade to Valkey (removed)
 
-A configuration change, because `read_entities` is generic over the trait. Two things differ, and
-both are documented in the architecture document:
+A configuration change, because `read_entities` is generic over the trait. This section described
+a tier that no longer exists; the same trait seam is what let it be deleted without a rewrite.
 
 - **Where writes land.** In-process writes into the one map this process holds, under the
   store's own `&mut self`; Valkey writes into shared state. Both satisfy `write` and
@@ -151,8 +165,8 @@ mmap'd artifact is demoted to a cold tier.
 ## Costs
 
 - **Memory is the limit, and it is per process.** State it as a number rather than discovering
-  it: entities times bytes per entity, and the point at which that stops fitting. The mmap'd
-  artifact moves the ceiling from RAM to local disk, not to infinity.
+  it: entities times bytes per entity, and the point at which that stops fitting. The embedded LSM
+  moves the ceiling from RAM to local disk, not to infinity.
 - **Staleness is bounded rather than zero**, as above.
 - **The async trait drags a runtime into the default build.** `read` is `async fn`, and for an
   in-memory map that is a poll and a future for work that never yields. `valkey` is currently a
