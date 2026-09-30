@@ -593,7 +593,7 @@ impl FeatureStore {
     ///
     /// A full refresh: every selected view is recomputed from its source and every value is
     /// overwritten. There is no watermark and nothing partial to reconcile, so a run that fails
-    /// leaves the values it had not yet overwritten as they were and the call can simply be
+    /// leaves the values it had not yet overwritten as they were and the call can be
     /// repeated. A run that is still going serves a mix of the values it has written and the ones
     /// it has not reached yet.
     ///
