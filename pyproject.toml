@@ -56,7 +56,7 @@ strip = true
 # same file rather than a per-minor one. Nothing in the bindings needs a symbol
 # outside the limited API, which is what makes that true; the wheel CI job
 # asserts the tag so a change to the pyo3 features cannot quietly make it false.
-# The wheel ships bundled DuckDB, so it is large. That is the price of the user
+# The wheel ships DuckDB, so it is large. That is the price of the user
 # compiling nothing, and the alternative is a per-interpreter build at install
 # time.
 #
@@ -68,13 +68,17 @@ strip = true
 package = true
 # uv rebuilds the extension only when a cache key changes, so the Rust sources
 # must be listed or edits to them are silently ignored. This key list replaces
-# uv's defaults, so pyproject.toml stays in it.
+# uv's defaults, so pyproject.toml stays in it. `.cargo/config.toml` is in it for
+# the same reason: it decides whether the extension links a prebuilt library or a
+# system one, and flipping it leaves every other entry identical, so `uv sync`
+# can hand back an extension built under the other setting.
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "Cargo.toml" },
   { file = "Cargo.lock" },
   { file = "crates/**/*.rs" },
   { file = "crates/**/Cargo.toml" },
+  { file = ".cargo/config.toml" },
 ]
 
 [tool.pytest.ini_options]

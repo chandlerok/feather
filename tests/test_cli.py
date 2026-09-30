@@ -389,8 +389,8 @@ def test_the_demo_files_hold_the_columns_the_generated_view_declares(project: Pa
     labels = pl.read_parquet(project / "data" / "training_labels.parquet")
     assert features.columns == ["user_id", "event_timestamp", "click_count", "purchase_count"]
     assert labels.columns == ["user_id", "event_timestamp", "label"]
-    # Microseconds as an integer, which is the form the bundled DuckDB build
-    # compares with, having no date arithmetic.
+    # Microseconds as an integer, so the point-in-time window the core builds is
+    # integer arithmetic on both sides rather than a date subtraction.
     assert features.schema["event_timestamp"] == pl.Int64
     assert features.height > labels.height
 

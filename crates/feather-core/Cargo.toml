@@ -41,7 +41,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = []
-# Bundled DuckDB. First build compiles DuckDB from source and takes minutes.
+# DuckDB, as a prebuilt library the build downloads rather than compiles, cached
+# under target/duckdb-download by the setting in `.cargo/config.toml`. This feature
+# is what gates the dependency, and the fetch is what it costs.
 offline = ["dep:duckdb"]
 # The embedded LSM online store. Deliberately not implied by `offline`: the two
 # are independent, and a serving-only build wants this one and nothing else.

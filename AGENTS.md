@@ -23,11 +23,15 @@ has no worktree bootstrap at all. If `setup.sh` is missing, the tree is older th
 and the toolchain is not installed. If the run fails, say which step failed rather than working
 around it; a half-set-up tree produces errors that look like code defects.
 
-One trap, because it costs eight minutes and looks like a hang. `uv run` syncs the project before
-it runs anything, so plain `uv run pytest` rebuilds the extension that `./setup.sh` skipped. Pass
-`--no-sync` to `uv run` and the environment is used as installed. The build is a release build
-with LTO: over eight minutes and 800MB of `target/` in a fresh worktree on this machine. It is
-also what `mise run test` triggers, which is one more reason that task is not an agent's to run.
+One trap, because it pauses long enough to look like a hang. `uv run` syncs the project before it
+runs anything, so plain `uv run pytest` rebuilds the extension that `./setup.sh` skipped. Pass
+`--no-sync` to `uv run` and the environment is used as installed. That build is a release build
+with thin LTO, and DuckDB used to be the bulk of it: 62s for a cold
+`cargo build -p feather-core --features offline` and 4m23s for the release wheel, measured by the
+author of the prebuilt-library change, against over eight minutes and 800MB of `target/` in a fresh
+worktree before it. The pause is much shorter than it was, and it is still a pause, which is why
+the flag is here. It is also what `mise run test` triggers, which is one more reason that task is
+not an agent's to run.
 
 This is bootstrap, not a check, so it does not conflict with the next section. The prohibition is
 on building to decide whether a change is correct.
@@ -40,8 +44,8 @@ two `target/` directories unless something tells cargo otherwise, and nothing he
 `CARGO_TARGET_DIR`. A `.cargo/config.toml` that only carries an `[env]` table does not change
 this, because cargo reads a target directory from `[build]`, not from the environment it hands
 the build. Keep it that way. Pointing
-several trees at one `CARGO_TARGET_DIR` does share the expensive part, because `libduckdb-sys` is a
-registry dependency and its artifact name does not depend on where the tree is. It also merges the
+several trees at one `CARGO_TARGET_DIR` saves one download of the prebuilt DuckDB library and
+nothing else, because there is no C++ compile left to share. What it also does is merge the
 trees' own crates, and that is not safe. Cargo leaves the absolute path out of the metadata hash on
 purpose, so `feather-core` in two worktrees is one artifact: one
 `libfeather_core-<hash>.rlib`, one
@@ -50,7 +54,7 @@ and links the wrong source. Two trees differing in one function, built in both o
 the other's value with no warning. It is
 [cargo#12516](https://github.com/rust-lang/cargo/issues/12516), open since 2023, and two checkouts
 of a workspace with path members reproduce it. Sharing is safe only while every tree sits at the same
-commit, which is the moment before a lane's first edit, so it buys the DuckDB build at the price of
+commit, which is the moment before a lane's first edit, so it buys one download at the price of
 tests that run against another lane's code. Per-tree directories cost one duplicate build, the
 cheaper failure.
 
@@ -58,21 +62,23 @@ Units are the other half of the disk, and sharing does not touch them. The recor
 43G holding 12 debug and 8 release `libduckdb-sys` units; the cleanup that freed 15G kept the two
 newest per profile, which was the wrong rule, as the next paragraph explains. Units accumulate
 through repeated build configurations, which per-tree duplication cannot account for. The recorded
-worst case was within 2.4Gi of full (#43). When free space drops below about 4Gi, keep the two
-largest `libduckdb-sys` units per profile of that tree's directory and delete the rest, not the two
-newest: a finished unit is gigabytes, an aborted build leaves a megabyte stub with a fresh mtime, and
-newest-first therefore keeps the stubs and deletes the finished builds. Name the directory rather
-than a relative `target/`, and confirm nothing is building against it first, because deleting units
-under a running build breaks it. `pgrep -l cargo` does not confirm that on its own: a DuckDB build
-here runs `cc1plus` with its cwd in the registry source directory, so a check that watches only
-`cargo` misses the compiler writing the unit. A live build holds a descriptor under the target
+worst case was within 2.4Gi of full (#43). Nothing in that build graph compiles DuckDB any more, so
+the directory worth clearing today is `target/duckdb-download/`, roughly 40MB per target: it is a
+download cache, safe to delete outright, and the next build re-fetches it. When free space drops
+below about 4Gi, keep the two largest entries under it and delete the rest, not the two newest: a
+finished download is tens of megabytes, an aborted one leaves a stub with a fresh mtime, and
+newest-first therefore keeps the stubs and deletes the finished downloads. Name the directory rather
+than a relative `target/`, and confirm nothing is building against it first, because deleting files
+under a running build breaks it. `pgrep -l cargo` does not confirm that on its own: the compiler is
+a child process, and a `rustc` here writes into the target directory, so a check that watches only
+`cargo` can miss a unit still being written. A live build holds a descriptor under the target
 directory, so watch the descriptors and it does not matter how the build was started:
 
 ```bash
 tree=/path/to/the/tree                          # each tree has its own; never share one
 target=$tree/target
 if ls -l /proc/[0-9]*/cwd /proc/[0-9]*/fd 2>/dev/null | grep -q "$target"; then echo "a build is using $target; wait"; else
-  for p in debug release; do du -sh "$target/$p/build/libduckdb-sys-"*/ 2>/dev/null | sort -rh | tail -n +3 | cut -f2- | xargs rm -rf; done
+  du -sh "$target/duckdb-download/"*/ 2>/dev/null | sort -rh | tail -n +3 | cut -f2- | xargs -r rm -rf
 fi
 ```
 
@@ -80,12 +86,13 @@ fi
 
 `mise run check` is the expensive one: `mise.toml` defines it as format:check, lint and test, where
 lint runs `cargo clippy --workspace --all-targets --all-features -- -D warnings` plus ruff and
-pyrefly, and test runs `cargo test --workspace --all-features` plus pytest, all of it waiting on the
-bundled DuckDB build. So do not run `cargo check`, `cargo clippy`, `cargo test`, `uv sync`,
-`pytest`, `mise run` or Docker to check a change: the static archive alone is 1.8GB on the CI runner
-(`.github/workflows/check.yml`), and a cold build is roughly 10 to 15 minutes
-(`crates/feather-core/Cargo.toml`). The README's `mise run check` and `mise run setup` are for a
-human with a machine to spare; this rule governs agents. Reproducing a documented measurement
+pyrefly, and test runs `cargo test --workspace --all-features` plus pytest, all of it behind a build
+of the extension and of every crate behind it. So do not run `cargo check`, `cargo clippy`, `cargo
+test`, `uv sync`, `pytest`, `mise run` or Docker to check a change. The prebuilt library took the
+DuckDB compile out of that build, but it is still minutes of work for a question CI answers anyway,
+and a build now also needs network egress to fetch the library, which is a second reason not to
+trigger one casually. The README's `mise run check` and `mise run setup` are for a human with a
+machine to spare; this rule governs agents. Reproducing a documented measurement
 (`docs/engine-and-format-decisions.md`, `docs/rust_feature_store_architecture.md`) is the one
 exception, and only when the number is the claim under review.
 

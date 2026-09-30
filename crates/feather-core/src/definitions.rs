@@ -125,8 +125,8 @@ impl SupportTier {
 /// whichever was added most recently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FileFormat {
-    /// DuckDB's `read_parquet`. Compiled into the bundled engine, and the only
-    /// Primary-tier file format DuckDB publishes.
+    /// DuckDB's `read_parquet`. Compiled into the engine, and the only Primary-tier
+    /// file format DuckDB publishes.
     #[default]
     Parquet,
     /// DuckDB's `read_vortex`. Loadable rather than compiled in, third-party

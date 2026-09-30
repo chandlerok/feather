@@ -7,8 +7,9 @@
 //! represent, and a second binding has nothing new to implement.
 //!
 //! The encoding layer ([`key`], [`value`]) and the settings loader are always
-//! available. The engines are behind features because bundled DuckDB takes minutes
-//! to build:
+//! available. The engines are behind features because each one is a dependency a
+//! consumer may not want, and DuckDB in particular is a large library to link even
+//! when the build downloads it rather than compiling it:
 //!
 //! - `offline`: DuckDB point-in-time joins and materialization
 //! - `fjall`: the embedded LSM online store

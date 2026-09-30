@@ -7,8 +7,8 @@
 //!
 //! Timestamps are int64 microseconds since the epoch rather than a Parquet
 //! timestamp column. The core accepts either and normalizes both, and integers
-//! are the form the bundled DuckDB build compares with, since it is built
-//! without ICU.
+//! keep the point-in-time window in integer arithmetic, which is what the join
+//! in `feather-core` is written against.
 //!
 //! The rows are relative to the current day, not fixed dates, because the
 //! generated view expires values after 30 days. A fixed table would read as

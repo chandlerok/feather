@@ -18,8 +18,8 @@ autoexamples = false
 arrow = { workspace = true, features = ["ipc"] }
 arrow-flight.workspace = true
 # The engine, with `offline` deliberately absent. Serving must not be able to reach
-# DuckDB: a deployment that only serves should not carry a C++ build or a 1.8GB
-# archive, and the `get_historical_features` path is a different concern from this one.
+# DuckDB: a deployment that only serves should not carry the library at all, and
+# the `get_historical_features` path is a different concern from this one.
 feather-core = { path = "../feather-core", default-features = false, features = ["fjall"] }
 futures-util.workspace = true
 serde = { workspace = true }

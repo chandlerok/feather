@@ -5,5 +5,27 @@
 # Set here rather than in a workflow because maturin-action forwards only an
 # allowlist of variables into the manylinux container and DUCKDB_ is not on it,
 # so a workflow-level variable would not reach the build that links the wheel.
+#
+# What the setting costs every cargo invocation in this repository, on every
+# machine including a laptop:
+# - The library is downloaded, not compiled, so a cold build needs network
+#   egress. An air-gapped build of this repository no longer works.
+# - The download is roughly 40MB per target and the crate verifies neither a
+#   checksum nor a signature, so a build trusts the upstream release channel
+#   over TLS. The pin is what makes that acceptable: the version is
+#   CARGO_PKG_VERSION, which Cargo.lock holds.
+# - A target with no published archive is a hard build error, not a fallback.
+#   The crate covers apple-darwin, linux gnu on amd64 and arm64, and windows.
+# - A developer's own DUCKDB_LIB_DIR, or DUCKDB_DOWNLOAD_LIB set to 0, in the
+#   environment still wins: cargo's [env] table does not override an
+#   already-set variable without force = true, and that override is
+#   deliberately left available so a developer can point at a system DuckDB.
+# - At run time the archive is a shared library. maturin and auditwheel vendor
+#   it into the wheel, which the wheel job in check.yml proves by installing
+#   that wheel into a clean venv with no Rust toolchain. An editable build does
+#   not vendor it: build.rs emits an rpath into this tree's
+#   target/duckdb-download, so `cargo clean`, a moved worktree, or a cache
+#   restore that missed the directory leaves a built extension that will not
+#   load.
 [env]
 DUCKDB_DOWNLOAD_LIB = "1"

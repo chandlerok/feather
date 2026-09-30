@@ -50,9 +50,9 @@ name: publish
 
 on:
   push:
-    # Only version tags. check.yml triggers on pushes to main, so a tag runs
-    # nothing there, and adding tags to that filter would run the whole suite,
-    # bundled DuckDB build included, on every tag pushed.
+    # Only version tags. check.yml triggers on pushes to main, so a tag runs nothing
+    # there, and adding tags to that filter would run the whole suite, Rust build and
+    # all, on every tag pushed.
     tags: ["v*"]
   workflow_dispatch:
 
@@ -121,8 +121,7 @@ jobs:
       # 14GB of storage, the same figure that filled on ubuntu-latest, and the
       # directories deleted here are Linux SDKs the macOS images do not have, so
       # there is no equivalent to delete. A macOS build that runs out of disk is
-      # the one way this matrix fails that a reviewer would not predict, and
-      # sccache is the mitigation until someone measures a macOS build.
+      # the one way this matrix fails that a reviewer would not predict.
       - name: free disk space
         if: runner.os == 'linux'
         run: |

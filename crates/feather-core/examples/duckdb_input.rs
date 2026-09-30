@@ -9,13 +9,15 @@
 //! The three routes:
 //!
 //! 1. **Arrow appender** (`appender-arrow`). Temporary table plus
-//!    `append_record_batch`. Columnar, no per-row work, no serialization. Costs
-//!    extra C++ template compilation on a clean build.
-//! 2. **Row appender**. Same table, filled one row at a time. No extra build
-//!    cost, but per-row work, which the design forbids.
-//! 3. **Temp Parquet**. Write the batch to a file and `read_parquet` it. No extra
-//!    build cost and it reuses existing code, but adds the serialization round
-//!    trip the design forbids, plus a file to clean up.
+//!    `append_record_batch`. Columnar, no per-row work, no serialization.
+//! 2. **Row appender**. Same table, filled one row at a time. Per-row work, which
+//!    the design forbids.
+//! 3. **Temp Parquet**. Write the batch to a file and `read_parquet` it. Reuses
+//!    existing code, but adds the serialization round trip the design forbids,
+//!    plus a file to clean up.
+//!
+//! None of the three costs build time the others do not: the engine is a
+//! prebuilt library, so they differ at run time and not at build time.
 //!
 //! Two things this measures that are easy to miss:
 //!

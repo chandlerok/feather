@@ -2947,7 +2947,7 @@ mod tests {
 
     #[test]
     fn each_format_names_the_extension_it_needs_loaded() {
-        // Parquet is compiled into the bundled build, so naming no extension is what
+        // Parquet is compiled into the engine, so naming no extension is what
         // keeps a local project from touching the extension repository at all. Vortex is
         // loadable and third-party maintained, which is why a source naming it opts in.
         assert_eq!(format_reader(FileFormat::Parquet), ("read_parquet", None));

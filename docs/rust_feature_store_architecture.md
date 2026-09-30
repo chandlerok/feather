@@ -576,8 +576,8 @@ the format rules are recorded, with the evidence behind them, in
 - **Engine.** Local DuckDB via the `duckdb` Rust crate.
 - **Entity frame input.** The caller's entity frame is an Arrow record batch. It is appended to
   a temporary table with DuckDB's Arrow appender (`appender-arrow`) and joined as the left side
-  of the `ASOF` join. Columnar, no per-row work, no serialization, and no file to clean up. The
-  cost is extra C++ template compilation on a clean DuckDB build.
+  of the `ASOF` join. Columnar, no per-row work, no serialization, and no file to clean up. None
+  of the three routes costs build time the others do not, since the engine is a prebuilt library.
 
   Measured on an Apple M2 with 8 cores and 8 GiB, 500k entity rows against a 2M-row feature
   table, minimum of 3 repetitions, three runs:

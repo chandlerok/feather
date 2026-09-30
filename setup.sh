@@ -28,8 +28,9 @@ mise install
 
 # The two halves of `mise run setup`, except that the Python environment is
 # installed without the project. `mise run setup` builds the extension, which is
-# a release build with LTO: over eight minutes and 800MB of target/ per worktree
-# on this machine. The lint and type-check path does not need that extension,
+# a release build with thin LTO: 4m23s for the wheel once DuckDB stopped being
+# compiled, down from over eight minutes and 800MB of target/ per worktree on this
+# machine. The lint and type-check path does not need that extension,
 # and AGENTS.md calls out the trap that `uv run` without `--no-sync` builds it
 # anyway. `mise run setup` remains the human path, and the one to use when the
 # extension itself is what you need to exercise.

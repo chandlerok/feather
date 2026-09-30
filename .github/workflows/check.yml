@@ -95,12 +95,11 @@ jobs:
       #
       # Only main saves. The repository shares a 10GB budget with the Python jobs'
       # entries, so a pull request writing this key would only push one that
-      # matters toward eviction. The key this job
-      # computes is `v0-rust-rust-...`: rust-cache builds it from the prefix,
-      # `GITHUB_JOB` and the runner platform, and `GITHUB_JOB` is this job's id,
-      # `rust`. A `shared-key` input replaces that job-id part rather than adding
-      # to it, so the `shared-key: rust` this branch first had produced the same
-      # string by coincidence.
+      # matters toward eviction. The key this job computes is `v0-rust-rust-...`:
+      # rust-cache builds it from the prefix, `GITHUB_JOB` and the runner
+      # platform, and `GITHUB_JOB` is this job's id, `rust`. A `shared-key` input
+      # replaces that job-id part rather than adding to it, which is how the
+      # wheel job gets an entry of its own.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -159,8 +158,8 @@ jobs:
       # and that is what filled the disk: the runner died with "No space left on
       # device" writing its own diagnostic log, part way through the restore,
       # which is also why the job's log was missing rather than showing an
-      # error. The keys are separate again and this job's entry is 326MB, so the
-      # cleanup stays where it belongs.
+      # error. The keys are separate again and this job's entry was 326MB under
+      # the bundled build, so the cleanup stays where it belongs.
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # astral-sh/setup-uv, pinned at v10.2.0
@@ -180,6 +179,15 @@ jobs:
       # job's entry may now be fine. Untested, and a CI question rather than a
       # guess. The two matrix entries do share with each other, which is free:
       # they are one job id.
+      #
+      # What survives the prebuilt library is why the key cannot simply be
+      # dropped. A full key match still cost 1674s in `uv sync` against 78s from
+      # the job's own entry, both figures measured under the bundled build.
+      # Pinning the editable build to the rust job's dev profile did not change
+      # that, so the entry cannot serve a build of the extension at all: that job
+      # runs clippy and `cargo test`, which produce neither the feather-py cdylib
+      # nor the build graph `uv sync` resolves, so a restore from it cannot
+      # satisfy the sync however DuckDB is obtained.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: sync
@@ -259,11 +267,12 @@ jobs:
       # would tell us nothing about the file that ships.
       #
       # `--strip` is the one flag here that is not incidental, because the wheel
-      # is almost entirely DuckDB's symbol table: 255MB unstripped, 24MB
-      # stripped, and PyPI refuses a file over 100MB. So a wheel that skipped
-      # this would not upload, rather than merely being large. The next step
-      # prints the size, so the number stays on the record instead of being
-      # re-derived.
+      # is almost entirely DuckDB's symbol table and PyPI refuses a file over
+      # 100MB, so a wheel that skipped this would not upload, rather than merely
+      # being large. The 255MB unstripped and 24MB stripped figures belong to the
+      # bundled static archive; the shared library this wheel links is a different
+      # size and nobody has measured it. The next step prints the size, so the
+      # number stays on the record instead of being re-derived.
       - name: build the wheel
         run: maturin build --strip --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is
