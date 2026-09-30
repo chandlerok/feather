@@ -7,12 +7,13 @@ Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
 > and the online serving layer are built and measured, and materialization writes a view's
-> values into the online store from its source. The point-in-time join is built over local
+> values into the online store from its source. `FeatureStore.serve()` turns the calling
+> process into a feature server over Arrow Flight. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
-> catalog are design only. There is no served API yet, and the `feather` command is not on
-> PyPI either, so `pip install feather-py polars` is a line that will work rather than one that
-> works today; everything after it runs.
+> catalog are design only, and the served endpoint does not authenticate yet. The `feather`
+> command is not on PyPI either, so `pip install feather-py polars` is a line that will work
+> rather than one that works today; everything after it runs.
 
 ## Design goals
 
@@ -25,20 +26,20 @@ Arrow.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a table in a configured database. No separate compute
   cluster is required for local or medium-scale workloads.
-- **An embedded store, and a server that owns it.** Online serving reads from a store inside
-  the process, with a read-time TTL check, and `serve()` serves it over Arrow Flight. The store
-  is a database that one process opens at a time, which is why the server is the only thing that
-  opens it. A point read costs single-digit microseconds warm where a networked KV store pays a
-  round trip; see `docs/serving-transport.md`.
+- **An embedded store, and a server that owns it.** Online serving reads from a store inside the
+  process, with a read-time TTL check, and `serve()` serves it over Arrow Flight. The store is a
+  database that one process opens at a time, which is why the server is the only thing that opens
+  it, and why a refresh and a server cannot run at once. A point read costs single-digit
+  microseconds warm where a networked store pays a round trip; see
+  [`docs/serving-transport.md`](docs/serving-transport.md).
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.
-- **A library, not a service.** There is no served API to operate. The language that defines
-  the features is the language that reads them, in the same process, which is what makes this a
-  good fit for a monolith and why nothing here runs a server. One is planned after v1, and the
-  read path stays a single in-process call so that a server is a thin wrapper over that call
-  rather than a second implementation. Until then, a team that wants an RPC surface for another
-  language builds one over the defining process.
+- **A library, with a server you can point it at.** The language that defines the features is
+  the language that reads them, in the same process, and the read path stays a single
+  in-process call. `serve()` is a thin wrapper over that call rather than a second
+  implementation of it, so a project in one process never pays for a hop, and a project that
+  needs an RPC surface for another language gets one without changing how features are read.
 
 ## Quickstart
 
@@ -154,11 +155,40 @@ different path under `[store]`, and the same command writes there instead. A pro
 refreshed under the earlier behaviour has no database on disk yet, so run `feather refresh`
 once after upgrading or `serve()` will open an empty store and answer null for every column.
 
+To serve the project, name a feature service and hand that name to `serve()`:
+
+```python
+from feather import FeatureService
+from definitions.user_clicks import UserClicks
+
+ranking = FeatureService(name="ranking_v3", features=[UserClicks])
+
+store = FeatureStore("feather.toml")
+store.serve("ranking_v3", addr="127.0.0.1:8815")
+```
+
+That blocks the calling process and never returns. The process becomes the feature server: it
+opens the store, resolves the service's field set once at startup, and answers Arrow Flight
+requests from the same read path `get_online_features` uses. A client in any language reads the
+response with its own Arrow library, so there is no generated client and no row-oriented format
+on the way. Resolution happens at boot, so a service naming a view or a feature the project
+does not declare fails there rather than on the first request, and a request cannot make the
+server resolve metadata per call.
+
+Two things to know before pointing it at anything. The store is a database one process opens at
+a time, so the serving process is the only thing that opens it and a refresh cannot run while it
+holds the directory; a deployment schedules that before anything else. And the endpoint does not
+authenticate yet, so `serve()` binds loopback by default and that is the only thing protecting
+it.
+
 ## Going to production
 
-The same code runs against remote stores; only `feather.toml` changes. The
-configuration schema, the query routing rules, and the shape of a production deployment are
-described in [the architecture document](docs/rust_feature_store_architecture.md).
+The same code runs against remote stores; only `feather.toml` changes. The configuration
+schema, the query routing rules, the storage layout, and the shape of a production deployment
+are described in [the architecture document](docs/rust_feature_store_architecture.md). The
+engine and format calls, with the measurements behind them, are in
+[the engine and format decisions](docs/engine-and-format-decisions.md), and the serving
+transport in [its own record](docs/serving-transport.md).
 
 ## Contributing
 

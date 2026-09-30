@@ -1,16 +1,17 @@
 # The embedded online store
 
-**Status: superseded.** This records the decision to make an in-process store the default and
-Valkey the shared tier, and the reasoning behind it. That framing no longer holds: the shared
-Valkey tier has been removed, and what shipped instead is an embedded LSM (`fjall`, behind the
-`fjall` feature) plus `FeatureStore.serve()`, which makes the calling process an Arrow Flight
-feature server. The store is a database one process opens at a time, and that server is the only
-thing that opens it, so there is no longer a "shared across processes" position to graduate to.
+**Status: superseded, and kept as a record.** This is the decision to make an in-process store
+the default and Valkey the shared tier, and the reasoning behind it. What shipped instead is an
+embedded LSM (`fjall`, behind the `fjall` feature) plus `FeatureStore.serve()`, which makes the
+calling process an Arrow Flight feature server. The store is a directory one process opens at a
+time, and that server is the only thing that opens it, so there is no longer a "shared across
+processes" position to graduate to. The Valkey tier was built, measured, and removed.
 
-Read this for why an in-process store became the default and why a two-tier cache was rejected,
-both of which still hold. For the current shape, see `docs/serving-transport.md` and the
-"Online serving layer" section of `docs/rust_feature_store_architecture.md`. What follows is kept
-as the record of a decision that has since changed, so the reasoning is not lost.
+Read this for why an in-process store became the default and why a two-tier cache was rejected.
+Both still hold. For the current shape, see [`serving-transport.md`](./serving-transport.md) and
+the "Online serving layer" section of
+[`rust_feature_store_architecture.md`](./rust_feature_store_architecture.md). Everything below
+is the record of a decision that has since changed, so the reasoning is not lost.
 
 ## The decision (historical)
 
@@ -32,11 +33,11 @@ something which "makes no attempt to be fast" and "exists to make the read path 
 is the default now, and it is written to be served from.
 
 A deployment moves to Valkey at the scale where one process stops being enough: the dataset no
-longer fits that process's memory, or several processes need to share one writable store. It is
-the same trade SQLite and Postgres present. (Superseded: both of those are now answered by the
-embedded store and the server rather than by a second store. The dataset-outgrows-memory case is
-what the LSM is for; several processes sharing one writable store is what the server is for,
-because the server is the only thing that opens the database.)
+longer fits that process's memory, or several processes need to share one writable store. Both
+of those turned out to be questions the embedded store and the server answer rather than
+questions a second store answers. The dataset-outgrows-memory case is what the LSM is for, and
+several processes sharing one writable store is what the server is for, because the server is
+the only thing that opens the directory.
 
 ## Why one copy deletes work
 
@@ -81,22 +82,18 @@ costs reclamation and never correctness." An in-process store therefore needs no
 which was the single feature that made the Redis family uniquely suitable.
 
 **The read path is already generic.** `read_entities<S: OnlineStore>` is the only caller in the
-serving path, so which store is behind it does not touch the Python surface or the offline
-path.
+serving path, so which store is behind it does not touch the Python surface or the offline path.
 
 ## What was built
 
 `MemoryStore` was promoted rather than joined by a second in-process store, because two
-implementations of the same semantics drift and the drift is invisible. (Superseded: the embedded
-LSM is now the in-process store, and `MemoryStore` is the test double. The anti-drift argument
-still stands, which is why `MemoryStore` was demoted rather than joined.) What it mirrors is the
-server's `HSET` behaviour, which
-`rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pinned against a real Valkey in
-`tests/valkey_integration.rs` (both removed with the tier). The mirror of the one rule the two
-tests shared is
-`a_write_without_an_expiry_clears_a_recorded_one` in
-`crates/feather-core/src/online/memory.rs`. That store is the only in-process implementation
-there is to keep honest.
+implementations of the same semantics drift and the drift is invisible. The rule outlived the
+promotion: adding the embedded LSM under it meant demoting `MemoryStore` to a test double rather
+than shipping two production positions. What `MemoryStore` mirrors is the server's `HSET`
+behaviour, which `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` pinned against
+a real Valkey in `tests/valkey_integration.rs`. Both tests went with the tier. The mirror of the
+one rule they shared is `a_write_without_an_expiry_clears_a_recorded_one` in
+`crates/feather-core/src/online/memory.rs`.
 
 The representation changed from `HashMap<Vec<u8>, HashMap<String, Vec<u8>>>` plus a second map
 for expiries, to one sorted slice of entries per entity. Every value is still its own allocation,
@@ -127,6 +124,10 @@ a short contiguous run.
 The trigger is not a date. It is resident memory per process against the dataset size, or a p99
 read latency that page faults rather than lookups explain.
 
+This is the generation that was not built. The embedded LSM answered the same trigger by moving
+the ceiling from RAM to local disk, which is a different answer to the same question and leaves
+the mmap'd artifact as the step past it.
+
 ## What the generation model would remove
 
 - **Eviction.** A generation is a complete snapshot, so there is no capacity policy and no way to
@@ -136,6 +137,8 @@ read latency that page faults rather than lookups explain.
   is the only complete list" of entity hashes a retired view's fields may still sit in. A
   generation built from current declarations never contains those fields. `hash_fields` becomes a
   manifest read, since the project registry is metadata rather than a hash.
+
+Each of the three is still on the refresh path, and each is a cost a full refresh pays today.
 
 ## The upgrade to Valkey (removed)
 
@@ -162,11 +165,16 @@ issue [#9](https://github.com/chandlerok/feather/issues/9). If incremental mater
 becomes a near-term goal, the mutable in-process store becomes the long-term shape and the
 mmap'd artifact is demoted to a cold tier.
 
+The assumption held, and so did the store it was made about.
+
 ## Costs
 
 - **Memory is the limit, and it is per process.** State it as a number rather than discovering
   it: entities times bytes per entity, and the point at which that stops fitting. The embedded LSM
   moves the ceiling from RAM to local disk, not to infinity.
+- **Single-writer is the limit, and it is per directory.** The database is opened by one process
+  at a time, so a refresh cannot run while a server holds it. A deployment schedules around that
+  before it schedules anything else.
 - **Staleness is bounded rather than zero**, as above.
 - **The async trait drags a runtime into the default build.** `read` is `async fn`, and for an
   in-memory map that is a poll and a future for work that never yields. `valkey` is currently a
@@ -174,6 +182,10 @@ mmap'd artifact is demoted to a cold tier.
   default, either the default build carries a runtime for nothing, or the trait becomes
   synchronous. A third option is cheap and already available: `futures` is a dependency, and
   `futures::executor::block_on` can drive the async trait without `tokio`. Not decided here.
+
+The first two are costs this repository still carries. The last one is resolved: `tokio` is a
+default feature of `feather-py` because `offline` and `serve` both need a runtime to block on,
+so the default build carries one and there is a reason.
 
 ## What this does not change
 
