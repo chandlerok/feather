@@ -1,0 +1,9 @@
+# duckdb-rs links a prebuilt DuckDB when `bundled` is off, which is what
+# `crates/feather-core` relies on: it downloads the release matching the
+# Cargo.lock pin and caches it under target/duckdb-download/.
+#
+# Set here rather than in a workflow because maturin-action forwards only an
+# allowlist of variables into the manylinux container and DUCKDB_ is not on it,
+# so a workflow-level variable would not reach the build that links the wheel.
+[env]
+DUCKDB_DOWNLOAD_LIB = "1"

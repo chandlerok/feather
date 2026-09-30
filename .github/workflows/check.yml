@@ -55,10 +55,10 @@ jobs:
     name: rust
     runs-on: ubuntu-latest
     env:
-      # Line tables only. A bundled DuckDB build is the bulk of target/: the
-      # static archive alone is 1.8GB, and most of that is debug info. Level 2
-      # does not fit on a runner and tests never needed variables, but level 1
-      # keeps file and line in panic backtraces.
+      # Line tables only, not full debug info: tests never needed variables, and
+      # level 1 still keeps file and line in panic backtraces. The bundled DuckDB
+      # archive that made the cached target/ large is gone, so a higher level may
+      # now fit, but changing it changes the cache key below.
       #
       # Scoped to this job rather than the workflow. rust-cache folds every
       # variable whose name starts with CARGO, CC, CFLAGS, CXX, CMAKE or RUST
@@ -71,10 +71,10 @@ jobs:
         with:
           persist-credentials: false
       # The runner image carries tens of gigabytes of SDKs this job never
-      # touches, and the DuckDB build filled what was left: the C++ archive step
-      # died with "No space left on device" writing libduckdb.a. Deleting the
-      # trees in parallel measured 82s against 127s for the sequential form on
-      # the same commit.
+      # touches. This step exists because the DuckDB build filled what was left
+      # (the C++ archive step died writing libduckdb.a); that build is gone, so
+      # removing this is a CI measurement rather than a guess. Deleting the trees
+      # in parallel measured 82s against 127s for the sequential form.
       - name: free disk space
         run: |
           pids=()
@@ -89,13 +89,13 @@ jobs:
           df -h /
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
-      # Bundled DuckDB compiles from source on a cold cache: measured on a
-      # 2-core runner the rust job takes around 45 minutes, nearly all of it in
-      # clippy and test.
+      # Compiling bundled DuckDB used to be the bulk of this job's cold-cache
+      # time, measured at around 45 minutes on a 2-core runner. The prebuilt
+      # library removes that compile, so this entry is now mostly the Rust build.
       #
-      # Only main saves. The entry is 2.3GB and the repository shares a 10GB
-      # budget with the Python jobs' entries, so a pull request writing this key
-      # would only push one that matters toward eviction. The key this job
+      # Only main saves. The repository shares a 10GB budget with the Python jobs'
+      # entries, so a pull request writing this key would only push one that
+      # matters toward eviction. The key this job
       # computes is `v0-rust-rust-...`: rust-cache builds it from the prefix,
       # `GITHUB_JOB` and the runner platform, and `GITHUB_JOB` is this job's id,
       # `rust`. A `shared-key` input replaces that job-id part rather than adding
@@ -170,25 +170,16 @@ jobs:
         run: uv venv --python ${{ matrix.python }}
       # The extension is built, because these tests exercise it: load_settings
       # reads feather.toml through the core, and FeatureStore runs the join
-      # through it. That second one means crates/feather-py asks feather-core
-      # for the offline engine, so this job pays the bundled DuckDB build it
-      # used to skip, on both matrix interpreters. Measured with the archive
-      # already in target/, a rebuild takes about four minutes; the rust job's
-      # cold-cache figure is around 45. See the cold-build issue.
-      #
-      # This job keeps its own key, and its own entry is what caches that
-      # archive: restoring it is what makes `uv sync` take about a minute rather
-      # than rebuild. Sharing the rust job's entry does not work, and that was
-      # measured rather than assumed: with that entry restored at a full match
-      # the extension still recompiled bundled DuckDB, 1674s in `uv sync`
-      # against 78s from this job's own entry. Pinning the editable build to the
-      # rust job's dev profile did not change that, so the entry cannot serve a
-      # build of the extension at all. The two matrix entries do share with each
-      # other, which is free: they are one job id.
-      #
-      # This is also the only place the Python-to-Rust handoff is tested at
-      # all: the rust job links the core directly and never loads the
+      # through it. That second one means crates/feather-py asks feather-core for
+      # the offline engine. It is also the only place the Python-to-Rust handoff
+      # is tested at all: the rust job links the core directly and never loads the
       # extension.
+      #
+      # This job keeps its own cache key. The measurement behind that was about
+      # the bundled DuckDB archive, which no longer exists, so sharing the rust
+      # job's entry may now be fine. Untested, and a CI question rather than a
+      # guess. The two matrix entries do share with each other, which is free:
+      # they are one job id.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: sync
@@ -249,10 +240,8 @@ jobs:
       # extension with the dev profile into target/debug and this one builds
       # target/release, so an entry restored from either is the wrong profile and
       # makes neither build quick; sharing a key across two profiles buys a
-      # partial hit and a confusing one. The repository has a 10GB budget across
-      # entries and a bundled DuckDB entry is gigabytes, so a third copy under
-      # this job's own id would be the wrong trade either way. Saving is left to
-      # main, for the reason the rust job gives.
+      # partial hit and a confusing one. Saving is left to main, for the reason
+      # the rust job gives.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

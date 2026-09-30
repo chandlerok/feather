@@ -145,28 +145,23 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
-      # Bundled DuckDB compiles from source on a cold cache, around 45 minutes
-      # per matrix entry on a 2-core runner, and the four entries do not share
-      # a target directory: two Linux architectures and two Darwin triples are
-      # four separate compilations of the same C++. Budget an hour and a half
-      # for a run, not fifteen minutes, and expect a retry to cost the same
-      # without sccache. It is on because the realistic failure is one of four
-      # builds dying near the end and the whole run having to be repeated.
+      # No `sccache` here. maturin-action mounts only the workspace, the build
+      # script and the git and ssh credentials into the container, so sccache's
+      # directory lives in the container's filesystem and is discarded with it.
       #
       # `strip` is not on this command line. It is `strip = true` in
       # `[tool.maturin]`, which is the only way a publish job cannot forget it.
       #
-      # `--compatibility pypi` is maturin's pre-upload check: it is what turns a
-      # 255MB unstripped wheel into a build failure instead of a rejection from
-      # PyPI, after forty-five minutes of compiling. `--locked` builds from the
-      # committed Cargo.lock rather than resolving again.
+      # `--compatibility pypi` is maturin's pre-upload check: it is what turns an
+      # oversized wheel into a build failure instead of a rejection from PyPI.
+      # `--locked` builds from the committed Cargo.lock rather than resolving
+      # again.
       # renovate: datasource=github-tags depName=PyO3/maturin-action
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           rust-toolchain: stable
-          sccache: true
           # Pinned to the floor pyproject.toml allows, so the artifact is built
           # by a known maturin rather than whatever is newest when the tag lands.
           maturin-version: v1.15.0
