@@ -1606,4 +1606,4 @@ community requested the switch and it was not made
 ([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments).
 
 `arrow-flight` tracks the workspace's Arrow major and brings `tonic` and `prost` with it, and it
-ships no auth handler. The serving surface adds an auth handler rather than inheriting one.
+ships no auth handler. Neither does the serving surface, which is the gap described above.
