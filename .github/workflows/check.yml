@@ -72,23 +72,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # The runner image carries tens of gigabytes of SDKs this job never
-      # touches. This step exists because the DuckDB build filled what was left
-      # (the C++ archive step died writing libduckdb.a); that build is gone, so
-      # removing this is a CI measurement rather than a guess. Deleting the trees
-      # in parallel measured 82s against 127s for the sequential form.
-      - name: free disk space
-        run: |
-          pids=()
-          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/.ghcup; do
-            sudo rm -rf "$dir" &
-            pids+=("$!")
-          done
-          for pid in "${pids[@]}"; do
-            wait "$pid" || exit 1
-          done
-          df -h /
+      # No disk cleanup here. It existed because the bundled DuckDB build filled
+      # the runner's free space; that build is gone, so this job no longer
+      # deletes 5 SDK trees to make room.
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # Compiling bundled DuckDB used to be the bulk of this job's cold-cache
@@ -168,13 +154,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # No disk cleanup here, unlike the rust job. It was added for the 2267MB
-      # entry this job restored while the two jobs shared one cargo cache key,
-      # and that is what filled the disk: the runner died with "No space left on
-      # device" writing its own diagnostic log, part way through the restore,
-      # which is also why the job's log was missing rather than showing an
-      # error. The keys are separate again and this job's entry was 326MB under
-      # the bundled build, so the cleanup stays where it belongs.
+      # No disk cleanup here. It was added for the 2267MB entry this job
+      # restored while the two jobs shared one cargo cache key, and that is what
+      # filled the disk: the runner died with "No space left on device" writing
+      # its own diagnostic log, part way through the restore, which is also why
+      # the job's log was missing rather than showing an error. The keys are
+      # separate again, which is a change of its own and not a consequence of
+      # the DuckDB one, and this job's entry was 326MB under the bundled build.
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # astral-sh/setup-uv, pinned at v10.2.0
@@ -257,23 +243,13 @@ jobs:
       # astral-sh/setup-uv, pinned at v10.2.0
       # renovate: datasource=github-tags depName=astral-sh/setup-uv
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-      # The runner image carries tens of gigabytes of SDKs this job never
-      # touches, and it needs the room more than the rust job does: on the first
-      # run of this job the disk filled during the build and `uv pip install` died
-      # writing the extension out of the wheel. Same deletion, measured at 82s
-      # against 127s for the sequential form in the rust job.
-      - name: free disk space
-        run: |
-          pids=()
-          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/.ghcup; do
-            sudo rm -rf "$dir" &
-            pids+=("$!")
-          done
-          for pid in "${pids[@]}"; do
-            wait "$pid" || exit 1
-          done
-          df -h /
+      # No disk cleanup here. It existed because this job needs more room than
+      # the rust job: the peak is a `maturin build` of the whole workspace into
+      # target/maturin and then `uv pip install dist/*.whl polars`, and on its
+      # first run the disk filled during the build, so the install died writing
+      # the extension out of the wheel. That was the DuckDB build filling the
+      # room, and it is gone, so on ubuntu the removal is measured rather than
+      # argued: this job is green on the head that removed the step.
       # A key of its own, not the python job's. The two jobs build the same
       # extension under different profiles and in different target directories:
       # the python job's `uv sync` builds release into target/release, and
