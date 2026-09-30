@@ -122,8 +122,8 @@ jobs:
       # they carry 14GB, a figure inherited from the base and not re-measured
       # against the labels the matrix names today, and the directories the Linux
       # entries would delete are Linux SDKs the macOS images do not have, so
-      # there was never anything to delete there anyway. Nothing currently
-      # mitigates that beyond the build being smaller. A tag push is the release
+      # there was never anything to delete there anyway. Nothing mitigates that
+      # beyond the build being smaller. A tag push is the release
       # rather than a measurement, so the evidence is a `workflow_dispatch` run
       # of this branch: run 36656505586 built all four wheels green with the
       # step gone.

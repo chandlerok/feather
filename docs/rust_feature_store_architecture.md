@@ -293,8 +293,8 @@ reasoning for that encoding, and the one cost it takes on, are in
 [`online/fjall.rs`](../crates/feather-core/src/online/fjall.rs).
 
 One key holds no entity's values: the project registry, `{project}:views`. Its fields are the view
-names a refresh has declared — a view that every refresh so far has found no rows for has no
-field — and its values are each view's newest event timestamp, encoded the way a freshness field
+names a refresh has declared (a view that every refresh so far has found no rows for has no
+field), and its values are each view's newest event timestamp, encoded the way a freshness field
 is. A refresh reads it to learn which views the previous refresh declared, writes it last, and
 garbage collection diffs the two sets. Losing it is a worse failure than a crash before it is
 written: a directory restored from an older copy, or handed to a fresh project, leaves entity
@@ -475,7 +475,7 @@ The distinction is preserved in the core: `Missing` is an enum with a variant pe
 null.** A client cannot tell a value that was never written from one that expired, or from a
 materialized null, and the online contract is nulls.
 
-Nulls is the right default because Arrow's null bitmap cannot separate the cases, so exactness
+Null is the right default because Arrow's null bitmap cannot separate the cases, so exactness
 would have to be a separate column, and paying for it unconditionally would widen every response
 for a distinction most consumers ignore. Nothing returns that column yet. `Missing::as_str`
 exists and the enum is exhaustive, so adding one is a field on the response and a column per
@@ -681,8 +681,8 @@ there is no registry"). Validating on every read is too expensive for a warehous
 - Validate **once per process per source** at startup, and cache the resolved schema.
 - Re-validate on a schedule in long-lived processes.
 - Record the source's snapshot identity alongside the result, where the source has one: a
-  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or — for a warehouse with no
-  Iceberg surface — a warehouse table version. A warehouse reached through its Iceberg REST
+  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or, for a warehouse with no
+  Iceberg surface, a warehouse table version. A warehouse reached through its Iceberg REST
   catalog would yield a snapshot id from `iceberg_snapshots(...)`, so it is the same mechanism
   rather than a vendor-specific one.
   That is the closest thing to a source pin available without a registry, and it is what
@@ -884,7 +884,7 @@ store indefinitely because it only deletes data when the last view for an entity
 ([#3596](https://github.com/feast-dev/feast/issues/3596)).
 
 The refresh knows which views retired, because it reads the project registry before it writes
-anything and diffs it against every view the project declares — not against the selection, which
+anything and diffs it against every view the project declares, not against the selection, which
 is why refreshing a subset retires nothing. What it does not know is where
 their fields are. A retired view's entities do not have to appear in any source any more, and
 their keys carry no trace of which view put a field in them, so the view set names the orphan
@@ -905,7 +905,7 @@ entity.
 The walk is rare by construction, which is the point of the registry: a project whose declared
 views have not changed retires nothing and walks nothing. It is idempotent as well, because
 removing a field that is already gone is a no-op, and the registry is written after the walk
-rather than before it, so a run that dies partway leaves a state the next run repairs — as long
+rather than before it, so a run that dies partway leaves a state the next run repairs, as long
 as that next run declares the same view set, since the retired set it computes comes from the
 registry rather than from the run it is repairing. This is the reason a refresh is not a pure
 function of its inputs, and it is the only part of it that is not.
@@ -1266,9 +1266,6 @@ There is no Helm chart and no Kustomize manifest, and there will not be one befo
 ships is a library, a `serve()` that turns the calling process into a server, and a refresh. A
 deployment wires those three together; this repository does not.
 
-The single-writer rule is the constraint a deployment has to schedule around before anything
-else, and nothing in this repository resolves it.
-
 ---
 
 ## Naming
@@ -1276,7 +1273,7 @@ else, and nothing in this repository resolves it.
 The distribution is `feather-py`, because `feather` is already registered on PyPI. The import
 name is `feather`.
 
-That pairing is what creates the collision this section exists to name. Installing
+That pairing is what creates the collision. Installing
 `feather-py` puts a top-level `feather` on the path, and the PyPI package `feather` (the
 Feather dataframe format) provides the same module name. An environment must not contain
 both, because which one an import resolves to depends on install order. This is accepted for

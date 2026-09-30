@@ -54,9 +54,6 @@ impl WrittenField {
     ///     value: The encoded value.
     ///     expires_at_unix_secs: When the field stops being readable, or `None` to leave it to
     ///         the read-time check alone.
-    ///
-    /// Returns:
-    ///     The field.
     pub fn new(name: impl Into<String>, value: Vec<u8>, expires_at_unix_secs: Option<i64>) -> Self {
         Self {
             name: name.into(),
