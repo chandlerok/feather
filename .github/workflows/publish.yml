@@ -111,30 +111,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # The runner image carries tens of gigabytes of SDKs this job never
-      # touches, and the DuckDB build fills what is left. The linux wheels build
-      # inside a container, but that container's writable layer is on the same
-      # disk, so the cleanup is needed for those too. Same deletion, measured at
-      # 82s against 127s for the sequential form in the rust job.
+      # No disk cleanup here. It existed because the DuckDB build filled the
+      # runner's free space, including inside the container, whose writable layer
+      # is on the same disk. That build is gone.
       #
-      # The macOS runners are the untested case, and it is a real one: they carry
-      # 14GB of storage, the same figure that filled on ubuntu-latest, and the
-      # directories deleted here are Linux SDKs the macOS images do not have, so
-      # there is no equivalent to delete. A macOS build that runs out of disk is
-      # the one way this matrix fails that a reviewer would not predict.
-      - name: free disk space
-        if: runner.os == 'linux'
-        run: |
-          pids=()
-          for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/local/.ghcup; do
-            sudo rm -rf "$dir" &
-            pids+=("$!")
-          done
-          for pid in "${pids[@]}"; do
-            wait "$pid" || exit 1
-          done
-          df -h /
+      # The macOS entries are the ones to watch if a runner runs out of space:
+      # they carry 14GB, and the directories the Linux entries would delete are
+      # Linux SDKs the macOS images do not have, so there was never anything to
+      # delete there anyway. Nothing currently mitigates that beyond the build
+      # being smaller, which is the measurement this run takes.
+      #
       # maturin needs an interpreter to build against. This does nothing for
       # the linux jobs, which are containerized, and the macOS runners would
       # otherwise supply whichever `python3` the image happens to ship. The
