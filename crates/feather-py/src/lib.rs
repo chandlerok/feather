@@ -252,9 +252,6 @@ impl ProjectScan for Online {
 ///     py: The calling thread's token, used to release the GIL.
 ///     f: The work to run against the store's state, with the GIL released.
 ///
-/// Returns:
-///     Whatever `f` returned.
-///
 /// Raises:
 ///     OSError: If another thread panicked while holding the lock, so the state cannot be
 ///         trusted.
@@ -289,9 +286,6 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
 ///
 /// Args:
 ///     inner: The store's state.
-///
-/// Returns:
-///     `Ok(())` once `inner.online` holds a store.
 ///
 /// Raises:
 ///     OSError: If the declared store directory cannot be opened.
