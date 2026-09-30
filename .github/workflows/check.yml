@@ -97,9 +97,10 @@ jobs:
       # entries, so a pull request writing this key would only push one that
       # matters toward eviction. The key this job computes is `v0-rust-rust-...`:
       # rust-cache builds it from the prefix, `GITHUB_JOB` and the runner
-      # platform, and `GITHUB_JOB` is this job's id, `rust`. A `shared-key` input
-      # replaces that job-id part rather than adding to it, which is how the
-      # wheel job gets an entry of its own.
+      # platform, and `GITHUB_JOB` is this job's id, `rust`. That id is also why
+      # the wheel job's entry is its own; a `shared-key` input replaces the
+      # job-id part rather than adding to it, and the wheel job passes one equal
+      # to its id.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -184,10 +185,11 @@ jobs:
       # dropped. A full key match still cost 1674s in `uv sync` against 78s from
       # the job's own entry, both figures measured under the bundled build.
       # Pinning the editable build to the rust job's dev profile did not change
-      # that, so the entry cannot serve a build of the extension at all: that job
-      # runs clippy and `cargo test`, which produce neither the feather-py cdylib
-      # nor the build graph `uv sync` resolves, so a restore from it cannot
-      # satisfy the sync however DuckDB is obtained.
+      # that, so the entry could not serve a build of the extension at all: that
+      # job runs clippy and `cargo test`, which produce neither the feather-py
+      # cdylib nor the build graph `uv sync` resolves. Whether that still
+      # separates the two jobs is the untested question above; what the
+      # measurement below explains is why they were separated.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: sync
