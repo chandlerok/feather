@@ -1156,9 +1156,12 @@ That is the intended shape in the cloud: no secret in the file, nothing to rotat
 
 ### Loadable extensions
 
-Nothing beyond Parquet and JSON is compiled into the engine. The crate exposes no feature for
-`httpfs`, `postgres`, `iceberg`, or `delta`, so those are loadable extensions rather than
-libraries, and a build cannot turn them on:
+The compiled-in set is DuckDB's own release configuration rather than something this repository
+chooses, because the engine is a prebuilt library and nothing here builds it. The library Feather
+links carries the Parquet reader, JSON, ICU and TPCH, which is the configuration DuckDB publishes;
+it does not carry `httpfs`, `postgres`, `iceberg`, or `delta`, so those are loadable extensions
+rather than libraries. Nothing in this repository's Cargo manifest can turn them on, because a
+manifest selects crate features rather than a DuckDB build:
 
 - `httpfs` is loaded on the first read of a URI path, and a configured object-store connection
   loads it at open, because the `s3` secret type comes from the extension itself. A project
