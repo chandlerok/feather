@@ -1,4 +1,5 @@
-//! In-process [`OnlineStore`], and the store a project serves from until it needs a shared one.
+//! In-process [`OnlineStore`], and the store a project serves from until it needs
+//! one on disk.
 //!
 //! Local mode runs on this: `feather.toml` with no `[store]` table. It is the default rather
 //! than a fallback, so it is written to be served from rather than merely to be correct.
@@ -7,21 +8,18 @@
 //! name and value are still separate allocations, as they were. A request asks for one or two
 //! fields per view on one entity, so searching that entity's index is the access pattern that
 //! matters, and a binary search over the names is expected to beat a hash per name, a win
-//! asserted rather than shown. A field name appears once,
-//! which the previous two-map layout did not manage for a field written with an expiry: the
-//! expiries map held that name a second time, and the entity key with it.
+//! asserted rather than shown. A field name appears once, which the previous two-map layout
+//! did not manage for a field written with an expiry: the expiries map held that name a second
+//! time, and the entity key with it.
 //!
 //! A field's expiry is remembered and never acted on: this store has no clock and reclaims
 //! nothing, and the read-time TTL check is the authoritative path in any case. Keeping the
-//! expiry visible is what lets a test assert what the write path asked for without a server.
+//! expiry visible is what lets a test assert what the write path asked for without a database.
 //!
-//! A write that carries no expiry drops any expiry this store already holds for that field,
-//! because that is what the server does: a field with no expiry is written as a plain `HSET`, and
-//! `HSET` clears whatever TTL the server holds for that field, the same way `SET` clears a key's
-//! TTL. The consequence is user-visible and intended: a view that drops its `ttl_days` stops
-//! asking for an expiry, the rewrite clears the old one, and its values stop expiring
-//! server-side. `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in
-//! The `online` tests in this module pin the same rule directly.
+//! A write that carries no expiry drops any expiry this store already holds for that field.
+//! The consequence is user-visible and intended: a view that drops its `ttl_days` stops asking
+//! for an expiry, the rewrite clears the old one, and its values stop being reclaimed.
+//! `a_write_without_an_expiry_clears_a_recorded_one` in this module pins the rule.
 
 use std::collections::HashMap;
 
@@ -83,8 +81,8 @@ impl Fields {
 /// An in-process [`OnlineStore`].
 #[derive(Debug, Default, Clone)]
 pub struct MemoryStore {
-    /// One entry per entity hash, with that entity's fields in name order.
-    hashes: HashMap<Box<[u8]>, Fields>,
+    /// One entry per entity key, with that entity's fields in name order.
+    keys: HashMap<Box<[u8]>, Fields>,
 }
 
 impl MemoryStore {
@@ -92,14 +90,14 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// Number of hashes held. Useful in assertions.
+    /// Number of entity keys held. Useful in assertions.
     pub fn hash_count(&self) -> usize {
-        self.hashes.len()
+        self.keys.len()
     }
 
-    /// One entity's fields, or `None` when the entity has no hash.
+    /// One entity's fields, or `None` when the entity is not in the store.
     pub fn fields(&self, key: &[u8]) -> Option<&Fields> {
-        self.hashes.get(key)
+        self.keys.get(key)
     }
 
     /// When one field was asked to expire, as Unix seconds, or `None` when nothing asked.
@@ -118,7 +116,7 @@ impl OnlineStore for MemoryStore {
             // entity's fields, which is what `materialize` does when it writes one batch per row
             // per view, because `OnlineStore::write` leaves the fields a batch does not mention
             // alone.
-            let mut entries = match self.hashes.remove(batch.key.as_slice()) {
+            let mut entries = match self.keys.remove(batch.key.as_slice()) {
                 Some(fields) => fields.entries.into_vec(),
                 None => Vec::new(),
             };
@@ -126,7 +124,7 @@ impl OnlineStore for MemoryStore {
                 let stored = Stored {
                     value: field.value.as_slice().into(),
                     // Carried through as written, including `None`, which clears whatever the
-                    // store held. That is the server's `HSET` behaviour the module documents.
+                    // store held. That is the rule the module documents.
                     expires_at_unix_secs: field.expires_at_unix_secs,
                 };
                 match entries.binary_search_by(|(name, _)| name.as_ref().cmp(field.name.as_str())) {
@@ -134,10 +132,10 @@ impl OnlineStore for MemoryStore {
                     Err(at) => entries.insert(at, (Box::from(field.name.as_str()), stored)),
                 }
             }
-            // A batch with no fields still leaves a hash, which is what this store did before it
+            // A batch with no fields still leaves a key, which is what this store did before it
             // was compacted and what `materialize` relies on when it decides not to write an
             // empty registry.
-            self.hashes.insert(
+            self.keys.insert(
                 batch.key.clone().into_boxed_slice(),
                 Fields {
                     entries: entries.into_boxed_slice(),
@@ -151,7 +149,7 @@ impl OnlineStore for MemoryStore {
         Ok(requests
             .iter()
             .map(|request| {
-                let fields = self.hashes.get(request.key.as_slice());
+                let fields = self.keys.get(request.key.as_slice());
                 request
                     .fields
                     .iter()
@@ -167,15 +165,14 @@ impl OnlineStore for MemoryStore {
 
     async fn delete_fields(&mut self, keys_and_fields: &[(Vec<u8>, Vec<String>)]) -> Result<()> {
         for (key, fields) in keys_and_fields {
-            let Some(existing) = self.hashes.remove(key.as_slice()) else {
+            let Some(existing) = self.keys.remove(key.as_slice()) else {
                 continue;
             };
             let mut entries = existing.entries.into_vec();
             entries.retain(|(name, _)| !fields.iter().any(|field| field.as_str() == name.as_ref()));
-            // A hash whose last field went is removed, which is what the server does when the
-            // last field of a key is deleted.
+            // An entity whose last field went is removed rather than left behind empty.
             if !entries.is_empty() {
-                self.hashes.insert(
+                self.keys.insert(
                     key.clone().into_boxed_slice(),
                     Fields {
                         entries: entries.into_boxed_slice(),
@@ -190,7 +187,7 @@ impl OnlineStore for MemoryStore {
 impl ProjectScan for MemoryStore {
     async fn hash_fields(&self, key: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(self
-            .hashes
+            .keys
             .get(key)
             .map(|fields| {
                 fields
@@ -205,7 +202,7 @@ impl ProjectScan for MemoryStore {
     async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>> {
         let prefix = crate::online::project_key_prefix(project);
         Ok(self
-            .hashes
+            .keys
             .keys()
             .filter(|key| key.starts_with(&prefix) && &key[..] != exclude)
             .map(|key| key.to_vec())
@@ -218,13 +215,10 @@ mod tests {
     use super::MemoryStore;
     use crate::online::{OnlineStore, WriteBatch, WrittenField};
 
-    /// A field written with no expiry loses the expiry the store already recorded for it,
-    /// because that is what the server does: the write is a plain `HSET`, which sets the value
-    /// and clears the field's TTL. A view whose definition loses its `ttl_days` writes `v:{view}`
-    /// this way and its values stop expiring server-side, which
-    /// `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in
-    /// The test above pins the same rule. The read path is then the only
-    /// thing that stops serving the value once it is stale.
+    /// A field written with no expiry loses the expiry the store already recorded for it. A
+    /// view whose definition loses its `ttl_days` writes `v:{view}` this way and its values
+    /// stop being reclaimed, which leaves the read-time check as the only thing that stops
+    /// serving one once it is stale.
     #[tokio::test]
     async fn a_write_without_an_expiry_clears_a_recorded_one() {
         let key = b"ads:user_id:2:u1".to_vec();
@@ -289,7 +283,7 @@ mod tests {
             .await
             .expect("a second write");
 
-        let fields = store.fields(&key).expect("the entity keeps its hash");
+        let fields = store.fields(&key).expect("the entity keeps its key");
         assert_eq!(
             fields.len(),
             2,
@@ -299,12 +293,12 @@ mod tests {
         assert_eq!(fields.get("v:alpha"), Some(b"a".as_slice()));
     }
 
-    /// A batch with no fields still leaves a hash, which is a deliberate divergence: the server
+    /// A batch with no fields still leaves a key, which is a deliberate divergence: the LSM
     /// queues nothing at all for an empty batch. `materialize` leans on this store creating the
-    /// hash for every key it is handed when it decides not to write an empty registry, so what
-    /// is pinned here is the hash being there rather than the fields being absent.
+    /// key for every one it is handed when it decides not to write an empty registry, so what
+    /// is pinned here is the key being there rather than the fields being absent.
     #[tokio::test]
-    async fn an_empty_batch_still_leaves_a_hash() {
+    async fn an_empty_batch_still_leaves_a_key() {
         let key = b"ads:user_id:2:u1".to_vec();
         let mut store = MemoryStore::new();
 
@@ -316,15 +310,14 @@ mod tests {
             .await
             .expect("a write with no fields");
 
-        assert_eq!(store.hash_count(), 1, "the key is a hash all the same");
-        let fields = store.fields(&key).expect("the key is a hash all the same");
-        assert!(fields.is_empty(), "and that hash holds no fields");
+        assert_eq!(store.hash_count(), 1, "the key is there all the same");
+        let fields = store.fields(&key).expect("the key is there all the same");
+        assert!(fields.is_empty(), "and it holds no fields");
     }
 
-    /// Deleting an entity's last field drops the entity rather than leaving an empty hash, which
-    /// is what the server does when the last field of a key is deleted. The hash count is per
-    /// entity and `scan_entity_keys` walks the same map, so an empty hash left behind would be a
-    /// key the server does not have.
+    /// Deleting an entity's last field drops the entity rather than leaving an empty one. The
+    /// count is per entity and `scan_entity_keys` walks the same map, so an empty entry left
+    /// behind would be a key the walk visits and a refresh deletes from for nothing.
     #[tokio::test]
     async fn deleting_the_last_field_drops_the_entity() {
         let key = b"ads:user_id:2:u1".to_vec();
@@ -358,7 +351,7 @@ mod tests {
         assert_eq!(
             store.hash_count(),
             0,
-            "the entity's hash went with its last field"
+            "the entity's key went with its last field"
         );
         assert!(store.fields(&key).is_none(), "so the entity is gone");
     }

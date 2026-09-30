@@ -44,7 +44,7 @@ use crate::value::encode_batch;
 pub struct ViewRefresh {
     /// The view's name, as declared.
     pub name: String,
-    /// Entity rows written, which is one `HSET` per entity.
+    /// Entity rows written, which is one store key per entity.
     pub rows: u64,
     /// The newest event timestamp any written row carried, in microseconds since the epoch.
     ///
@@ -157,7 +157,7 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
     // `OnlineStore::write` sets the fields it is given and leaves every other field alone, which
     // is what makes a full refresh safe to re-run, so a name that stays in the store is retired
     // by this refresh and by every refresh after it, each of which walks the whole keyspace to
-    // delete fields that are already gone. Removing the field is one `HDEL` at one key, and
+    // delete fields that are already gone. Removing the field is one delete at one key, and
     // removing a field that is already absent is a no-op, so this is safe to repeat.
     if !retired.is_empty() {
         store
@@ -185,10 +185,10 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
             registry.insert(view.name.clone(), encode_freshness(highest));
         }
     }
-    // An empty registry is not written. `MemoryStore` creates a hash for every key it is handed
-    // and an LSM queues no record at all for a batch with no fields, so writing one would
-    // leave the double holding a key the server never creates, and nothing was recorded either
-    // way: the next refresh reads the same empty registry and diffs the same declared set.
+    // An empty registry is not written. `MemoryStore` creates a key for every one it is handed
+    // and an LSM queues no record at all for a batch with no fields, so writing one would leave
+    // the map holding an entry the LSM never creates, and nothing was recorded either way: the
+    // next refresh reads the same empty registry and diffs the same declared set.
     if !registry.is_empty() {
         store
             .write(&[WriteBatch {
@@ -209,7 +209,7 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
     })
 }
 
-/// Remove a retired view's fields from every entity hash of a project.
+/// Remove a retired view's fields from every entity key of a project.
 ///
 /// The refresh already knows which views retired, from the registry it read. What it does not
 /// know is where their fields are, so the project's keyspace is walked once. That walk is the
@@ -221,7 +221,7 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
 ///     retired: The view names to remove the fields of. An empty list walks nothing.
 ///
 /// Returns:
-///     How many entity hashes were visited, whether or not they held anything.
+///     How many entity keys were visited, whether or not they held anything.
 ///
 /// Raises:
 ///     Whatever the store reports for a failed scan or deletion.
@@ -249,9 +249,9 @@ pub async fn collect_orphans<S: OnlineStore + ProjectScan>(
 
     let mut deletions = Vec::with_capacity(scanned.len());
     for key in scanned {
-        // Only a key shaped like an entity hash is touched. `HDEL` against a key that is not a
-        // hash fails with `WRONGTYPE`, so a walk that deleted blindly would fail a refresh over
-        // a key that has nothing to do with the view being retired.
+        // Only a key shaped like an entity key is touched. Everything else under the prefix
+        // belongs to something the view never wrote, and deleting at it would remove fields
+        // that are not a retired view's.
         if is_entity_hash_key(&key, project) {
             deletions.push((key, fields.clone()));
         }
@@ -296,15 +296,14 @@ fn select_views<'a>(
 ///
 /// Measured from the winning row's event timestamp rather than from the time of the write. A
 /// 40-day-old value under a 30-day TTL has already expired, and an expiry measured from the
-/// write would give it another 30 days of life; the read-time check would then disagree with
-/// what the server holds. `None` for a view that declares no TTL.
+/// write would give it another 30 days of life. `None` for a view that declares no TTL.
 ///
-/// Rounded up, so rounding is not what makes the server reclaim a field while the read-time
-/// check would still call it fresh. Rounding down opens a window just under a second wide where
-/// a value the read path would have served is already gone, which reports it as never written
-/// instead. The two sides read different clocks — the server's, against this absolute instant,
-/// and the caller's `now`, against the recorded freshness — so a skew between them is the one
-/// way left for the server to reclaim early, and no rounding direction can cover it.
+/// Rounded up. Neither store honours the expiry today — the embedded LSM drops it and the
+/// in-process map records it and never acts — so this is what a store that did reclaim would be
+/// given, and the rounding decides the sign of its error when one arrives. Down would open a
+/// window just under a second wide in which a value the read path still calls fresh is already
+/// gone, and the read path would report it as never written. A skew between the reclaiming
+/// store's clock and the caller's `now` is the one error left that no rounding covers.
 fn value_expiry_unix_secs(view: &FeatureView, event_micros: i64) -> Option<i64> {
     let ttl_days = view.ttl_days?;
     // Rounded up rather than down. `i64::div_ceil` is still unstable in this toolchain, so the
@@ -917,7 +916,8 @@ mod tests {
             .expect("refresh both views");
 
         // Something else under the same project prefix, holding a field named like a retired
-        // view's. A walk that deleted blindly would send `HDEL` at it.
+        // view's. A walk that deleted blindly would remove a field that is not a retired
+        // view's.
         store
             .write(&[WriteBatch {
                 key: b"ads:meta".to_vec(),

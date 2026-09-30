@@ -1,8 +1,9 @@
 //! Embedded LSM-backed [`OnlineStore`].
 //!
-//! fjall has no hash type, so the one-hash-per-entity layout that a hash store reads with a
-//! `HMGET` against is here a run of adjacent keys. That run is what the key encoding below is
-//! for, and getting it right is most of what this module does.
+//! fjall has no hash type, so one entity's fields — the unit a hash store would
+//! hold together and read with a single multi-field call — are here a run of
+//! adjacent keys. That run is what the key encoding below is for, and getting
+//! it right is most of what this module does.
 //!
 //! **Why the key is length-prefixed.** [`crate::key::entity_hash_key`] is
 //! `project:entity_name:` followed by the output of `encode_entity_key`, and the field names are
@@ -15,14 +16,14 @@
 //!
 //! which is unambiguous in both directions. It also groups one entity's fields into a single
 //! contiguous run, because the prefix is fixed for a given key, so a per-entity read is one range
-//! rather than one point get per field. That is what replaces the `HMGET`.
+//! rather than one point get per field. That range is what the collocated layout buys, and it
+//! is why the read cost does not grow with the number of views an entity carries.
 //!
 //! **The one thing this encoding gives up.** A project scan cannot be a prefix scan, because the
 //! length prefix comes first and it varies per entity. [`ProjectScan::scan_entity_keys`] is
 //! therefore a full keyspace walk that parses each record's key and filters by project. That is
 //! the right trade: the only caller is retiring a view, which is rare, whereas the serving path
-//! is a point read and must be exact. See `ponytail:` on that method.
-//!
+//! is a point read and must be exact. See `ponytail:` on that method.//!
 //! **Durability.** [`OnlineStore::write`] is called once per streamed batch, not once per
 //! refresh: `materialize` calls it from `accept()` for each `RecordBatch` the engine produces,
 //! so a large refresh is many calls. [`FjallStore::write`] therefore does **not** fsync per call
@@ -107,7 +108,7 @@ impl FjallStore {
 
     /// The keyspace the online store keeps its records in.
     ///
-    /// One keyspace rather than one per project, because a project is a key prefix and fjall already
+    /// One keyspace rather than one per project, because a project is a key prefix and fjall
     /// has prefix iteration. Splitting them would buy per-project compaction at the cost of a
     /// keyspace per project and a lookup to find it.
     const KEYSPACE: &str = "online";
@@ -196,8 +197,8 @@ impl OnlineStore for FjallStore {
     }
 
     async fn delete_fields(&mut self, keys_and_fields: &[(Vec<u8>, Vec<String>)]) -> Result<()> {
-        // Removing a field is a record delete, not a hash delete, so a retired view's fields go
-        // without touching the fields of the views still on the entity.
+        // Removing a field removes one record, so a retired view's fields go without touching
+        // the fields of the views still on the entity.
         let mut batch =
             fjall::OwnedWriteBatch::with_capacity(self._db.clone(), keys_and_fields.len());
         for (key, fields) in keys_and_fields {

@@ -683,8 +683,8 @@ impl FeatureStore {
                 .expect("open_online leaves a store in place");
 
             // One view slot per distinct view, in first-appearance order, holding that view's
-            // requested features in request order. One `HMGET` per entity asks for one field per
-            // view, so the whole request costs one store read per entity however many views it
+            // requested features in request order. One store read per entity asks for one field
+            // per view, so the whole request costs one read per entity however many views it
             // names, which is the rule the storage layout exists to make possible.
             let mut views: BTreeMap<String, FeatureView> = BTreeMap::new();
             let mut slots: Vec<(usize, usize)> = Vec::with_capacity(references.len());
