@@ -867,7 +867,7 @@ impl Engine {
     /// Run the reduced scan, handing each batch to `sink` before fetching the next.
     ///
     /// The connection is held for the whole scan, which is what the lint below notices. Holding
-    /// it is safe rather than merely convenient: the lock is uncontended by construction, since
+    /// it is safe: the lock is uncontended by construction, since
     /// every caller reaches the engine through the store's own mutex, and the one place that
     /// takes it exclusively, [`Engine::scan_latest_per_entity`], does so after this future has
     /// been dropped.
