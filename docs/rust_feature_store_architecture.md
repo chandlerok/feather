@@ -576,8 +576,8 @@ the format rules are recorded, with the evidence behind them, in
 - **Engine.** Local DuckDB via the `duckdb` Rust crate.
 - **Entity frame input.** The caller's entity frame is an Arrow record batch. It is appended to
   a temporary table with DuckDB's Arrow appender (`appender-arrow`) and joined as the left side
-  of the `ASOF` join. Columnar, no per-row work, no serialization, and no file to clean up. The
-  cost is extra C++ template compilation on a clean DuckDB build.
+  of the `ASOF` join. Columnar, no per-row work, no serialization, and no file to clean up. None
+  of the three routes costs build time the others do not, since the engine is a prebuilt library.
 
   Measured on an Apple M2 with 8 cores and 8 GiB, 500k entity rows against a 2M-row feature
   table, minimum of 3 repetitions, three runs:
@@ -1156,9 +1156,12 @@ That is the intended shape in the cloud: no secret in the file, nothing to rotat
 
 ### Loadable extensions
 
-Nothing beyond Parquet and JSON is compiled into the engine. The crate exposes no feature for
-`httpfs`, `postgres`, `iceberg`, or `delta`, so those are loadable extensions rather than
-libraries, and a build cannot turn them on:
+The compiled-in set is DuckDB's own release configuration rather than something this repository
+chooses, because the engine is a prebuilt library and nothing here builds it. The library Feather
+links carries the Parquet reader, JSON, ICU and TPCH, which is the configuration DuckDB publishes;
+it does not carry `httpfs`, `postgres`, `iceberg`, or `delta`, so those are loadable extensions
+rather than libraries. Nothing in this repository's Cargo manifest can turn them on, because a
+manifest selects crate features rather than a DuckDB build:
 
 - `httpfs` is loaded on the first read of a URI path, and a configured object-store connection
   loads it at open, because the `s3` secret type comes from the extension itself. A project

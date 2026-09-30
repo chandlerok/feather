@@ -1588,14 +1588,14 @@ fn extensions_for(
 }
 
 /// How a file format is read: the table function that yields its rows, and the DuckDB
-/// extension that has to be loaded first, or `None` when the bundled build already
+/// extension that has to be loaded first, or `None` when the engine already
 /// contains it.
 ///
 /// Both halves are here rather than on [`FileFormat`] because they are DuckDB's names,
 /// and `definitions.rs` is the language-neutral contract that no engine appears in.
 fn format_reader(format: FileFormat) -> (&'static str, Option<&'static str>) {
     match format {
-        // The bundled build compiles the Parquet reader in, so installing it would be a
+        // The engine compiles the Parquet reader in, so installing it would be a
         // no-op that can still fail on a machine that cannot reach the repository.
         FileFormat::Parquet => ("read_parquet", None),
         // Loadable, third-party maintained, and pre-1.0, so a source naming it opts in
@@ -2947,7 +2947,7 @@ mod tests {
 
     #[test]
     fn each_format_names_the_extension_it_needs_loaded() {
-        // Parquet is compiled into the bundled build, so naming no extension is what
+        // Parquet is compiled into the engine, so naming no extension is what
         // keeps a local project from touching the extension repository at all. Vortex is
         // loadable and third-party maintained, which is why a source naming it opts in.
         assert_eq!(format_reader(FileFormat::Parquet), ("read_parquet", None));

@@ -15,13 +15,13 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 arrow.workspace = true
 # `offline` is a default feature: `FeatureStore` runs the point-in-time join, so
-# the engine has to be in the wheel. That means bundled DuckDB, which compiles
-# from source, so every build of the extension now pays what this crate used to
-# avoid. It also means the Python CI job can no longer skip the C++ build.
+# the engine has to be in the wheel. That means DuckDB in every build of the
+# extension, which is a download and a link this crate used to avoid. It also means
+# the Python CI job can no longer skip the engine.
 feather-core = { path = "../feather-core" }
-# The serving surface. A `serve`-only build links this and not `offline`, so a deployment
-# that only serves carries no DuckDB and no C++ build. That is the point of keeping the
-# transport in its own crate.
+# The serving surface. A `serve`-only build links this and not `offline`, so a
+# deployment that only serves carries no DuckDB at all. That is the point of
+# keeping the transport in its own crate.
 feather-serve = { path = "../feather-serve", optional = true }
 # For `feather demo`, which writes the two Parquet files the generated project
 # reads. Same version as arrow, for the same reason: two Arrow majors in one

@@ -4,9 +4,9 @@
 # skip the install entirely and leave them missing. The explicit component step
 # in CI is the one that actually holds; this declaration is for a fresh machine.
 # Pinned, not floating. rust-cache puts the resolved rustc version in its cache
-# key, so `latest` invalidates the whole 2.3GB cargo entry the day a new release
-# lands and quietly turns the next run into a from-source DuckDB build. The
-# version is the one CI already resolved; bumping it is a deliberate cache reset.
+# key, so `latest` invalidates the whole cargo entry the day a new release lands
+# and the next run rebuilds every crate behind it. The version is the one CI
+# already resolved; bumping it is a deliberate cache reset.
 rust = { version = "1.98.1", components = ["rustfmt", "clippy"] }
 uv = "latest"
 # Pinned: hk.pkl amends a versioned schema URL, so a floating hk would drift away
@@ -149,7 +149,7 @@ run = "cargo bench --workspace --all-features"
 [tasks."bench:load"]
 description = "Load test the serving path, against the embedded store"
 # Only the fjall feature: the serving benchmark measures the online path, and pulling in
-# bundled DuckDB would add minutes to the build for nothing.
+# DuckDB would link a library the benchmark never calls.
 run = "cargo build --release -p feather-serve --examples"
 
 # --------------------------------------------------------------------- watch

@@ -1,9 +1,11 @@
 // Git hooks for feather.
 //
-// Deliberately fast checks only. `cargo clippy --all-features` is excluded
-// because it builds bundled DuckDB from source, which takes minutes; run it with
-// `mise run lint:rust` instead. The `fix` hook below can still autofix, and it is
-// opt-in via `hk fix`.
+// Deliberately fast checks only. `cargo clippy --all-features` is excluded as a
+// policy choice rather than a necessity now that DuckDB is downloaded rather
+// than compiled: it builds the whole workspace with every feature, and that is
+// a CI job's cost, not a commit hook's. Run it with `mise run lint:rust`
+// instead. The `fix` hook below can still autofix, and it is opt-in via
+// `hk fix`.
 //
 // Git here is 2.50, below the 2.54 cutoff, so `hk install` writes a script shim
 // into .git/hooks/ rather than using config-based hooks. `hk install --global`
