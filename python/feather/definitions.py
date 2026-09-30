@@ -189,9 +189,6 @@ def view_fields(view: type[FeatureView]) -> tuple[Field[Any], ...]:
     Args:
         view: The declared view class.
 
-    Returns:
-        The fields.
-
     Raises:
         ValueError: If the class declares no fields, which is almost always the
             decorator applied to the wrong class.

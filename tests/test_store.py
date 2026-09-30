@@ -166,9 +166,6 @@ def project(tmp_path: Path) -> Project:
 
     Args:
         tmp_path: The pytest temp directory.
-
-    Returns:
-        The project.
     """
     (tmp_path / "definitions").mkdir()
     clicks = tmp_path / "clicks.parquet"
