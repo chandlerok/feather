@@ -1,8 +1,9 @@
 //! Online storage and the read path.
 //!
 //! The store trait is deliberately narrow: it moves opaque field values in and
-//! out of hashes. Encoding, TTL, and missingness live above it, so the same
-//! logic runs against the in-process map and against the embedded LSM.
+//! out of keys. A key holds a named set of fields and nothing else, which is the
+//! unit both implementations happen to agree on, and encoding, TTL, and
+//! missingness live above it.
 //!
 //! There is no cache in the store.
 
@@ -65,7 +66,7 @@ impl WrittenField {
     }
 }
 
-/// One write: a hash key and the fields to set in it.
+/// One write: a key and the fields to set in it.
 ///
 /// "Set" rather than "insert", because a field already in the hash is overwritten. That is
 /// what makes a full refresh safe to re-run.
@@ -75,18 +76,19 @@ pub struct WriteBatch {
     pub fields: Vec<WrittenField>,
 }
 
-/// One `HMGET`: a hash key and the fields to read from it.
+/// One read: a key and the fields to read from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRequest {
     pub key: Vec<u8>,
     pub fields: Vec<String>,
 }
 
-/// A minimal hash store. Async because the real implementation is, and because
-/// pretending otherwise would make the serving path look cheaper than it is.
+/// A field store. Async so a networked store fits it without a rewrite; the
+/// embedded LSM does not need it, and pays for a future it does not poll. A
+/// synchronous trait would be wrong for the next implementation, not this one.
 #[allow(async_fn_in_trait)]
 pub trait OnlineStore {
-    /// Write fields into hashes. Fields not mentioned are left alone, which is
+    /// Write fields into keys. Fields not mentioned are left alone, which is
     /// what makes a full refresh safe to re-run.
     ///
     /// A field may carry an absolute expiry. A store that cannot honour one writes the value
@@ -94,7 +96,7 @@ pub trait OnlineStore {
     /// served, so an unexpired leftover costs reclamation and never correctness.
     async fn write(&mut self, batches: &[WriteBatch]) -> Result<()>;
 
-    /// Read fields from hashes, one `HMGET` per request, in request order.
+    /// Read fields from keys, one call per request, in request order.
     ///
     /// The outer `Vec` is per request and the inner is per requested field, in
     /// the order requested. A field that is absent yields `None`, which is how a
@@ -102,10 +104,13 @@ pub trait OnlineStore {
     async fn read(&self, requests: &[ReadRequest]) -> Result<Vec<Vec<Option<Vec<u8>>>>>;
 
     /// Remove fields, used when a view is retired.
+    ///
+    /// Removing a field that is already gone is a no-op, which is what lets a
+    /// refresh be repeated after a run that died partway through.
     async fn delete_fields(&mut self, keys_and_fields: &[(Vec<u8>, Vec<String>)]) -> Result<()>;
 }
 
-/// The reads that look at a project's whole keyspace rather than at one hash in it.
+/// The reads that look at a project's whole keyspace rather than at one key in it.
 ///
 /// Deliberately separate from [`OnlineStore`] rather than a method on it. `read_entities` bounds
 /// its store by that trait, and the serving path has no business reaching for a keyspace walk:
@@ -113,11 +118,11 @@ pub trait OnlineStore {
 /// only caller.
 #[allow(async_fn_in_trait)]
 pub trait ProjectScan {
-    /// Every field of one hash, as `(name, value)` pairs, and empty when there is no such key.
+    /// Every field of one key, as `(name, value)` pairs, and empty when there is no such key.
     ///
-    /// A whole hash rather than named fields, which is what [`OnlineStore::read`] takes, because
-    /// the project registry is read to learn which fields it holds. Asking for them one at a
-    /// time would mean knowing the answer in advance.
+    /// Every field rather than named ones, which is what [`OnlineStore::read`] takes, because
+    /// the project registry is read to learn which fields it holds. Naming them would mean
+    /// already knowing the answer.
     ///
     /// Args:
     ///     key: The hash key.
@@ -137,11 +142,11 @@ pub trait ProjectScan {
     /// Args:
     ///     project: The project whose keys are wanted.
     ///     exclude: A key to leave out. The caller names the project registry, which lives
-    ///         under the same prefix and is not an entity hash.
+    ///         under the same prefix and is not an entity key.
     ///
     /// Returns:
     ///     The keys, in no particular order. The caller filters them further; this is a key
-    ///     listing, not a promise that every key in it is an entity hash.
+    ///     listing, not a promise that every key in it is an entity key.
     async fn scan_entity_keys(&self, project: &str, exclude: &[u8]) -> Result<Vec<Vec<u8>>>;
 }
 
@@ -154,21 +159,6 @@ pub fn project_key_prefix(project: &str) -> Vec<u8> {
     prefix.extend_from_slice(project.as_bytes());
     prefix.push(b':');
     prefix
-}
-
-/// A project name escaped for a `SCAN` pattern.
-///
-/// `MATCH` reads `*`, `?`, `[` and `\` as pattern syntax, so a project named `ads*` would
-/// otherwise walk another project's keys. Backslash is the escape for all four.
-pub fn glob_escape(project: &str) -> String {
-    let mut escaped = String::with_capacity(project.len());
-    for character in project.chars() {
-        if matches!(character, '*' | '?' | '[' | ']' | '\\') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
 }
 
 /// Why a view's values are not usable for an entity.

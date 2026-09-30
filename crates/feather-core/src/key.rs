@@ -12,10 +12,11 @@
 //! many bytes, then expects a separator. That means no escaping rule to get wrong
 //! and no restriction on key contents.
 //!
-//! There is no cluster hash tag, and that is permanent rather than a v1
-//! shortcut. One hash is already one cluster slot, so every field of an entity is
-//! colocated by construction. A project-level tag would force every entity in the
-//! project into a single slot, which is the opposite of what a cluster is for.
+//! There is no cluster hash tag, and there never will be. The store is a
+//! directory one process opens, so there is no cluster to spread entities
+//! across and a project-level tag would only concentrate them. The tag question
+//! was worth answering before the networked tier it applied to was built; that
+//! tier is gone, and the key format it constrained went with it.
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{DataType, Int32Type, Int64Type};
@@ -150,7 +151,7 @@ pub fn entity_hash_key(project: &str, entity_name: &str, encoded: &[u8]) -> Vec<
     out
 }
 
-/// Split a hash key back into `(project, entity_name, encoded_key)`.
+/// Split a store key back into `(project, entity_name, encoded_key)`.
 pub fn parse_entity_hash_key(key: &[u8]) -> Result<(&str, &str, &[u8])> {
     fn malformed(reason: &str) -> Error {
         Error::MalformedEntityKey {
@@ -227,25 +228,24 @@ pub fn entity_key_component(column: &dyn Array, row: usize) -> Result<Vec<u8>> {
     }
 }
 
-/// Whether a key has the shape of an entity hash, `project:{entity}:{len}:{value}`.
+/// Whether a key has the shape of an entity key, `project:{entity}:{len}:{value}`.
 ///
-/// Garbage collection walks a project's keyspace and deletes only from the keys that look like
-/// an entity hash, so a key with nothing to do with the retired view — `{project}:views`,
-/// `{project}:meta` — is never sent a deletion at all. The encoded tail has to decode, which is
-/// the `{len}:` suffix that also keeps `{project}:views` from looking like an entity named
-/// `views`.
+/// The project walk hands back every key it finds under the prefix, and only an entity key's
+/// fields are a retired view's to delete. A key with nothing to do with the retired view —
+/// `{project}:views`, `{project}:meta` — is left out of the walk entirely. The encoded tail has
+/// to decode, which is the `{len}:` suffix that also keeps `{project}:views` from parsing as an
+/// entity named `views`.
 ///
-/// This is a check of the key's name, not of its type. The walk is `SCAN … MATCH` with no `TYPE
-/// hash`, so a key shaped like an entity hash but holding something else still reaches `HDEL`,
-/// and the server still answers `WRONGTYPE` for it; keeping that from happening is what adding
-/// `TYPE hash` to the scan would do, at the cost of a slower walk.
+/// This is a check of the key's name and nothing else. A key shaped like an entity key but
+/// holding something else still reaches [`crate::online::OnlineStore::delete_fields`], which is
+/// why the walk cannot be the one place that guarantees the deletion is well aimed.
 ///
 /// Args:
 ///     key: The key as it exists in the store.
 ///     project: The project the key is expected to belong to.
 ///
 /// Returns:
-///     `true` when the key parses as this project's entity hash.
+///     `true` when the key parses as this project's entity key.
 pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
     match parse_entity_hash_key(key) {
         Ok((found, _, encoded)) => found == project && decode_entity_key(encoded).is_ok(),
@@ -255,7 +255,7 @@ pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
 
 /// The project registry key, `{project}:views`.
 ///
-/// A hash whose fields are the view names a refresh has declared and whose values are each
+/// A key whose fields are the view names a refresh has declared and whose values are each
 /// view's newest event timestamp in microseconds, encoded the way
 /// [`crate::online::encode_freshness`] encodes a freshness field. The value is the newest
 /// timestamp *any* refresh has seen for that view, which is not always the last refresh's: a
@@ -268,15 +268,16 @@ pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
 /// written, so a first refresh over a source with no usable row leaves no key in either
 /// store.
 ///
-/// Losing the key is a different failure from a crash before it is written. Eviction under the
-/// configured `allkeys-lru`, a `DEL`, or a restore from an older snapshot all leave a project
-/// with entity hashes and no registry, and every later refresh then reads an empty map,
-/// retires nothing, and leaks a renamed view's fields for good. Nothing else records the
-/// previous declared view set, and the write-last ordering cannot cover it: that ordering
+/// Losing the key is a different failure from a crash before it is written. Nothing in an
+/// embedded store evicts it, but a directory restored from an older copy, or one handed to a
+/// fresh project, leaves entity keys and no registry, and every later refresh then reads an
+/// empty map, retires nothing, and leaks a renamed view's fields for good. Nothing else records
+/// the previous declared view set, and the write-last ordering cannot cover it: that ordering
 /// protects a run which dies before its own write, not a key that is already gone.
 ///
-/// The project name is not escaped, because a key is not a pattern. A caller that turns it
-/// into one has to escape it itself; [`crate::online::ProjectScan`] is where that happens.
+/// The project name is not escaped, because a key is not a pattern. Both stores that implement
+/// [`crate::online::ProjectScan`] walk and filter in code rather than handing a pattern to the
+/// engine, so nothing here has to be one.
 ///
 /// Args:
 ///     project: The project name.
