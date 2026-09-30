@@ -475,13 +475,12 @@ The distinction is preserved in the core: `Missing` is an enum with a variant pe
 null.** A client cannot tell a value that was never written from one that expired, or from a
 materialized null, and the online contract is nulls.
 
-The default is nulls-only because Arrow's null bitmap cannot separate the two cases, so
-exactness would have to be a separate column, and paying for it unconditionally would widen
-every response for a distinction most consumers ignore. Nothing returns that column yet.
-`Missing::as_str` exists and the enum is exhaustive, so adding a state column is a field on
-the response and a column per feature; what it needs is a decision about whether the online
-contract is nulls or a state mask, because a client that starts depending on the mask cannot be
-given nulls alone afterwards.
+Nulls is the right default because Arrow's null bitmap cannot separate the cases, so exactness
+would have to be a separate column, and paying for it unconditionally would widen every response
+for a distinction most consumers ignore. Nothing returns that column yet. `Missing::as_str`
+exists and the enum is exhaustive, so adding one is a field on the response and a column per
+feature; what it needs first is a decision about whether the contract is nulls or a state mask,
+because a client that starts depending on the mask cannot be given nulls alone afterwards.
 
 #### Freshness contract
 
@@ -1528,9 +1527,11 @@ distinction is real.
 
 ## Open design questions
 
-Two items remain open. Two further capabilities are deferred with triggers rather than left
-open, and they are documented where they belong: approximate aggregates in "Tile encoding",
-and incremental materialization in "Watermarks as a last resort".
+Two items are open, one needing a product decision and one an operational one. Two further
+capabilities are deferred with triggers rather than left open, and they are documented where they
+belong: approximate aggregates in "Tile encoding", and incremental materialization in
+"Watermarks as a last resort". A third section records the serving surface, which is built; it
+is here because what it does not do yet matters as much as what it does.
 
 ### Needs a product decision
 
