@@ -64,10 +64,13 @@ newest per profile, which was the wrong rule, as the next paragraph explains. Un
 through repeated build configurations, which per-tree duplication cannot account for. The recorded
 worst case was within 2.4Gi of full (#43). Nothing in that build graph compiles DuckDB any more, so
 the directory worth clearing today is `target/duckdb-download/`, roughly 40MB per target: it is a
-download cache, safe to delete outright, and the next build re-fetches it. When free space drops
-below about 4Gi, keep the two largest entries under it and delete the rest, not the two newest: a
-finished download is tens of megabytes, an aborted one leaves a stub with a fresh mtime, and
-newest-first therefore keeps the stubs and deletes the finished downloads. Name the directory rather
+download cache, safe to delete outright once nothing has been built against it, and the next
+build re-fetches it. Between a build and the test run that imports the extension it is not safe,
+because build.rs emits an rpath into this tree's target/duckdb-download, so deleting it leaves a
+built extension that will not load, and the failure is an import error rather than a build error.
+When free space drops below about 4Gi, keep the two largest entries under it and delete the rest,
+not the two newest: a finished download is tens of megabytes, an aborted one leaves a stub with
+a fresh mtime, and newest-first therefore keeps the stubs and deletes the finished downloads. Name the directory rather
 than a relative `target/`, and confirm nothing is building against it first, because deleting files
 under a running build breaks it. `pgrep -l cargo` does not confirm that on its own: the compiler is
 a child process, and a `rustc` here writes into the target directory, so a check that watches only

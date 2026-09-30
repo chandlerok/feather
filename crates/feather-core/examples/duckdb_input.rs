@@ -214,12 +214,12 @@ fn main() {
     let mechanisms = [
         Mechanism {
             name: "arrow appender",
-            note: "columnar, no serialization; extra C++ on clean build",
+            note: "columnar, no serialization",
             run: arrow_appender,
         },
         Mechanism {
             name: "row appender",
-            note: "per-row work; no extra build cost",
+            note: "per-row work",
             run: row_appender,
         },
         Mechanism {

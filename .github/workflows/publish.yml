@@ -134,9 +134,16 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
-      # No `sccache` here. maturin-action mounts only the workspace, the build
-      # script and the git and ssh credentials into the container, so sccache's
-      # directory lives in the container's filesystem and is discarded with it.
+      # No `sccache` here. There is no C++ compile left to cache: the DuckDB
+      # engine is a prebuilt library the build links rather than a source tree it
+      # compiles, so sccache had nothing to record for it. On the linux jobs it
+      # could not have worked anyway, because maturin-action mounts only the
+      # workspace, the build script and the git and ssh credentials into the
+      # container, which would leave sccache's directory in the container's
+      # filesystem to be discarded with it. The two apple-darwin entries are not
+      # containerized, so that reason never applied to them. Removing `sccache`
+      # also removed the only recorded mitigation for the macOS disk risk the
+      # cleanup above calls out, which nothing in this workflow replaces.
       #
       # `strip` is not on this command line. It is `strip = true` in
       # `[tool.maturin]`, which is the only way a publish job cannot forget it.
