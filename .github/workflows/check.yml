@@ -140,13 +140,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # No disk cleanup here, unlike the rust job. It was added for the 2267MB
-      # entry this job restored while the two jobs shared one cargo cache key,
-      # and that is what filled the disk: the runner died with "No space left on
-      # device" writing its own diagnostic log, part way through the restore,
-      # which is also why the job's log was missing rather than showing an
-      # error. The keys are separate again and this job's entry was 326MB under
-      # the bundled build, so the cleanup stays where it belongs.
+      # No disk cleanup here. It was added for the 2267MB entry this job
+      # restored while the two jobs shared one cargo cache key, and that is what
+      # filled the disk: the runner died with "No space left on device" writing
+      # its own diagnostic log, part way through the restore, which is also why
+      # the job's log was missing rather than showing an error. The keys are
+      # separate again, which is a change of its own and not a consequence of
+      # the DuckDB one, and this job's entry was 326MB under the bundled build.
       # renovate: datasource=github-tags depName=jdx/mise-action
       - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
       # astral-sh/setup-uv, pinned at v10.2.0
@@ -215,7 +215,13 @@ jobs:
       # astral-sh/setup-uv, pinned at v10.2.0
       # renovate: datasource=github-tags depName=astral-sh/setup-uv
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-      # No disk cleanup here either, for the reason the rust job gives.
+      # No disk cleanup here. It existed because this job needs more room than
+      # the rust job: the peak is a `maturin build --release` of the whole
+      # workspace into target/release and then `uv pip install dist/*.whl
+      # polars`, and on its first run the disk filled during the build, so the
+      # install died writing the extension out of the wheel. This job is green
+      # on the head that removed the step, so on ubuntu the removal is measured
+      # rather than argued.
       # A key of its own, not the python job's. That job's `uv sync` builds the
       # extension with the dev profile into target/debug and this one builds
       # target/release, so an entry restored from either is the wrong profile and
