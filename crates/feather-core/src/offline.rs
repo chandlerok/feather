@@ -193,9 +193,6 @@ impl Engine {
     ///         loadable extensions live.
     ///     connections: The project's named connections, keyed by the name a source refers to.
     ///
-    /// Returns:
-    ///     The engine.
-    ///
     /// Raises:
     ///     [`Error::SpillDirectory`] if the spill or extension directory cannot be created.
     ///         Checked here because DuckDB creates the directory it spills into but not its
@@ -228,10 +225,6 @@ impl Engine {
 
     /// Open the connection this engine reads through, replacing a discarded one.
     ///
-    /// Returns:
-    ///     `Ok(())` once a connection with the engine's settings, secrets, and spill
-    ///     directory is in place.
-    ///
     /// Raises:
     ///     [`Error::DuckDb`] if the connection cannot be opened, a setting is rejected, or a
     ///         configured secret is malformed.
@@ -241,9 +234,6 @@ impl Engine {
     }
 
     /// The connection this engine reads through, opening one if the last was discarded.
-    ///
-    /// Returns:
-    ///     A borrow of the live connection.
     ///
     /// Raises:
     ///     [`Error::DuckDb`] if a discarded connection cannot be reopened.
@@ -344,9 +334,6 @@ impl Engine {
     ///
     /// Args:
     ///     view: The view whose source decides which extension, if any, is needed.
-    ///
-    /// Returns:
-    ///     `Ok(())` once the filesystem or scanner the source needs is loaded.
     ///
     /// Raises:
     ///     [`Error::UnknownSourceFormat`] if a file source names a format Feather has no
@@ -475,9 +462,6 @@ fn cgroup_memory_limit() -> Option<String> {
 ///
 /// Args:
 ///     contents: The file's contents, which may be the literal `max` when unlimited.
-///
-/// Returns:
-///     A byte count as a string, or `None` when the file reports no real limit.
 fn memory_limit_from_cgroup(contents: &str) -> Option<String> {
     let bytes: u64 = contents.trim().parse().ok()?;
     // Both cgroup versions report an enormous sentinel rather than a flag when unlimited.
@@ -829,9 +813,6 @@ impl Engine {
     /// Args:
     ///     view: The view whose source is scanned.
     ///     sink: Receives each batch, in the order DuckDB produces them.
-    ///
-    /// Returns:
-    ///     `Ok(())` once the scan is exhausted and every batch has been accepted.
     ///
     /// Raises:
     ///     [`Error::MissingColumn`] if the source lacks a column the scan needs.
