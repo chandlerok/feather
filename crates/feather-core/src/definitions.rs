@@ -529,9 +529,6 @@ impl Definitions {
     /// Args:
     ///     connections: The project's `[connections]`, keyed by the name a source refers to.
     ///
-    /// Returns:
-    ///     `Ok(())` when every view's source resolves.
-    ///
     /// Raises:
     ///     [`Error::UnknownConnection`] if a source names a name that is not configured.
     ///     [`Error::SourceConnectionKind`] if the named connection is another kind.

@@ -47,7 +47,7 @@ jobs:
           ruff check python tests
           ruff format --check python tests
       # dprint owns every non-Rust, non-Python file type. Its plugin list lives
-      # in dprint.json; this step just checks the tree.
+      # in dprint.json; this step checks the tree.
       - name: data files
         run: dprint check
 
@@ -110,9 +110,8 @@ jobs:
         run: rm -rf target/*/build/libduckdb-sys-*
       # clippy is a component of the toolchain rather than a tool, so mise does
       # not treat it as missing, and a mise-action cache hit can leave it
-      # uninstalled: the first run died on `cargo-fmt` not being installed for
-      # the toolchain. Installing it here is explicit and does not depend on the
-      # cache being cold.
+      # uninstalled, which is how the rustfmt step above died. Installing it
+      # here is explicit and does not depend on the cache being cold.
       - name: rust components
         run: rustup component add clippy
       - name: clippy

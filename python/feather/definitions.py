@@ -189,9 +189,6 @@ def view_fields(view: type[FeatureView]) -> tuple[Field[Any], ...]:
     Args:
         view: The declared view class.
 
-    Returns:
-        The fields.
-
     Raises:
         ValueError: If the class declares no fields, which is almost always the
             decorator applied to the wrong class.
@@ -234,9 +231,11 @@ class FeatureService:
     """A named projection: a name and the features it exposes.
 
     Accepts declared fields, or a whole view to mean every field on it. The
-    name is the projection's identity rather than a wire handle; no read
-    consumes it. The field set resolves here, at construction, and a read names
-    fields, not this.
+    name is the wire handle: ``FeatureStore.serve()`` takes it, and the server
+    resolves this field set against the project's definitions once at startup,
+    so a service naming a view or a feature the project does not declare fails
+    at boot rather than on the first request. In-process reads do not use it;
+    they name fields directly.
 
     Deliberately not a registry object: it carries no entities, no version, and
     no infrastructure, because entities come from the referenced views.

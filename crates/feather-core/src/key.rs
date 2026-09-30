@@ -281,9 +281,6 @@ pub fn is_entity_hash_key(key: &[u8], project: &str) -> bool {
 ///
 /// Args:
 ///     project: The project name.
-///
-/// Returns:
-///     The registry key.
 pub fn views_registry_key(project: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(project.len() + b":views".len());
     out.extend_from_slice(project.as_bytes());
