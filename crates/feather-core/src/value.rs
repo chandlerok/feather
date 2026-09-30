@@ -70,7 +70,7 @@ impl SchemaTag {
     ///
     /// FNV-1a rather than `DefaultHasher` because the standard hasher is
     /// explicitly not stable across Rust releases, and this value is persisted
-    /// in Valkey. A tag that changed on a toolchain upgrade would invalidate
+    /// in the store. A tag that changed on a toolchain upgrade would invalidate
     /// every stored value.
     pub fn of(fields: &[Field]) -> Self {
         const OFFSET: u32 = 0x811c_9dc5;
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn the_tag_is_stable() {
-        // Persisted in Valkey, so it must not drift across builds.
+        // Persisted in the store, so it must not drift across builds.
         assert_eq!(SchemaTag::of(&fields()).0, SchemaTag::of(&fields()).0);
         // Pin the actual value so a refactor of the hash is caught.
         assert_eq!(

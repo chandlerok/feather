@@ -44,16 +44,12 @@ use feather_core::offline::ROW_COLUMN;
 use feather_core::online::fjall::FjallStore;
 #[cfg(feature = "offline")]
 use feather_core::online::memory::MemoryStore;
-#[cfg(all(feature = "offline", feature = "valkey"))]
-use feather_core::online::valkey::ValkeyStore;
 #[cfg(feature = "offline")]
 use feather_core::online::{
     EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues, WriteBatch,
 };
 #[cfg(all(feature = "offline", feature = "fjall"))]
 use feather_core::settings::Store as StoreSettings;
-#[cfg(feature = "offline")]
-use feather_core::settings::Valkey as ValkeySettings;
 #[cfg(feature = "offline")]
 use feather_core::{
     Definitions, FeatureView, JoinOptions, Limits, OfflineEngine, OnMissing, entity_key_component,
@@ -148,40 +144,37 @@ struct FeatureStore {
 struct Inner {
     /// The runtime the online store's I/O runs on.
     ///
-    /// Created once with the store rather than per call, and multi-threaded because the Valkey
-    /// client's connection manager needs a reactor to drive it. Blocking the Python thread on
-    /// it with `block_on` is sound here: that thread is not one of its workers, so there is no
+    /// Created once with the store rather than per call, and multi-threaded because the
+    /// serving transport runs one request per worker thread. Blocking the Python thread on it
+    /// with `block_on` is sound here: that thread is not one of its workers, so there is no
     /// runtime to nest inside.
     runtime: tokio::runtime::Runtime,
     engine: OfflineEngine,
     definitions: Definitions,
     /// The project name, which namespaces every online key.
     project: String,
-    /// The Valkey connection the settings declare, if any.
-    valkey: Option<ValkeySettings>,
     /// The embedded store the settings declare, if any. Read here so the write path and
     /// `serve()` open the same database, rather than each picking its own.
     #[cfg(feature = "fjall")]
     store: Option<StoreSettings>,
     /// The store features are served from, opened on the first online call.
     ///
-    /// `None` until then, so that constructing a store over a project whose Valkey is down
-    /// still works, and so that a project that never reads online never opens a connection.
+    /// `None` until then, so that constructing a store over a project whose store directory is
+    /// not yet created still works, and so that a project that never reads online never opens
+    /// a database.
     online: Option<Online>,
 }
 
 /// The online store a project serves from, which one it is decided by the settings.
 #[cfg(feature = "offline")]
 enum Online {
-    /// Local mode: the settings declare no Valkey, so the values live in this process.
+    /// Local mode: the settings declare no `[store]`, so the values live in this process and
+    /// die with it.
     Memory(MemoryStore),
     /// The settings declare an embedded store, so a refresh writes a database that outlives
     /// the process and that `serve()` can then open.
     #[cfg(feature = "fjall")]
     Fjall(Box<FjallStore>),
-    /// The settings declare a Valkey.
-    #[cfg(feature = "valkey")]
-    Valkey(Box<ValkeyStore>),
 }
 
 #[cfg(feature = "offline")]
@@ -191,8 +184,6 @@ impl OnlineStore for Online {
             Online::Memory(store) => store.write(batches).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.write(batches).await,
-            #[cfg(feature = "valkey")]
-            Online::Valkey(store) => store.write(batches).await,
         }
     }
 
@@ -204,8 +195,6 @@ impl OnlineStore for Online {
             Online::Memory(store) => store.read(requests).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.read(requests).await,
-            #[cfg(feature = "valkey")]
-            Online::Valkey(store) => store.read(requests).await,
         }
     }
 
@@ -217,8 +206,6 @@ impl OnlineStore for Online {
             Online::Memory(store) => store.delete_fields(keys_and_fields).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.delete_fields(keys_and_fields).await,
-            #[cfg(feature = "valkey")]
-            Online::Valkey(store) => store.delete_fields(keys_and_fields).await,
         }
     }
 }
@@ -230,8 +217,6 @@ impl ProjectScan for Online {
             Online::Memory(store) => store.hash_fields(key).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.hash_fields(key).await,
-            #[cfg(feature = "valkey")]
-            Online::Valkey(store) => store.hash_fields(key).await,
         }
     }
 
@@ -244,8 +229,6 @@ impl ProjectScan for Online {
             Online::Memory(store) => store.scan_entity_keys(project, exclude).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.scan_entity_keys(project, exclude).await,
-            #[cfg(feature = "valkey")]
-            Online::Valkey(store) => store.scan_entity_keys(project, exclude).await,
         }
     }
 }
@@ -301,7 +284,8 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
 /// Open the project's online store if it is not open yet.
 ///
 /// Opening is deferred to the first call that needs it, so a project can be constructed without
-/// a reachable Valkey and a project that only reads historical features never connects.
+/// a store directory it cannot open and a project that only reads historical features never
+/// opens one.
 ///
 /// Args:
 ///     inner: The store's state.
@@ -310,8 +294,7 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
 ///     `Ok(())` once `inner.online` holds a store.
 ///
 /// Raises:
-///     ConnectionError: If the settings declare a Valkey that cannot be reached, naming it.
-///     RuntimeError: If the settings declare a Valkey and this build has no Valkey support.
+///     OSError: If the declared store directory cannot be opened.
 #[cfg(feature = "offline")]
 fn open_online(inner: &mut Inner) -> PyResult<()> {
     if inner.online.is_some() {
@@ -321,15 +304,15 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
         #[cfg_attr(not(feature = "fjall"), allow(unused_mut))]
         let Inner {
             runtime,
-            valkey,
             #[cfg(feature = "fjall")]
             store,
             ..
         } = &*inner;
+        let _ = runtime;
         #[cfg(feature = "fjall")]
-        let opened = connect_online(runtime, valkey.as_ref(), store.as_ref())?;
+        let opened = connect_online(store.as_ref())?;
         #[cfg(not(feature = "fjall"))]
-        let opened = connect_online(runtime, valkey.as_ref())?;
+        let opened = connect_online()?;
         opened
     };
     inner.online = Some(opened);
@@ -339,73 +322,24 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
 /// Build the store the settings name.
 ///
 /// Args:
-///     runtime: The runtime the Valkey client's I/O runs on.
-///     configured: The settings' `[valkey]` table, or `None` for local mode.
+///     store: The settings' `[store]` table, or `None` for local mode.
 ///
 /// Returns:
-///     A Valkey-backed store when the settings declare one, and the in-process store
+///     The embedded store when the settings declare one, and the in-process map
 ///     otherwise, which is the document's local mode.
 ///
 /// Raises:
-///     ConnectionError: If the declared Valkey cannot be reached. The message names the
-///         endpoint, because a connection failure that does not say what it could not reach is
-///         the least useful kind.
-///     RuntimeError: If the settings declare a Valkey and this build has no Valkey support.
+///     OSError: If the declared store directory cannot be opened, naming the path.
 #[cfg(feature = "offline")]
-fn connect_online(
-    runtime: &tokio::runtime::Runtime,
-    configured: Option<&ValkeySettings>,
-    #[cfg(feature = "fjall")] store: Option<&StoreSettings>,
-) -> PyResult<Online> {
-    // An embedded store is checked before the Valkey connection so a project that declares
-    // both is an error rather than a silent preference: one is the store of record and the
-    // other would be a second, divergent copy.
-    #[cfg(feature = "fjall")]
-    if let (Some(store), Some(valkey)) = (store, configured) {
-        return Err(PyValueError::new_err(format!(
-            "`[store]` and `[valkey]` are both configured; declare one, because a refresh \
-             would write a database that `serve()` does not open, and the values would not \
-             agree (store path {}, valkey endpoint {})",
-            store.path, valkey.endpoint
-        )));
-    }
+fn connect_online(#[cfg(feature = "fjall")] store: Option<&StoreSettings>) -> PyResult<Online> {
     #[cfg(feature = "fjall")]
     if let Some(store) = store {
         return Ok(Online::Fjall(Box::new(
             FjallStore::open(&store.path, store.cache(), store.memtable()).map_err(core_error)?,
         )));
     }
-    let Some(configured) = configured else {
-        return Ok(Online::Memory(MemoryStore::new()));
-    };
-    #[cfg(feature = "valkey")]
-    {
-        // The settings keep the transport separate from the address, because a security flag
-        // guessed wrong is worse than one an operator wrote down; the client wants one URL.
-        let scheme = if configured.tls { "rediss" } else { "redis" };
-        let url = format!("{scheme}://{}", configured.endpoint);
-        let store = runtime
-            .block_on(ValkeyStore::connect(&url))
-            .map_err(|error| {
-                // Named in full rather than imported: the only use is behind this feature, and an
-                // import that is unused without it is one an unused-import cleanup will remove,
-                // which breaks the `--all-features` build for the sake of the default one.
-                pyo3::exceptions::PyConnectionError::new_err(format!(
-                    "could not connect to the Valkey at {}: {error}",
-                    configured.endpoint
-                ))
-            })?
-            .with_field_expiration(configured.field_expiration);
-        Ok(Online::Valkey(Box::new(store)))
-    }
-    #[cfg(not(feature = "valkey"))]
-    {
-        let _ = runtime;
-        Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "the settings declare a Valkey at {}, and this build has no Valkey support; install a build with the `valkey` feature",
-            configured.endpoint
-        )))
-    }
+    let _ = &store;
+    Ok(Online::Memory(MemoryStore::new()))
 }
 
 #[cfg(feature = "offline")]
@@ -450,7 +384,6 @@ impl FeatureStore {
                 engine,
                 project: definitions.project.clone(),
                 definitions,
-                valkey: settings.valkey,
                 #[cfg(feature = "fjall")]
                 store: settings.store,
                 online: None,
@@ -648,7 +581,7 @@ impl FeatureStore {
     /// Raises:
     ///     ValueError: If a named view is not declared, or a source cannot be read as its view
     ///         declares it.
-    ///     ConnectionError: If the settings declare a Valkey that cannot be reached.
+    ///     OSError: If the declared store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     #[pyo3(signature = (views = None))]
     fn materialize(
@@ -722,7 +655,7 @@ impl FeatureStore {
     ///         both the same join key and the same entity name, since the hash key carries the
     ///         name and one request reads one entity type; if the frame has no such column or has
     ///         a null in it; or if a requested feature name collides with a column of the frame.
-    ///     ConnectionError: If the settings declare a Valkey that cannot be reached.
+    ///     OSError: If the declared store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     fn get_online_features(
         &self,

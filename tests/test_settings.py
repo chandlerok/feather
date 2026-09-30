@@ -36,10 +36,8 @@ region = "us-east-1"
 key_id = "AKIAEXAMPLE"
 secret = "shhh"
 
-[valkey]
-endpoint = "valkey-cluster.internal.svc:6379"
-tls = true
-field_expiration = true
+[store]
+path = ".feather/online"
 """
 
 
@@ -79,7 +77,7 @@ def test_local_mode_needs_nothing_but_a_project(tmp_path: Path) -> None:
     assert settings.project == "ad_recommendations"
     assert settings.definitions == ["definitions/user_clicks.py"]
     assert settings.connections == {}
-    assert settings.valkey is None
+    assert settings.store is None
 
 
 def test_a_full_file_arrives_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,10 +95,8 @@ def test_a_full_file_arrives_typed(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert s3.key_id == "AKIAEXAMPLE"
     assert s3.secret.get_secret_value() == "shhh"
 
-    assert settings.valkey is not None
-    assert settings.valkey.endpoint == "valkey-cluster.internal.svc:6379"
-    assert settings.valkey.tls is True
-    assert settings.valkey.field_expiration is True
+    assert settings.store is not None
+    assert settings.store.path == ".feather/online"
 
 
 def test_secrets_are_not_leaked_by_repr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -320,7 +316,7 @@ def test_the_default_path_is_feather_toml() -> None:
 def test_settings_can_be_built_without_a_file() -> None:
     settings = FeatherSettings(project="p", definitions=["definitions/a.py"])
 
-    assert settings.valkey is None
+    assert settings.store is None
 
 
 def test_the_model_rejects_a_shape_the_core_would_not_produce() -> None:

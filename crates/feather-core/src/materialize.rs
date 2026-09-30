@@ -186,7 +186,7 @@ pub async fn materialize<S: OnlineStore + ProjectScan>(
         }
     }
     // An empty registry is not written. `MemoryStore` creates a hash for every key it is handed
-    // and `ValkeyStore` queues nothing at all for a batch with no fields, so writing one would
+    // and an LSM queues no record at all for a batch with no fields, so writing one would
     // leave the double holding a key the server never creates, and nothing was recorded either
     // way: the next refresh reads the same empty registry and diffs the same declared set.
     if !registry.is_empty() {
@@ -747,7 +747,7 @@ mod tests {
     async fn a_refresh_whose_source_yields_nothing_writes_no_registry() {
         // The registry is written only when it has something to record. A refresh over an empty
         // source has nothing, and the two stores disagreed about that: `MemoryStore` created an
-        // empty hash for the key while `ValkeyStore` queued no command at all and left the key
+        // empty record for the key while the LSM queued nothing at all and left the key
         // absent, so a test could see a registry the server never had.
         let source = Parquet::write(&source(&[]));
         let view = a_view(&source.string(), None);

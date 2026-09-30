@@ -21,7 +21,7 @@
 //! on the server, still through DuckDB.
 //!
 //! There is no skip guard. A server that never came up fails the test, for the same
-//! reason the Valkey and RustFS integration tests do not skip: a container that is broken
+//! reason the RustFS and other integration tests do not skip: a container that is broken
 //! in CI should be visible there rather than quietly passing.
 //!
 //! The endpoint and credentials come from the environment so the test can run against

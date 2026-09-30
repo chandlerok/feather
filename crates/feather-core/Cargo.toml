@@ -38,10 +38,6 @@ duckdb = { workspace = true, optional = true, features = [
   # comparison in examples/duckdb_input.rs.
   "appender-arrow",
 ] }
-redis = { workspace = true, optional = true, features = [
-  "tokio-comp",
-  "connection-manager",
-] }
 tokio = { workspace = true, optional = true }
 
 # The embedded online store, and the only thing the serving path needs. Twelve
@@ -62,23 +58,18 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 default = []
 # Bundled DuckDB. First build compiles DuckDB from source and takes minutes.
 offline = ["dep:duckdb"]
-# Real Valkey client. Unit tests use the in-memory fake instead.
-valkey = ["dep:redis", "dep:tokio"]
 # The embedded LSM online store. Deliberately not implied by `offline`: the two
 # are independent, and a serving-only build wants this one and nothing else.
 fjall = ["dep:fjall"]
-full = ["offline", "valkey", "fjall"]
-
-[[example]]
-name = "loadtest"
-# Declared here rather than with an inner #![cfg] in the file, which would cfg
-# out `main` too and break a plain `cargo test`.
-required-features = ["valkey"]
+# The in-process map, the other in-process store. `offline` needs a store to
+# write a refresh into, so it implies the cheapest one available.
+memory = []
+full = ["offline", "fjall", "memory"]
 
 [[example]]
 name = "duckdb_input"
 # Needs the offline feature for the duckdb crate. Without this, a plain
-# `cargo test --features valkey` fails to compile the example.
+# `cargo test --features fjall` fails to compile the example.
 required-features = ["offline"]
 
 [[example]]

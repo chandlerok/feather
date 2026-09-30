@@ -1,6 +1,6 @@
 //! Entity key encoding.
 //!
-//! One Valkey hash per entity, keyed by
+//! One entity per key, keyed by
 //! `{project}:{entity_name}:{encoded_entity_key}` where the encoded key is
 //!
 //! ```text
@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType, Int32Type, Int64Type};
 use crate::error::{Error, Result};
 
 /// Cap on a single entity key component, so one pathological key cannot produce
-/// an unbounded Valkey key.
+/// an unbounded store key.
 pub const MAX_COMPONENT_LEN: usize = 512;
 
 const SEPARATOR: u8 = b'|';
@@ -133,7 +133,7 @@ pub fn decode_entity_key(encoded: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(components)
 }
 
-/// Build the full Valkey hash key for an entity.
+/// Build the full store key for an entity.
 ///
 /// ```
 /// use feather_core::{encode_entity_key, entity_hash_key};

@@ -448,7 +448,7 @@ def test_refresh_with_no_view_named_refreshes_every_view(
 def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> None:
     """One store, not two.
 
-    A project with no Valkey in `feather.toml` is local mode, and the in-process
+    A project with no `[store]` in `feather.toml` is local mode, and the in-process
     store belongs to the `FeatureStore` that opened it. So the values a refresh
     writes are there for the object that wrote them, which is why this holds the
     store rather than opening a second one.

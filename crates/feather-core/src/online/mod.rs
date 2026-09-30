@@ -2,7 +2,7 @@
 //!
 //! The store trait is deliberately narrow: it moves opaque field values in and
 //! out of hashes. Encoding, TTL, and missingness live above it, so the same
-//! logic runs against the in-memory store and against Valkey.
+//! logic runs against the in-process map and against the embedded LSM.
 //!
 //! There is no cache in the store.
 
@@ -10,9 +10,6 @@ pub mod memory;
 
 #[cfg(feature = "fjall")]
 pub mod fjall;
-
-#[cfg(feature = "valkey")]
-pub mod valkey;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

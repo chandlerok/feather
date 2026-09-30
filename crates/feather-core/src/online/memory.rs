@@ -1,6 +1,6 @@
 //! In-process [`OnlineStore`], and the store a project serves from until it needs a shared one.
 //!
-//! Local mode runs on this: `feather.toml` with no `[valkey]` table. It is the default rather
+//! Local mode runs on this: `feather.toml` with no `[store]` table. It is the default rather
 //! than a fallback, so it is written to be served from rather than merely to be correct.
 //!
 //! Shape: one allocation for the entity's field index, its entries in name order; each field's
@@ -21,7 +21,7 @@
 //! TTL. The consequence is user-visible and intended: a view that drops its `ttl_days` stops
 //! asking for an expiry, the rewrite clears the old one, and its values stop expiring
 //! server-side. `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in
-//! `tests/valkey_integration.rs` pins that against a real Valkey.
+//! The `online` tests in this module pin the same rule directly.
 
 use std::collections::HashMap;
 
@@ -223,7 +223,7 @@ mod tests {
     /// and clears the field's TTL. A view whose definition loses its `ttl_days` writes `v:{view}`
     /// this way and its values stop expiring server-side, which
     /// `rewriting_a_field_without_an_expiry_clears_the_servers_expiry` in
-    /// `tests/valkey_integration.rs` pins against a real Valkey. The read path is then the only
+    /// The test above pins the same rule. The read path is then the only
     /// thing that stops serving the value once it is stale.
     #[tokio::test]
     async fn a_write_without_an_expiry_clears_a_recorded_one() {

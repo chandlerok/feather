@@ -43,5 +43,5 @@ cat <<'EOF'
 Done. Next:
   cargo fmt --all --check && ruff check python tests && dprint check
   mise run check        # what CI runs; slow, so let a push run it instead
-  mise run valkey:up    # before the integration tests
+  mise run s3:up        # before the integration tests
 EOF

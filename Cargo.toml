@@ -48,7 +48,6 @@ duckdb = { version = "~1.10505.0", default-features = false }
 # serving path depends on this and not on `duckdb`.
 fjall = { version = "3.1", default-features = false }
 futures-util = { version = "0.3", default-features = false }
-redis = { version = "1.7", default-features = false }
 tokio = { version = "1.53", default-features = false }
 tonic = { version = "0.14", default-features = false }
 

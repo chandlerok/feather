@@ -116,12 +116,11 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features \
             -- -D warnings
-      # The suite includes the Valkey, RustFS, and Postgres integration
-      # tests, which connect eagerly and have no skip guard: with nothing
+      # The suite includes the RustFS and Postgres integration tests,
+      # which connect eagerly and have no skip guard: with nothing
       # listening they fail rather than skip. docker-compose.yml is reused
-      # rather than bare containers so the tests meet the same maxmemory and
-      # eviction constraints they are written against, rather than passing on
-      # a roomier server than they target. RustFS comes up through the same
+      # rather than bare containers so the tests meet the same
+      # constraints they are written against. RustFS comes up through the same
       # task a developer runs, because the bucket these tests read from is
       # created there: the image ignores RUSTFS_DEFAULT_BUCKETS and has no
       # bucket-create subcommand. Postgres needs no such step, because
@@ -130,9 +129,8 @@ jobs:
       # source installs an extension from the DuckDB extension repository,
       # `httpfs` for a URI and `postgres` for a table, so the job needs
       # network beyond these containers.
-      - name: valkey, rustfs, and postgres
+      - name: rustfs and postgres
         run: |
-          mise run valkey:up
           mise run s3:up
           mise run postgres:up
       - name: test
@@ -202,16 +200,10 @@ jobs:
       # guarantees go unenforced.
       - name: pyrefly
         run: uv run --no-sync pyrefly check
-      # The suite includes three tests marked `integration`, which read and write
-      # a real Valkey: the round trip, a rename that retires a view, and two
-      # threads sharing one store. They connect eagerly and have no skip guard,
-      # so with nothing listening they fail rather than skip. That is why the
-      # rust job starts services for the same class of test. The constrained
-      # container from docker-compose.yml is reused rather than a bare one, so
-      # the tests meet the maxmemory and eviction limits they are written
-      # against.
-      - name: valkey
-        run: mise run valkey:up
+      # No container is started for this job. The three online-store tests that used to need a
+      # real Valkey now run against the embedded store in a per-project temp directory, so the
+      # round trip, a rename that retires a view, and two threads sharing one store are all
+      # ordinary unit tests here rather than integration ones.
       - name: pytest
         run: uv run --no-sync pytest
       - name: services down

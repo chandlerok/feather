@@ -136,10 +136,10 @@ def demo(directory: Path, *, force: bool = False) -> None:
 def refresh(directory: Path, views: Sequence[str]) -> None:
     """Refresh the project's views into the online store.
 
-    A project with no Valkey in its settings is local mode, and its online store
+    A project with no ``[store]`` in its settings is local mode, and its online store
     is in-process and belongs to the store object that opened it. So the values
     written here are served to this process and to nothing after it; a
-    deployment that serves from more than one process configures a Valkey, and
+    deployment that serves from more than one process configures a store, and
     the same call writes to that.
 
     Args:
@@ -151,7 +151,7 @@ def refresh(directory: Path, views: Sequence[str]) -> None:
         FileNotFoundError: If there is no ``feather.toml`` in ``directory``.
         ValueError: If a named view is not declared, or a source cannot be read as
             its view declares it.
-        ConnectionError: If the settings declare a Valkey that cannot be reached.
+        OSError: If the declared store directory cannot be opened.
     """
     from feather import FeatureStore
 
@@ -196,7 +196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "refresh":
             refresh(args.directory, args.views)
     except Exception as error:
-        # ConnectionError is an OSError, so a Valkey that cannot be reached is
+        # An unreadable store is an OSError, so a store that cannot be opened is
         # already covered. The catch is broad because a definition module is the
         # user's own Python, imported by exec_module, so a typo in it is a
         # SyntaxError, a NameError or an AttributeError and none of those is an

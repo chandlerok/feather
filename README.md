@@ -1,13 +1,13 @@
 # Feather
 
 An opinionated feature store with a Rust core and a native Python API. Online serving reads
-from an in-process store, or from Valkey over async `tokio` I/O to share one across processes.
-Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
+from an embedded store, and `FeatureStore.serve()` turns the calling process into a feature
+server over Arrow Flight. Historical point-in-time joins run in an embedded DuckDB engine over
+Arrow.
 
 > **Status: early implementation.** The definition layer, entity key encoding, value codec,
-> and the online serving layer are built and measured against Valkey, the position a
-> deployment graduates to, and materialization writes a view's values into the online store
-> from its source. The point-in-time join is built over local
+> and the online serving layer are built and measured, and materialization writes a view's
+> values into the online store from its source. The point-in-time join is built over local
 > Parquet, object storage, and a Postgres table, and `FeatureStore` exposes the join, the
 > refresh, and the online read to Python. Warehouse sources read through an Iceberg REST
 > catalog are design only. There is no served API yet, and the `feather` command is not on
@@ -25,10 +25,11 @@ Historical point-in-time joins run in an embedded DuckDB engine over Arrow.
 - **Point-in-time joins in-process.** An embedded DuckDB engine computes `ASOF` joins over
   local Parquet, object storage, or a table in a configured database. No separate compute
   cluster is required for local or medium-scale workloads.
-- **In-process online reads by default.** Online serving reads an in-process store, or Valkey
-  over async `tokio` I/O in a deployment, when one writable store needs to be shared across
-  processes, with a read-time TTL check. The serving figures in the architecture document are
-  measured against Valkey, on a stated container.
+- **An embedded store, and a server that owns it.** Online serving reads from a store inside
+  the process, with a read-time TTL check, and `serve()` serves it over Arrow Flight. The store
+  is a database that one process opens at a time, which is why the server is the only thing that
+  opens it. A point read costs single-digit microseconds warm where a networked KV store pays a
+  round trip; see `docs/serving-transport.md`.
 - **No registry or lockfile.** Feature definitions are Python modules that both the offline
   and serving paths import directly. Git versions them; there is no generated artifact to
   drift.
@@ -147,10 +148,10 @@ removes its fields from every entity that still carries them. Name views to refr
 subset: `feather refresh user_clicks`. That refreshes the project you are standing in, so
 from somewhere else pass `-C`: `feather refresh -C my_feature_store user_clicks`.
 
-A generated project declares no Valkey, so its online store is in-process and belongs to
-the `FeatureStore` that opened it: the values are there for the process that refreshed them
-and for nothing after it. A deployment that serves from more than one process puts a
-Valkey in `feather.toml`, and the same command writes to that instead.
+A generated project declares no `[store]`, so its online store is an in-process map that
+belongs to the `FeatureStore` that opened it: the values are there for the process that
+refreshed them and for nothing after it. A deployment puts a path in `feather.toml` under
+`[store]`, and the same command writes a database instead, which `serve()` then opens.
 
 ## Going to production
 

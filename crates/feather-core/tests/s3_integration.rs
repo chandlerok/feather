@@ -13,7 +13,7 @@
 //! re-implementing that wiring.
 //!
 //! There is no skip guard. An endpoint that never came up fails the test, for the same
-//! reason the Valkey integration tests do not skip: a container that is broken in CI
+//! reason the other integration tests do not skip: a container that is broken in CI
 //! should be visible there rather than quietly passing.
 //!
 //! The endpoint, credentials, and bucket come from the environment so the test can run
