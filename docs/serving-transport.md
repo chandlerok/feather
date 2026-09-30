@@ -3,6 +3,10 @@
 Status: **measurement, not a decision record.** One question was asked and answered: if a user's
 own process hosts the serving surface, does the Python in that process cost anything?
 
+This is the current shape of serving. The transport decision itself, the storage layout it reads
+from, and what is not built (there is no authentication) are in the "Online serving layer"
+section of [`rust_feature_store_architecture.md`](./rust_feature_store_architecture.md).
+
 ## The question
 
 `FeatureStore.serve()` makes the caller the server. Python imports the module and blocks. If the
@@ -69,6 +73,8 @@ released across the blocking `serve`, and a user's other threads keep running.
   than compared against a source of truth.
 - **One host, one box.** Nothing here says anything about what happens with a replica per pod,
   which is where the consistency questions live.
+- **Nothing here was measured behind an authenticating proxy**, because there is no
+  authentication to put in front of. Every figure is loopback.
 
 ## What follows
 
@@ -76,6 +82,11 @@ released across the blocking `serve`, and a user's other threads keep running.
 application, and the store can be embedded. The three hold together: the feature server is the
 only thing that opens the directory, so there is one writer set, and a push is visible to every
 reader without a fan-out.
+
+The cost is that a refresh cannot run while the server holds the directory, so a deployment
+schedules the two against each other. That is the one operational consequence of embedding the
+store, and it is why a project that needs both up at once needs a store that permits a second
+writer.
 
 ## Reproducing
 
@@ -91,22 +102,19 @@ cargo build --release -p feather-serve --examples
 ./target/release/examples/bench_client 127.0.0.1:8815 8 12 8
 ```
 
-Every argument is positional. There is no runner script and there are no environment variables;
-an earlier draft of this section showed both, and neither exists.
+Every argument is positional. There is no runner script and there are no environment variables.
 
-**The Python host does not ship.** The rows above labelled "Python (pyo3, GIL released)" and
-the `python thread progressed` log came from a throwaway pyo3 module built against this crate by
-path, living outside the repository. It is not in the diff, so **the Python-host column cannot be
-reproduced from what is here.** The part that is reproducible is that `serve_rust` is the same
-`feather_serve::serve` call a Python `FeatureStore.serve()` makes, differing only in the host
-process, which is why comparing the two isolates the cost of hosting in Python.
+**The Python host does not ship.** The row above labelled "Python (pyo3, GIL released)" and the
+`python thread progressed` log came from a throwaway pyo3 module built against this crate by
+path, living outside the repository, so **the Python-host column cannot be reproduced from what
+is here.** What is reproducible is that `serve_rust` makes the same `feather_serve::serve` call
+a Python `FeatureStore.serve()` makes, differing only in the host process, which is why
+comparing the two isolates the cost of hosting in Python. Reproducing the column needs a pyo3
+module that calls it, which is what `crates/feather-py` does through `_core.serve`. A harness
+built the same way belongs in this tree rather than in `/tmp`; until one lands, treat that
+column as what it is, a reading from a prototype.
 
-Reproducing it needs a pyo3 module that calls `feather_serve::serve`, which is what
-`crates/feather-py` now does through `_core.serve`. A measurement harness built the same way
-would belong here rather than in `/tmp`; until one lands, treat the Python column as the number
-it is: a reading from a prototype that this change does not ship.
-
-The point-read figures in the comparison above come from a separate standalone bench that is also
-not in this diff. The 5.5us warm and ~150us cold readings for the store are reproducible with
-`fill_store` plus `bench_client`; the Valkey figures are Feast's published numbers for a Redis
-Cluster, not a measurement taken here.
+The point-read figures in the comparison above come from a separate standalone bench that is
+also not in this repository. The 5.5us warm and ~150us cold readings for the store are
+reproducible with `fill_store` plus `bench_client`; the Valkey figures are Feast's published
+numbers for a Redis Cluster, not a measurement taken here.
