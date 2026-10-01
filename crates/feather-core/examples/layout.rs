@@ -37,14 +37,14 @@
 //!
 //! Three figures per case, and they answer different questions:
 //!
-//! - **bytes read** is what the parquet reader actually pulled through, from the
+//! - **bytes read** is what the parquet reader pulled through, from the
 //!   kernel's `rchar` counter across the join. DuckDB's own query profile was the
 //!   first choice and cannot answer it: on 1.105.05 the `READ_PARQUET` operator
 //!   reports `Total Files Read` and nothing about rows or bytes, so the number would
 //!   have to be invented.
 //! - **row groups out of range** is read from the file's footer, so it is the most the
 //!   layout could let the reader skip, not a record of what it skipped. Comparing it
-//!   with the bytes actually read is what tells the two apart.
+//!   with the bytes read is what tells the two apart.
 //! - **join ms** is the minimum over `REPEATS` runs, for the reason
 //!   `examples/duckdb_input.rs` gives.
 //! - **matched** is the non-null half of the join's output, and the only figure here

@@ -77,8 +77,8 @@ pub struct ReadRequest {
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
     pub name: String,
-    /// The entity every view in the service shares, which is what makes one hash key per entity
-    /// possible: the views are collocated, so one store read covers all of them.
+    /// The entity every view in the service shares, which is what makes one store key per entity
+    /// possible: the views are collocated, so one read covers all of them.
     pub entity_name: String,
     /// `(view, feature)` per requested column, **in the order the client wants them back**.
     pub features: Vec<(String, String)>,

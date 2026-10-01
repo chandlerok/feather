@@ -96,7 +96,7 @@ impl SchemaTag {
 /// A batch of encoded vectors in one buffer, with each row's byte range.
 ///
 /// One allocation and one pass, rather than a `Vec<Vec<u8>>` per entity. The
-/// writer slices this buffer per entity when issuing `HSET`.
+/// writer slices this buffer per entity as it writes each entity's field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedBatch {
     pub buf: Vec<u8>,
@@ -376,7 +376,7 @@ impl Builder {
 /// Decode many encoded vectors into Arrow arrays of the same length.
 ///
 /// `bufs` is in entity order, matching what the read path gets back from one
-/// `HMGET` per entity.
+/// store read per entity.
 pub fn decode_batch(
     fields: &[Field],
     expected: SchemaTag,

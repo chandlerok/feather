@@ -68,11 +68,7 @@ path = "{store_path}"
 
 
 def now_micros() -> int:
-    """The current time, in microseconds since the epoch.
-
-    Returns:
-        The current time.
-    """
+    """The current time, in microseconds since the epoch."""
     return time.time_ns() // 1_000
 
 
@@ -126,9 +122,6 @@ def make_project(
         project: The project name, which namespaces every online key.
         store: Whether `feather.toml` declares an embedded store. The path is unique
             per project, so two tests in one run cannot open each other's database.
-
-    Returns:
-        The project.
     """
     (tmp_path / "definitions").mkdir(exist_ok=True)
     clicks = tmp_path / "clicks.parquet"
@@ -172,9 +165,6 @@ def project(tmp_path: Path) -> Project:
 
     Args:
         tmp_path: The pytest temp directory.
-
-    Returns:
-        The project.
     """
     return make_project(tmp_path)
 

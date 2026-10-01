@@ -122,8 +122,8 @@ jobs:
       # they carry 14GB, a figure inherited from the base and not re-measured
       # against the labels the matrix names today, and the directories the Linux
       # entries would delete are Linux SDKs the macOS images do not have, so
-      # there was never anything to delete there anyway. Nothing currently
-      # mitigates that beyond the build being smaller. A tag push is the release
+      # there was never anything to delete there anyway. Nothing mitigates that
+      # beyond the build being smaller. A tag push is the release
       # rather than a measurement, so the evidence is a `workflow_dispatch` run
       # of this branch: run 36656505586 built all four wheels green with the
       # step gone.
@@ -142,11 +142,11 @@ jobs:
       # compiles, so sccache had nothing to record for it. On the linux jobs it
       # could not have worked anyway, because maturin-action mounts only the
       # workspace, the build script and the git and ssh credentials into the
-      # container, which would leave sccache's directory in the container's
-      # filesystem to be discarded with it. The two apple-darwin entries are not
-      # containerized, so that reason never applied to them. Removing `sccache`
-      # also removed the only recorded mitigation for the macOS disk risk the
-      # cleanup above calls out, which nothing in this workflow replaces.
+      # container, leaving sccache's directory in a filesystem that is discarded
+      # with it. The two apple-darwin entries are not containerized, so that
+      # reason never applied to them. Removing `sccache` also removed the only
+      # recorded mitigation for the macOS disk risk the cleanup above calls out,
+      # and nothing in this workflow replaces it.
       #
       # `strip` is not on this command line. It is `strip = true` in
       # `[tool.maturin]`, which is the only way a publish job cannot forget it.
@@ -245,7 +245,7 @@ jobs:
           }
       # No `username` and no `password` input. The action exchanges the OIDC
       # token for a short-lived one by itself, which is the entire reason step 2
-      # of the handoff above exists; a token in this repository would be a
-      # strictly worse version of the same thing.
+      # of the handoff above exists. A token in this repository would publish
+      # less safely, and would have to be rotated.
       # renovate: datasource=github-tags depName=pypa/gh-action-pypi-publish
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

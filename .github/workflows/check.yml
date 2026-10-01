@@ -47,7 +47,7 @@ jobs:
           ruff check python tests
           ruff format --check python tests
       # dprint owns every non-Rust, non-Python file type. Its plugin list lives
-      # in dprint.json; this step just checks the tree.
+      # in dprint.json; this step checks the tree.
       - name: data files
         run: dprint check
 
@@ -103,13 +103,15 @@ jobs:
       # is not. This is deliberate rather than a separate cache on the library:
       # a cache keyed on that path misses for exactly the same reason, so it
       # cannot bootstrap a first run.
+      #
+      # The same step and the same reasoning are in the python and wheel jobs,
+      # because each of them restores its own target/.
       - name: the DuckDB library is not in the target cache
         run: rm -rf target/*/build/libduckdb-sys-*
       # clippy is a component of the toolchain rather than a tool, so mise does
       # not treat it as missing, and a mise-action cache hit can leave it
-      # uninstalled: the first run died on `cargo-fmt` not being installed for
-      # the toolchain. Installing it here is explicit and does not depend on the
-      # cache being cold.
+      # uninstalled, which is how the rustfmt step above died. Installing it
+      # here is explicit and does not depend on the cache being cold.
       - name: rust components
         run: rustup component add clippy
       - name: clippy
@@ -193,29 +195,19 @@ jobs:
       # guess. The two matrix entries do share with each other, which is free:
       # they are one job id.
       #
-      # What survives the prebuilt library is why the key cannot simply be
-      # dropped. A full key match still cost 1674s in `uv sync` against 78s from
-      # the job's own entry, both figures measured under the bundled build.
-      # Pinning the editable build to the rust job's dev profile did not change
-      # that, so the entry could not serve a build of the extension at all: that
-      # job runs clippy and `cargo test`, which produce neither the feather-py
-      # cdylib nor the build graph `uv sync` resolves. Whether that still
-      # separates the two jobs is the untested question above; what the
-      # measurement below explains is why they were separated.
+      # What still argues for a key of its own is that the two jobs do not build
+      # the same thing. `uv sync` resolves the editable extension against
+      # target/release; the rust job runs clippy and `cargo test`, which produce
+      # neither the feather-py cdylib nor the build graph `uv sync` resolves, so
+      # a full key match cost 1674s in `uv sync` against 78s from the job's own
+      # entry. Whether the prebuilt library reopened that gap is the untested
+      # question above.
       # renovate: datasource=github-tags depName=Swatinem/rust-cache
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # rust-cache restores target/**, which includes libduckdb-sys's build-script
-      # output, so a restored target/ carries a fresh fingerprint for that script.
-      # It does not carry the libduckdb.so that output points at: the recorded
-      # -L target/duckdb-download/.../1.5.5 is present and the directory is empty,
-      # and the link fails with "unable to find library -lduckdb". Deleting the
-      # build-script output makes cargo re-run the script, which re-downloads the
-      # library (about 40MB, seconds) when it is missing and does nothing when it
-      # is not. This is deliberate rather than a separate cache on the library:
-      # a cache keyed on that path misses for exactly the same reason, so it
-      # cannot bootstrap a first run.
+      # The DuckDB library is not in this job's target cache either. The
+      # reasoning is in the rust job.
       - name: the DuckDB library is not in the target cache
         run: rm -rf target/*/build/libduckdb-sys-*
       - name: sync
@@ -227,10 +219,11 @@ jobs:
       # guarantees go unenforced.
       - name: pyrefly
         run: uv run --no-sync pyrefly check
-      # No container is started for this job. The three online-store tests that used to need a
-      # real Valkey now run against the embedded store in a per-project temp directory, so the
-      # round trip, a rename that retires a view, and two threads sharing one store are all
-      # ordinary unit tests here rather than integration ones.
+      # No container is started for this job. The three online-store tests that
+      # used to need a real Valkey now run against the embedded store in a
+      # per-project temp directory, so the round trip, a rename that retires a
+      # view, and two threads sharing one store are all ordinary unit tests here
+      # rather than integration ones.
       - name: pytest
         run: uv run --no-sync pytest
       - name: services down
@@ -274,16 +267,8 @@ jobs:
         with:
           shared-key: wheel
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # rust-cache restores target/**, which includes libduckdb-sys's build-script
-      # output, so a restored target/ carries a fresh fingerprint for that script.
-      # It does not carry the libduckdb.so that output points at: the recorded
-      # -L target/duckdb-download/.../1.5.5 is present and the directory is empty,
-      # and the link fails with "unable to find library -lduckdb". Deleting the
-      # build-script output makes cargo re-run the script, which re-downloads the
-      # library (about 40MB, seconds) when it is missing and does nothing when it
-      # is not. This is deliberate rather than a separate cache on the library:
-      # a cache keyed on that path misses for exactly the same reason, so it
-      # cannot bootstrap a first run.
+      # The DuckDB library is not in this job's target cache either. The
+      # reasoning is in the rust job.
       - name: the DuckDB library is not in the target cache
         run: rm -rf target/*/build/libduckdb-sys-*
       # maturin needs an interpreter to build against, and whether a bare `python`
@@ -296,18 +281,16 @@ jobs:
       # the command below carries no --release, so the wheel this job checks is
       # built unoptimized into target/maturin, while the python job's editable
       # build is target/release. publish.yml passes --release because the file
-      # it uploads is the one a user installs, which makes the profile it builds
-      # the profile that has to be right. A release build here would measure a
-      # second, unmeasured build of the extension on a 2-core runner, so the job
-      # checks the profile that is cheap and leaves the gap written down.
+      # it uploads is the one a user installs. A release build here would measure
+      # a second, unmeasured build of the extension on a 2-core runner, so the
+      # job checks the profile that is cheap and leaves the gap written down.
       #
       # `--strip` is the one flag here that is not incidental, because the wheel
       # is almost entirely DuckDB's symbol table and PyPI refuses a file over
-      # 100MB, so a wheel that skipped this would not upload, rather than merely
-      # being large. The 255MB unstripped and 24MB stripped figures belong to the
-      # bundled static archive; the shared library this wheel links is a
-      # different size, and this step's first run measured it at 32MB. That is
-      # the dev profile's figure, not the shipped wheel's size.
+      # 100MB, so a wheel that skipped this would not upload. The 255MB
+      # unstripped and 24MB stripped figures belong to the bundled static
+      # archive; the shared library this wheel links is a different size, and
+      # this step's first run measured the dev profile's at 32MB.
       - name: build the wheel
         run: maturin build --strip --interpreter /tmp/build/bin/python --out dist
       # The claim in pyproject.toml is one wheel for 3.11 through 3.14, which is

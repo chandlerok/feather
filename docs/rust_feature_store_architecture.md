@@ -9,12 +9,15 @@ Scope note: this is a design document with a partial implementation. The definit
 entity key encoding, value codec, and the online serving layer are built and measured, and so is
 materialization, which computes a view's values from its source and writes them to the online
 store. The offline engine is built over local Parquet, object storage, and a Postgres table, and
-is design only for the source kinds with no reader. There is no served API yet: the library runs
-in the caller's process, so the deployment machinery under "Materialization", the per-view
-parallelism, the schedule, and the lock, is design only, none of which the refresh implements
-itself. The serving figures are measured against a shared Valkey, the position a deployment
-graduates to, so the in-process default carries no published figure yet. Figures that are
+is design only for the source kinds with no reader. `FeatureStore.serve()` is built: it makes the
+calling process an Arrow Flight feature server over the embedded store. What is still design only
+is everything a deployment runs around that: the schedule, the per-view parallelism, the lock, and
+the Kubernetes objects. Nothing in this repository issues any of them. Figures that are
 measurements say so and carry their hardware and cardinality; the rest are targets.
+
+Sections describing a tier that no longer exists say so where they begin. Their prose is kept,
+because the trade each one records is one a reader of the current store still has to make, but
+nothing below should be read as a description of the code.
 
 ---
 
@@ -32,14 +35,15 @@ offline engine) and low-latency feature lookup (the online serving layer).
                                  │ Maturin / PyO3
      ┌───────────────────────────▼──────────────────────────────────┐
      │  Rust core                                                   │
+     │  feather-serve: Arrow Flight, the whole request path         │
      └────────┬─────────────────────────────────────┬───────────────┘
               │ offline                             │ online
 ┌─────────────▼──────────────────┐    ┌─────────────▼─────────────────────┐
-│  DuckDB                        │    │  In-process store by default,     │
-│  Parquet / S3 / Iceberg        │    │  or Valkey to share               │
-│  warehouse sources (Iceberg    │    │  one hash per entity, one         │
-│  REST catalogs)                │    │  field per feature view           │
-│  ASOF join, Arrow out          │    │  one HMGET per entity             │
+│  DuckDB                        │    │  Embedded LSM (fjall), in a       │
+│  Parquet / S3 / Iceberg        │    │  directory one process opens      │
+│  warehouse sources (Iceberg    │    │  one key per entity, all of its    │
+│  REST catalogs)                │    │  fields in one contiguous run     │
+│  ASOF join, Arrow out          │    │  one store read per entity        │
 │                                │    │  read-time TTL check              │
 └────────────────────────────────┘    └───────────────────────────────────┘
 ```
@@ -53,10 +57,11 @@ for the evidence behind it.
 1. **Performance first.** Native code (Rust) and vectorized memory layouts (Apache Arrow),
    with no per-row Python and no serialization format on the hot path.
 2. **Zero-infrastructure local mode.** Point-in-time joins and online lookups work out of
-   the box with no external services.
-3. **Opinionated simplification.** One configurable online store, in-process by default and
-   Valkey when a deployment needs it shared, one local compute engine (DuckDB), one internal
-   representation (Arrow).
+   the box with no external services. The online store is a directory in the project, and
+   the process that serves it is the process that opened it.
+3. **Opinionated simplification.** One online store, an embedded LSM whose position is set
+   by a `path` in `feather.toml`, one local compute engine (DuckDB), one internal
+   representation (Arrow), and one serving transport (Arrow Flight).
 4. **Additive upgrade paths.** Every capability deferred from v1 has a documented retrofit
    that does not require changing the storage format or the serving path.
 
@@ -67,14 +72,9 @@ Explicitly out of scope, so that the "opinionated" claim has content:
 - No streaming ingestion or real-time feature computation. Features are materialized in
   batches.
 - No Spark or Flink execution backend.
-- No pluggable online store interface. There are two positions, in-process and Valkey, and
-  which one a deployment runs is configuration rather than a plugin. See "Online serving
-  layer".
-- No feature server before v1. The library runs in the caller's process and reads Valkey
-  directly, and that is the shape this project ships. A server is planned after v1
-  ([issue #5](https://github.com/chandlerok/feather/issues/5)), so the read path stays one
-  in-process call and a server is a thin wrapper over it rather than a second implementation.
-  Until it lands, a team that wants an RPC surface builds one over the defining process.
+- No networkable online store. The store is a directory one process opens, and the server
+  is how a second process reads it. A store that several processes write is a different
+  product; see "Open design questions".
 - No feature transformations expressed as arbitrary user code in the serving path.
 - No registry or lockfile. Definitions are versioned by git and imported directly.
 - No large vectors. The online store holds small scalar values. Embeddings are a different
@@ -234,12 +234,12 @@ FeatureService(
   would be a second source of truth.
 - **No versioning, no logging config, no infrastructure.** Feast's feature service bundles all
   of that, which makes it registry-shaped, and this design has no registry.
-- **Nothing consumes it yet.** The original reason for a name was that a serving request would
-  carry it, and there is no served API. In-process, a checked module-level list gives the same
-  protection against a training script and a serving handler listing different features, so what
-  a `FeatureService` adds today is validation and a compiled identity rather than a wire one. It
-  is kept because the shape is settled and cheap; it becomes load-bearing only if a request ever
-  crosses a process boundary.
+- **What consumes it now.** The name is the wire form of a serving request: a `DoGet` ticket
+  carries a feature service name, and `ResolvedService::resolve` turns it into a field set
+  once at startup. In-process, a checked module-level list gives the same protection against a
+  training script and a serving handler listing different features, so the name was doing
+  nothing before the server existed. It is load-bearing across a process boundary now, and a
+  service that names nothing is a boot failure rather than an empty response.
 - **A raw field list stays available** as an escape hatch for ad-hoc and debug requests.
 
 If logged features are ever adopted (see "Open design questions"), this is where their
@@ -249,38 +249,35 @@ configuration belongs.
 
 The language that defines the features is the language that reads them. A Go binding is what a
 Go project needs to declare its views in Go and read them in its own process, the same way the
-Python binding does. There is no Go binding yet: the workspace has two members, `feather-core`
-and `feather-py`, and no Go source. When one is written it will link this crate the way the PyO3
-crate does, so the key encoding, the value codec, the TTL check, and the point-in-time join stay
-one implementation rather than becoming one per language.
+Python binding does. There is no Go binding yet: the workspace has three Rust members,
+`feather-core`, `feather-py` and `feather-serve`, and no Go source. When one is written it will
+link `feather-core` the way the PyO3 crate does, so the key encoding, the value codec, the TTL
+check, and the point-in-time join stay one implementation rather than becoming one per language.
 
-That is also the fastest arrangement available: a read is a call in the same process, with no
-server to reach and no hop to pay for. Serving from a separate process would add one, which is
-why the library is the shape this project ships and why a server comes after v1 rather than
-first.
+That is still the fastest arrangement: a read is a call in the same process, with no server to
+reach and no hop to pay for.
 
-Reading from another language is therefore a build-your-own path until a binding for that
-language exists or the server lands. A project that wants, say, a Go service to read features
-the defining language declared builds a gRPC, HTTP, or Arrow Flight surface over the defining
-process and owns it. [Issue
-#5](https://github.com/chandlerok/feather/issues/5) tracks the server, and "The RPC surface,
-after v1" records the transport research.
+Reading from another language no longer requires building anything. The server is built, and it
+speaks Arrow Flight, so a Go service reads features the Python process declared by opening a
+Flight client and decoding the Arrow response. What it costs is a network hop and a client
+library, and what it buys is that the Go process never has to import the definitions.
 
-One thing is worth knowing if a surface is ever built over a _second_ declaration of the same
-fields, rather than over the defining process. The schema tag covers field names, dtypes, and
-declaration order, and does not cover `ttl_days`. Two declarations that agree on fields and
-disagree on the TTL compute the same tag, so the same stored value reads as fresh in one and
-expired in the other, and nothing detects it. That is harmless while one declaration exists,
-because the read-time check uses that one. Mixing `ttl_days` into the hash, announced by the
-reserved `flags` byte, is the fix, and it is cheap while nothing published depends on the current
-tag.
+**A client is not a second declaration, and the difference matters.** A client names a feature
+service and gets back the columns that service resolved at startup. That is safe. What is not
+safe is a second _process_ declaring the same views itself, which is a second source of truth
+for the schema tag: the tag covers field names, dtypes, and declaration order, and does not
+cover `ttl_days`. Two declarations that agree on fields and disagree on the TTL compute the same
+tag, so the same stored value reads as fresh in one and expired in the other, and nothing
+detects it. Harmless while one declaration exists, because the read-time check uses that one.
+Mixing `ttl_days` into the hash, announced by the reserved `flags` byte, is the fix, and it is
+cheap while nothing published depends on the current tag.
 
 ### 2. Online serving layer
 
 #### Storage layout
 
-One Valkey hash per entity. All feature views that share an entity live in that single hash,
-which means a cluster colocates them automatically, with no hash tags.
+One key per entity. All feature views that share an entity live under it, so one store read
+covers every view an entity has values for.
 
 ```text
 key:    {project}:{entity_name}:{encoded_entity_key}
@@ -288,16 +285,21 @@ fields: v:{view}   the view's encoded feature vector, all its features in one bl
         f:{view}   event timestamp of the last write for this view (int64 micros)
 ```
 
-One key holds no entity's values: the project registry, `{project}:views`. It is a hash whose
-fields are the view names a refresh has declared — a view that every refresh so far has found no
-rows for has no field — and whose values are each view's newest event timestamp, encoded the way
-a freshness field is. A refresh reads it to learn which views the previous refresh declared,
-writes it last, and garbage collection diffs the two sets. Being a hash is what lets it reuse
-the read, write and delete the other hashes already need, rather than adding a command family
-for one key per project. Losing it is a worse failure than a crash before it is written:
-eviction under the configured `allkeys-lru`, a `DEL`, or a restore from an older snapshot leaves
-the next refresh reading an empty registry, retiring nothing, and leaving a renamed view's
-fields in the store for good.
+Both stores put an entity's fields in one contiguous run and read them together. The in-process
+map holds a sorted slice of `(name, value)` pairs per entity. The embedded LSM has no hash type,
+so it prefixes each record with the entity key's length, which makes an entity's records
+adjacent and turns a per-entity read into one range rather than a point get per field. The
+reasoning for that encoding, and the one cost it takes on, are in
+[`online/fjall.rs`](../crates/feather-core/src/online/fjall.rs).
+
+One key holds no entity's values: the project registry, `{project}:views`. Its fields are the view
+names a refresh has declared (a view that every refresh so far has found no rows for has no
+field), and its values are each view's newest event timestamp, encoded the way a freshness field
+is. A refresh reads it to learn which views the previous refresh declared, writes it last, and
+garbage collection diffs the two sets. Losing it is a worse failure than a crash before it is
+written: a directory restored from an older copy, or handed to a fresh project, leaves entity
+keys and no registry, and every later refresh then reads nothing, retires nothing, and leaves a
+renamed view's fields in the store for good.
 
 #### Entity key encoding
 
@@ -310,15 +312,14 @@ escaping:
 
 Each component carries its own byte length, so a `|` inside a value cannot be mistaken for a
 separator: the parser reads the length, consumes exactly that many bytes, then expects the
-separator. That leaves no escaping rule to get wrong and no restriction on key contents,
-while staying readable in `valkey-cli`.
+separator. That leaves no escaping rule to get wrong and no restriction on key contents.
 
 Four consequences:
 
 - **All of a view's entities must be supplied.** Partial-key lookups are rejected at
   validation time rather than producing a key that can never match.
 - **Component length is capped** at 512 bytes, so one pathological key cannot produce an
-  unbounded Valkey key.
+  unbounded store key.
 - **A colon is refused in the project name and in every entity name.** Reading a project back
   out of a key means splitting on the first two colons, so a colon inside either name is
   ambiguous rather than escapable: garbage collection would fail to recognise those keys and
@@ -329,12 +330,10 @@ Four consequences:
   `a`'s field `b:count`, and the reference `a:b:count` resolves to whichever of the two came
   first. A colon in a _feature_ name is safe, because everything after the first separator is
   the feature.
-- **No cluster hash tag, permanently.** One hash is already one slot, so every field of an
-  entity is colocated by construction. A project-level hash tag would force every entity in
-  the project into a single slot, which is the opposite of what a cluster is for. Reading N
-  entities fans out across N slots, and the client handles that by pipelining per node. This
-  is not a v1 shortcut: the access pattern is single-hash by design, so the key format never
-  needs a tag.
+- **No cluster hash tag.** The store is a directory one process opens, so there is no cluster
+  to spread entities across and a project-level tag would only concentrate them. The question
+  was worth answering before a networked tier was built; that tier was removed, and the
+  question went with it.
 
 The leading segment is a namespace, reserved so that later capabilities are additive rather
 than a key-format change:
@@ -358,7 +357,7 @@ implementation agree with this one without a shared artifact.
 A field value is one view's feature vector for one entity:
 
 ```text
-[tag: u8][flags: u8][null bitmap][fixed-width columns, declared order][variable-width tail]
+[tag: u32 LE][flags: u8][null bitmap][fixed-width columns, declared order][variable-width tail]
 ```
 
 The property that matters is that **fixed-width columns are concatenated with no per-value
@@ -367,7 +366,9 @@ values (strings, lists) live in a trailing section behind an offset table, so a 
 wants only fixed-width columns never touches them.
 
 `tag` identifies the view's schema version: field names, dtypes, and declaration order. A
-mismatch means the value is treated as missing rather than decoded.
+mismatch means the value is treated as missing rather than decoded. `flags` is reserved and
+written as zero, so an encoding-level change has somewhere to announce itself without moving
+anything.
 
 One field per view, not per feature. That is a deliberate reversal of this document's earlier
 naming, which was inconsistent with the codec: the codec writes a whole view's vector as a
@@ -397,20 +398,24 @@ it, decoding needs no per-value type dispatch. That is the point of the layout.
 #### Read path
 
 For a request covering any number of feature views on the same entity, serving issues **one
-`HMGET` per entity**, requesting one field per view plus one freshness field. View count does
-not multiply round trips. The caller's requested features are projected out after decoding,
-so reading two features from a wide view costs decode time for the columns it did not ask for.
+store read per entity**, asking for one field per view plus one freshness field. View count does
+not multiply reads. The caller's requested features are projected out after decoding, so reading
+two features from a wide view costs decode time for the columns it did not ask for.
 
 Feast issues one `read_from_online_store` call per feature view despite advertising entity
 collocation; a user with 11 feature views reported "abysmal" retrieval times
 ([#3596](https://github.com/feast-dev/feast/issues/3596)). The same issue notes all reads are
 synchronous, and
 [#2247](https://github.com/feast-dev/feast/issues/2247) reports the same for DynamoDB. The
-rule here is absolute: never one read per view.
+rule here is absolute: never one read per view. `online/mod.rs` has a test that counts store
+reads for a request naming four views and asserts the count is one, because the rule is a
+property of the layout, and a property nothing checks is a property that erodes.
 
 Requested fields are resolved against already-loaded in-process definitions, so resolution is a
-table lookup rather than I/O. Feast resolves registry metadata on every request, which profiling
-shows is more than half of `get_online_features` execution time
+table lookup rather than I/O. Over Flight the resolution happens once at startup rather than
+per request, and the resolved field set is what the ticket's service name selects. Feast
+resolves registry metadata on every request, which profiling shows is more than half of
+`get_online_features` execution time
 ([#4710](https://github.com/feast-dev/feast/issues/4710)); that cost does not exist here,
 because there is no registry and no separate process to resolve against.
 
@@ -418,31 +423,34 @@ Batch within a request, not across requests. A staff-level design for a comparab
 measured this and rejected cross-request micro-batching: at 1M requests/second across 2000
 hosts, a 1ms batching window captures about 0.5 requests, which is not enough to justify the
 added latency. The useful batching is within one request's entity list, which the
-one-`HMGET`-per-entity rule already provides. Do not build a cross-request aggregator.
+one-read-per-entity rule already provides. Do not build a cross-request aggregator.
 
 TTL is enforced at read time by comparing `f:{view}` against the view's `ttl`. An expired
-value is returned as null, which is the documented contract. The freshness field is read as
-part of the same `HMGET`, so this check costs no additional round trip.
+value is returned as null, which is the documented contract. The freshness field is read in the
+same call, so this check costs no additional read.
 
 #### TTL and reclamation
 
-Two mechanisms, belt and braces:
+**One mechanism: the read-time check.** `f:{view}` plus the declared `ttl`. This is the
+correctness path, and it is the only one: a value is served because the read path decided to
+serve it, never because something else removed it.
 
-- **Read-time check (authoritative, portable).** `f:{view}` plus the declared `ttl`. Works on
-  any Valkey. This is the correctness path.
-- **Native field expiration (reclamation).** Write the value field with an absolute expiry
-  derived from its event timestamp plus the TTL, not from wall-clock write time, and the server
-  reclaims it instead of leaving it for the next rewrite of its hash. The freshness field is
-  deliberately not expired: the read path tells `expired` from `never written` by comparing it
-  against the TTL, so reclaiming it would collapse two states the contract keeps apart.
+Nothing reclaims. `FjallStore` drops the `expires_at_unix_secs` a write carries, and
+`MemoryStore` records it without acting on it, because neither has a clock-driven expiry to
+offer and the read-time check makes reclamation a disk-space question rather than a correctness
+one. The cost is that an expired value holds its key until the next refresh rewrites that
+entity or the view is retired. A full refresh rewrites every value anyway, so the exposure is
+bounded by how long a view goes unrefreshed.
 
-The version floor is real, and it is per command rather than per feature. Field expiration
-landed in Redis 7.4 as `HEXPIREAT` and the rest of the family, and `HSETEX` and `HGETEX` are the
-Redis 8.0 additions; Valkey carries the family from 9.0. A write therefore probes the server
-once per connection and uses `HSETEX` where it exists, `HSET` plus `HEXPIREAT` otherwise, and
-neither on a server that has no field expiration at all. On such a server the read-time check
-still returns correct results, and the only loss is that an expired field is not reclaimed
-until its hash is rewritten or deleted.
+The write path still computes the absolute expiry and passes it through, because it is the
+right value to pass and re-deriving it later would be a second rule to keep in step.
+`materialize` rounds it up, so a store that did reclaim would err late rather than early; the
+comment on `value_expiry_unix_secs` carries the argument, including the clock skew that no
+rounding direction covers.
+
+The freshness field would not be expired even by a store that reclaimed. The read path tells
+`expired` from `never written` by comparing it against the TTL, so reclaiming it would collapse
+two states the contract keeps apart.
 
 Feast has neither mechanism. Its Redis adapter can only expire whole entities, so its own
 documented principle ("if you request a feature ... older than its TTL, you should get a
@@ -462,15 +470,17 @@ Three states exist, and collapsing them would lie to the consumer:
 `expired` and `missing` both mean "unknown"; the difference is diagnostic, and both are
 reported as `missing`.
 
-In the transport, **both `null` and `missing` surface as Arrow nulls by default**. Callers
-that need to distinguish them, for example to fill with learned per-feature defaults rather
-than a single sentinel, pass `include_state_mask=True` and receive one `uint8` state column
-per feature.
+The distinction is preserved in the core: `Missing` is an enum with a variant per cause, and
+`read_entities` returns which one applies. **The transport flattens all three to an Arrow
+null.** A client cannot tell a value that was never written from one that expired, or from a
+materialized null, and the online contract is nulls.
 
-The default is nulls-only because Arrow's null bitmap cannot separate the two cases, so
-exactness has to be a separate column, and paying for it unconditionally would widen every
-response for a distinction most consumers ignore. A caller that fills missing values needs
-the mask; a caller that reads present values does not.
+Null is the right default because Arrow's null bitmap cannot separate the cases, so exactness
+would have to be a separate column, and paying for it unconditionally would widen every response
+for a distinction most consumers ignore. Nothing returns that column yet. `Missing::as_str`
+exists and the enum is exhaustive, so adding one is a field on the response and a column per
+feature; what it needs first is a decision about whether the contract is nulls or a state mask,
+because a client that starts depending on the mask cannot be given nulls alone afterwards.
 
 #### Freshness contract
 
@@ -483,7 +493,7 @@ max_staleness = refresh_interval
 - `refresh_interval` is the deployment's schedule, so this number is per deployment rather
   than a constant. Both stores return the newest value materialized into them, so both are as
   stale as that interval; they differ in whose writes they can see, since an in-process read
-  sees only what this process's refresh wrote and, in a deployment, a Valkey read sees any
+  sees only what this process's refresh wrote and a read against the directory sees any
   process's.
 - TTL expiry caps staleness by construction: an expired value reads as missing rather than as
   a stale value.
@@ -504,31 +514,32 @@ time, so the server is the only thing that opens it, and that is what replaces a
 reader in any language goes to the server, not to the store. A point read costs single-digit
 microseconds warm, where a networked KV store pays a round trip per entity.
 
-The relationship is substitution rather than layering. The in-process store is not a cache in
-front of Valkey, and Valkey is not a store with a local copy in front of it: a deployment picks
-one. It is the trade SQLite and Postgres present, where the embedded store is the default and the
-server is what a project graduates to.
+The relationship is substitution rather than layering. The store is not a cache in front of
+something else, and there is no second copy to keep correct. It is the trade SQLite and Postgres
+present, with the embedded store on one side and the server on the other.
 
-Both positions are the same trait. `read_entities<S: OnlineStore>` is the only caller in the
+Both stores are the same trait. `read_entities<S: OnlineStore>` is the only caller in the
 serving path, so which store is behind it does not touch the Python surface or the offline path,
-and choosing between them is configuration.
+and choosing between them is configuration rather than a code change.
 
 Two things differ, and both matter:
 
-- **Where writes land.** In-process writes into the one map this process holds; Valkey writes
-  into shared state. Both satisfy `write` and `delete_fields`, and both are mutated where they
-  stand: a refresh is not staged into a copy and swapped in.
-- **How stale a read can be.** In-process serves what the last refresh in this process wrote, so
-  staleness is bounded by the refresh interval. Writes take `&mut self` and reads take `&self`,
-  and the Python binding holds its store behind one lock for a whole refresh, so a read sees a
-  completed refresh rather than a partial one. That is exclusion rather than an atomic swap, so
-  the bound is the interval and not zero.
+- **Where writes land.** `MemoryStore` writes into the one map this process holds, which dies
+  with it. `FjallStore` writes into a directory that outlives the process. Both satisfy `write`
+  and `delete_fields`, and both are mutated where they stand: a refresh is not staged into a copy
+  and swapped in.
+- **How stale a read can be.** `MemoryStore` serves what the last refresh in this process wrote,
+  so staleness is bounded by the process's own lifetime. `FjallStore` serves what any refresh
+  wrote, so staleness is bounded by the refresh interval across processes. Writes take
+  `&mut self` and reads take `&self`, and the Python binding holds its store behind one lock for
+  a whole refresh, so a read sees a completed refresh rather than a partial one. That is
+  exclusion rather than an atomic swap, so the bound is the interval and not zero.
 
 The store is not responsible for expiry. `OnlineStore::write` documents that a store which
 cannot honour an expiry "writes the value anyway: the read-time TTL check in `read_entities` is
 what decides whether a value is served, so an unexpired leftover costs reclamation and never
-correctness". An in-process store therefore needs no per-field TTL, which is the one feature that
-made Valkey uniquely suitable.
+correctness." Neither store needs a per-field TTL, which is what lets a store with no clock sit
+under the serving path.
 
 The in-process store is the embedded LSM, `FjallStore`, and `MemoryStore` is the test double.
 The two are not both production positions: an earlier decision made the in-process store the
@@ -542,8 +553,9 @@ means demoting `MemoryStore` rather than joining it. See
 **Superseded.** The figures below were measured against a shared Valkey, which is no longer a
 position. The serving path is now an embedded store behind Arrow Flight, and its measurements,
 including the read cost and the cost of hosting the server in Python, are in
-[`serving-transport.md`](./serving-transport.md). They are kept here as the record of the
-networked-store numbers, which are the baseline the embedded store is measured against.
+[`serving-transport.md`](./serving-transport.md). They are kept as the record of the
+networked-store numbers, which are the baseline the embedded store is measured against, and for
+the version-floor argument under "TTL and reclamation", which described a store that reclaimed.
 
 Measured against Valkey directly, on a container limited to 2 CPUs and 512MiB with `maxmemory`
 384MiB and `allkeys-lru`, over 100k entities across 4 views of 8 features each, with 66-byte
@@ -555,14 +567,14 @@ vectors:
 | read, 100 entities x 4 views | p50 2.36ms, p99 5.10ms, 24.2us per entity |
 | write, materialization shape | 193k vectors/s, 386k field writes/s       |
 
-Single-entity p99 is sub-millisecond across four views, which is the one-`HMGET`-per-entity
-rule and the fixed-stride encoding doing their job. The 17.7ms tail maximum on single reads is
-unexplained and worth investigating.
+Single-entity p99 is sub-millisecond across four views, which is the one-read-per-entity rule
+and the fixed-stride encoding doing their job. The 17.7ms tail maximum on single reads is
+unexplained and was never investigated.
 
 These were reproduced with `mise run bench:load` against a Valkey container, which the removal
-of the tier took with it. The current serving benchmark is `mise run bench:load`, which builds
-the `feather-serve` examples; `docs/serving-transport.md` records how to run it and which parts
-of its harness ship.
+of the tier took with it. The task name survives and now builds the `feather-serve` examples;
+[`serving-transport.md`](./serving-transport.md) records how to run it and which parts of its
+harness ship.
 
 These numbers are from one host and one container shape. Treat them as an order of magnitude,
 not a guarantee.
@@ -669,8 +681,8 @@ there is no registry"). Validating on every read is too expensive for a warehous
 - Validate **once per process per source** at startup, and cache the resolved schema.
 - Re-validate on a schedule in long-lived processes.
 - Record the source's snapshot identity alongside the result, where the source has one: a
-  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or — for a warehouse with no
-  Iceberg surface — a warehouse table version. A warehouse reached through its Iceberg REST
+  Parquet file's metadata, an Iceberg, Delta or DuckLake snapshot, or, for a warehouse with no
+  Iceberg surface, a warehouse table version. A warehouse reached through its Iceberg REST
   catalog would yield a snapshot id from `iceberg_snapshots(...)`, so it is the same mechanism
   rather than a vendor-specific one.
   That is the closest thing to a source pin available without a registry, and it is what
@@ -769,7 +781,7 @@ row alignment.
 ## Materialization
 
 Materialization computes feature values from offline sources and writes them to the online
-store (Valkey in a deployment, the in-process store in local mode).
+store: the embedded LSM where `[store]` names a directory, the in-process map otherwise.
 
 ### Full refresh, no watermarks
 
@@ -806,11 +818,12 @@ Re-materialization is the migration.
 The write path never leaves Arrow and never builds a row-oriented intermediate:
 
 1. DuckDB computes the values and streams Arrow record batches out.
-2. In a deployment, each batch is encoded directly into Valkey write commands.
-3. Commands are pipelined, one flush per 1024 commands (`DEFAULT_CHUNK` in
-   `online/valkey.rs`). The bound is a command count rather than a byte budget: large enough
-   to amortise the round trip, small enough that one flush does not hold a multi-megabyte
-   request buffer.
+2. Each batch is encoded into the store's own records and written before the next batch is
+   pulled, one key per entity holding that view's vector and freshness field.
+3. Writes are batched. One `OnlineStore::write` call carries up to `WRITE_CHUNK` (4096) field
+   records, which is a ceiling rather than a typical size: a call usually carries one streamed
+   Arrow batch, which is far fewer rows. It exists so that a caller handing over a very large
+   slice does not build one enormous journal entry.
 
 No step materializes the full dataset. This is the specific difference from Feast, which
 converts the entire Arrow table into a Python list of protobuf objects before writing:
@@ -871,35 +884,46 @@ store indefinitely because it only deletes data when the last view for an entity
 ([#3596](https://github.com/feast-dev/feast/issues/3596)).
 
 The refresh knows which views retired, because it reads the project registry before it writes
-anything and diffs it against every view the project declares — not against the selection, which
+anything and diffs it against every view the project declares, not against the selection, which
 is why refreshing a subset retires nothing. What it does not know is where
 their fields are. A retired view's entities do not have to appear in any source any more, and
-their hashes carry no trace of which view put a field in them, so the view set names the orphan
+their keys carry no trace of which view put a field in them, so the view set names the orphan
 but not its location: the project's keyspace is the only complete list. When, and only when, a
-view retires, the refresh therefore walks that keyspace with `SCAN` and `HDEL`s the retired
-views' `v:{view}` and `f:{view}` fields from every entity hash it finds, leaving every other
-field alone. A key that is not shaped like an entity hash is not touched, because `HDEL`
-against a key that is not a hash is an error rather than a no-op.
+view retires, the refresh therefore walks that keyspace and removes the retired views' `v:{view}`
+and `f:{view}` fields from every entity key it finds, leaving every other field alone. A key not
+shaped like an entity key is skipped, because everything else under the prefix belongs to
+something the retired view never wrote.
+
+On the embedded LSM that walk is a full keyspace scan, not a prefix scan. The length prefix
+that makes an entity's records adjacent also means the entity key does not start the record, so
+the scan parses every record and filters by project. That is affordable here because the only
+caller is this one, and a full refresh that retires a view is already writing every value. The
+`ponytail:` marker on `scan_entity_keys` names the upgrade: a second keyspace holding one record
+per entity key, which turns the walk into a prefix scan at the cost of a second write per
+entity.
 
 The walk is rare by construction, which is the point of the registry: a project whose declared
 views have not changed retires nothing and walks nothing. It is idempotent as well, because
 removing a field that is already gone is a no-op, and the registry is written after the walk
-rather than before it, so a run that dies partway leaves a state the next run repairs — as long
+rather than before it, so a run that dies partway leaves a state the next run repairs, as long
 as that next run declares the same view set, since the retired set it computes comes from the
 registry rather than from the run it is repairing. This is the reason a refresh is not a pure
 function of its inputs, and it is the only part of it that is not.
 
 ### Ceiling
 
-Full refresh cost scales with total entity-view pairs, not new data. With one hash per entity
-and one field per view, a refresh writes `entities x views` field values. Measured at 386k
-field writes per second on the constrained container described under "Serving measurements",
-tens of millions of entity-view pairs is about a minute and low hundreds of millions is
-minutes. The earlier estimate in this document, which said hours for the second case, was
-several times too pessimistic.
+Full refresh cost scales with total entity-view pairs, not new data. With one key per entity and
+one field per view, a refresh writes `entities x views` field values, encoded and streamed one
+Arrow batch at a time. There is no write-throughput figure for the embedded store: the
+`bench:load` task builds the serving examples, and nothing here measures a refresh's write
+rate. The Valkey measurement recorded under "Serving measurements" is 386k field writes per
+second, on a container limited to 2 CPUs, and it is a different store on different hardware.
 
-That is the v1 ceiling, and it is deliberate. See "Scalability" for the documented path past
-it.
+So the ceiling is stated as a shape rather than a number: a refresh is bounded by how fast the
+engine can reduce the source to one row per entity and by how fast the store can absorb the
+encoded batches, and neither has been measured against a dataset large enough to matter. What is
+measured is the join (see the offline engine section) and the read. See "Scalability" for the
+documented path past this.
 
 ---
 
@@ -910,10 +934,10 @@ it.
 Everything deferred from v1 is additive or a rewrite depending on two choices, both of which
 are cheap now and structural later:
 
-1. **Key layout: one hash per entity, one field per feature view.** Incremental updates later
-   become "`HSET` a few fields on a few hashes". Tiling later becomes "add `t:` fields to the
-   same hash". Choosing key-per-feature, or one opaque blob per entity, makes both a storage
-   format rewrite.
+1. **Key layout: one key per entity, one field per feature view.** Incremental updates later
+   become "set a few fields on a few keys". Tiling later becomes "add `t:` fields beside the
+   existing ones". Choosing a key per feature, or one opaque blob per entity, makes both a
+   storage format rewrite.
 2. **Self-describing, namespaced values.** The schema tag lets the encoding change without a
    migration, and the field namespace prefix lets a new field kind be introduced without
    renaming existing fields.
@@ -1017,9 +1041,10 @@ match and returns null until the refresh completes. Correct, never a decode fail
 zero-downtime for large refreshes.
 
 The upgrade is double-buffered generations: write the new encoding under a new generation,
-flip a pointer atomically, then let the old generation expire via native field expiration.
-This is additive, because values already carry a schema tag and fields are already
-namespaced. It costs 2x peak storage during a refresh, which is why it is not the v1 default.
+flip a pointer atomically, then let the old generation go. This is additive, because values
+already carry a schema tag and fields are already namespaced. It costs 2x peak storage during a
+refresh, which is why it is not the v1 default. The old generation cannot be reclaimed by
+expiry, because nothing reclaims; a refresh has to overwrite or the view has to be retired.
 
 ### Watermarks as a last resort
 
@@ -1081,13 +1106,18 @@ password = "${POSTGRES_PASSWORD}"
 # server offers it, so this is only for a deployment that will not settle for that.
 ssl_mode = "verify-full"
 
-[valkey]
-endpoint = "valkey-cluster.internal.svc:6379"
-tls = true
-# Needs a server that can expire a hash field: HEXPIREAT is a Redis 7.4 addition and HSETEX a
-# Redis 8.0 one. A server with neither falls back to the read-time TTL check, which is the
-# authoritative path either way.
-field_expiration = true
+[store]
+# The embedded LSM's directory. One process opens it at a time, so in a
+# deployment `serve()` is the process that opens it and a refresh runs
+# against the same directory from a job that opens it while no server is
+# running. Absent means the in-process map, which dies with the process.
+path = "var/feather-store"
+# Resident block cache, in bytes. Default 64MiB.
+cache_bytes = 67108864
+# Write buffer, in bytes. Default 64MiB, which is fjall's own and the size
+# its measurements point at: across scattered updates a 4MiB memtable
+# wrote 5.3x the logical bytes and a 64MiB one wrote 1.1x.
+memtable_bytes = 67108864
 ```
 
 An `endpoint` is what makes the entry an S3-compatible store rather than AWS, and it brings
@@ -1111,10 +1141,10 @@ Three absences are deliberate.
 
 - **No `offline_store`.** A source belongs to the view it feeds and is declared on that view,
   so there is no deployment-wide offline store to name. See "Offline engine".
-- **No `type` on `[valkey]`.** Valkey is the only shared store that can be configured, and a
-  pluggable one is a non-goal. The table name carries the kind, so a key that could only hold
-  one value is not written down. Its absence is a position rather than an omission: no
-  `[valkey]` table means the in-process store, which is the default.
+- **No `type` on `[store]`.** There is one online store, and a pluggable one is a non-goal.
+  The table name carries the kind, so a key that could only hold one value is not written down.
+  Its absence is a position rather than an omission: no `[store]` table means the in-process
+  map, which is the right default for a project read from the same process that refreshes it.
 - **No compute engine.** Every source runs on DuckDB, so a local file, an object-storage
   prefix, and a database table differ only in how the source is declared, not in what
   executes it.
@@ -1220,18 +1250,21 @@ warehouse one.
 
 1. **Local development.** `pip install feather-py`. Everything runs in-process: local
    Parquet, an in-memory DuckDB, and the in-process online store, so nothing external is
-   needed.
-2. **Single-process production.** The same shape as local, with no `[valkey]` table: the process
-   holds the store, and materialization runs in or beside it. The ceiling is that process's
-   memory, and the staleness bound is the refresh interval.
-3. **Scale-out.** `[valkey]` is configured, and an online read in this position goes to Valkey.
-   Valkey would run as a StatefulSet, and materialization would run as resource-isolated
-   Kubernetes Jobs on a schedule or on demand, against the same Valkey.
+   needed. `feather refresh` and `get_online_features` share one process's store, and the values
+   are gone when it exits.
+2. **Serving.** `[store]` names a directory. `FeatureStore.serve()` opens it and blocks, so the
+   serving process is the store's owner, and a client in any language reads over Arrow Flight.
+   The ceiling is that directory's disk, and the staleness bound is the refresh interval.
+3. **Refreshing a served project.** The database is opened by one process at a time, so a
+   refresh cannot run while a server holds it. This is the constraint a deployment has to
+   schedule around, and it is the reason the scheduling below is design only rather than a
+   recipe: the obvious shape is a `CronJob` per view group that runs while the server is down,
+   which trades serving availability for refresh correctness, and a project that needs both has
+   to run the server against a store that permits a second writer.
 
-There is no API pod, no Helm chart, and no Kustomize manifest, and there will not be one before
-v1: this project ships a library. A server is planned after v1, and the read path is kept as a
-single in-process call so that it wraps that call rather than reimplementing it. Until it lands,
-a team that wants an RPC surface builds one over the defining process.
+There is no Helm chart and no Kustomize manifest, and there will not be one before v1. What
+ships is a library, a `serve()` that turns the calling process into a server, and a refresh. A
+deployment wires those three together; this repository does not.
 
 ---
 
@@ -1240,7 +1273,7 @@ a team that wants an RPC surface builds one over the defining process.
 The distribution is `feather-py`, because `feather` is already registered on PyPI. The import
 name is `feather`.
 
-That pairing is what creates the collision this section exists to name. Installing
+That pairing is what creates the collision. Installing
 `feather-py` puts a top-level `feather` on the path, and the PyPI package `feather` (the
 Feather dataframe format) provides the same module name. An environment must not contain
 both, because which one an import resolves to depends on install order. This is accepted for
@@ -1297,10 +1330,11 @@ The cost is materializing the result. The ordering is applied to the scan rather
 materialization, because a sort performed while building the table would not order a later
 scan, and the row order is the thing that keeps labels and features aligned.
 
-### The online store is in-process by default
+### The online store is embedded
 
 **Rejected:** Valkey as the only store, with the in-process `moka` cache as an optimization in
-front of it.
+front of it. That tier was built, measured, and then removed; the reasoning below is why it was
+built, and the store it was rejected for is what shipped.
 
 A two-tier design has to keep the L1 correct, which for Valkey means client-side caching in
 broadcasting mode, a RESP3 redirect connection that was implemented here because valkey-glide has
@@ -1309,13 +1343,13 @@ an always-on fallback TTL. All of that existed because there are two copies of t
 
 Inverting the tiers removes it. With one copy there is nothing to invalidate, the store need not
 be Redis-family at all, and `OnlineStore::write` already permits a store that ignores expiry,
-because the read-time TTL check is the authoritative path. The cost is that memory becomes a
-per-process ceiling and a read can be as stale as the refresh interval, which is why a shared
-store is a separate position rather than the default.
+because the read-time TTL check is the authoritative path. The cost is that the store is opened
+by one process at a time, which is the constraint a deployment schedules around, and that a read
+can be as stale as the refresh interval.
 
-Evidence, and the gated next step: [`embedded-online-store.md`](./embedded-online-store.md). The
-rejected cache design is retained, unprioritized, in
-[#25](https://github.com/chandlerok/feather/issues/25).
+Evidence: [`embedded-online-store.md`](./embedded-online-store.md) and
+[`serving-transport.md`](./serving-transport.md). The rejected cache design is retained,
+unprioritized, in [#25](https://github.com/chandlerok/feather/issues/25).
 
 ### Spill is local, capped, and private
 
@@ -1400,23 +1434,22 @@ Rejected alternatives:
   at the cost of a registry-shaped artifact, and this design has no registry. A rename is a
   rewrite under full refresh, which is the migration path anyway.
 
-### One hash per entity, one field per view
+### One key per entity, one field per view
 
 **Rejected:** one key per (view, entity), and one opaque blob per entity.
 
-The hash gives cluster colocation for free and makes a request for N views a single `HMGET`
-per entity. The rejected alternatives either reintroduce per-view round trips or make
-incremental updates and tiling structural rewrites. The tradeoff accepted is that per-view
-TTL needs field expiration rather than key expiration, which is why the Valkey version floor
-exists.
+Colocating an entity's views under one key is what makes a request for N views a single store
+read. The rejected alternatives either reintroduce per-view reads or make incremental updates and
+tiling structural rewrites. The trade accepted is that the layout does not need the store to have
+a hash type, which is what let the embedded LSM be the store without a different layout.
 
 ### Read-time TTL as the correctness path
 
-**Rejected:** relying on native field expiration alone.
-
-Field expiration is version-gated and its reclamation is a periodic job, so it is not a
-correctness guarantee. The read-time check is authoritative and portable; native expiration
-is a reclamation optimization.
+**Superseded in its original form.** The rejected alternative was relying on a networked store's
+native field expiration alone, which was version-gated and reclaimed on a periodic job, so it was
+never a correctness guarantee. The decision that survives is the positive one: a value is served
+because the read path decided to serve it, never because something removed it. Neither store
+reclaims at all, which makes the point without needing the version floor that made it necessary.
 
 ### Full refresh, no watermarks
 
@@ -1460,12 +1493,16 @@ do not merge exactly are out of scope for v1 rather than approximated. See "Tile
 
 ### Length-prefixed entity keys
 
-**Rejected:** escaping a separator, hashing the entity tuple, and cluster hash tags.
+**Rejected:** escaping a separator, and hashing the entity tuple.
 
 Escaping needs a rule that must be right in two places and is easy to get subtly wrong.
-Hashing the tuple makes keys unreadable, so `valkey-cli` stops being useful for debugging.
-Hash tags are unnecessary because the access pattern is single-hash: one hash is one slot, so
-a tag buys nothing for reads and would force a whole project into a single slot.
+Hashing the tuple makes keys unreadable, and an unreadable key cannot be diagnosed by looking
+at it, which is what a length prefix is for.
+
+A cluster hash tag was a third rejected option, on the access pattern rather than the encoding:
+one key is already the unit of a read, so a tag would buy nothing and would concentrate every
+entity in a project into one slot. That tier was built and then removed, and the tag question
+went with it.
 
 ### Fixed-stride value encoding
 
@@ -1490,10 +1527,11 @@ distinction is real.
 
 ## Open design questions
 
-Two items remain open. Two further capabilities are deferred with triggers rather than left
-open, and they are documented where they belong: approximate aggregates in "Tile encoding",
-and incremental materialization in "Watermarks as a last resort". A third note records the
-transport for the RPC surface planned after v1, which this project does not ship yet.
+Two items are open, one needing a product decision and one an operational one. Two further
+capabilities are deferred with triggers rather than left open, and they are documented where they
+belong: approximate aggregates in "Tile encoding", and incremental materialization in
+"Watermarks as a last resort". A third section records the serving surface, which is built; it
+is here because what it does not do yet matters as much as what it does.
 
 ### Needs a product decision
 
@@ -1528,21 +1566,44 @@ transport for the RPC surface planned after v1, which this project does not ship
   The trigger has fired: the read path and the refresh are built and measured. What is missing is
   the instrumentation, not the reason to add it.
 
-### The RPC surface, after v1
+### The serving surface: what shipped and what did not
 
-A server is planned for after v1, and it is deliberately not part of this design yet: the core
-is a library, and the language that defines the features is the language that reads them.
-Recorded here so the transport research is not lost. Arrow Flight is the transport that keeps the
-data path Arrow-native, being gRPC with Arrow IPC as the payload, so it keeps a mainstream RPC
-transport while keeping protobuf out of the data path. Hopsworks shipped that combination for a
-feature store and reported up to 45x throughput over their REST API, and independent benchmarks
-put Flight up to 30x over ODBC. Feast's community requested the switch and it was not made
+The RPC surface is built. `feather-serve` is an Arrow Flight service, `FeatureStore.serve()`
+binds it, and a client in any language reads the response with its own Arrow library because the
+response is Arrow IPC inside gRPC. That was the transport the research below chose, and the
+reasoning is kept because it is the reasoning the choice still rests on.
+
+A `DoGet` ticket carries a feature service name and the entity keys to read. The field set is
+not in the ticket: `ResolvedService::resolve` resolves the service against the project's
+definitions once at startup, so a service naming a view or a feature that does not exist fails
+at boot rather than on the first request, and a request cannot make the serving path resolve
+metadata per call. That is where the `FeatureService` name stopped being decorative.
+
+**Authentication is the gap, and it is a real one.** `feather serve` does not authenticate. The
+`handshake` call answers `unimplemented` rather than accepting anything, which is the honest
+answer, and `serve()` binds loopback by default, so loopback is the only thing protecting the
+endpoint. The Flight specification is explicit that a token validated only at connection time is
+not safe behind a layer-7 load balancer, so the answer is per-call validation or mTLS, and
+neither is written. Tracked in
+[issue #5](https://github.com/chandlerok/feather/issues/5).
+
+What is also not there: `DoPut`, `DoExchange`, and `do_action` all answer `unimplemented`, and
+`ListFlights` returns nothing. A write path over the transport is a different feature from
+serving reads, and there is no attempt at it.
+
+**The Python-host measurement does not reproduce from this repository.** The rows in
+[`serving-transport.md`](./serving-transport.md) labelled "Python (pyo3, GIL released)" came
+from a throwaway module built against this crate by path, living outside the tree. What ships is
+`serve_rust`, which makes the same `feather_serve::serve` call a Python `FeatureStore.serve()`
+makes, differing only in the host process. A harness built the same way belongs in the tree
+rather than in `/tmp`; until one lands, treat that column as a reading from a prototype.
+
+Arrow Flight is the transport that keeps the data path Arrow-native, being gRPC with Arrow IPC
+as the payload, so it keeps a mainstream RPC transport while keeping protobuf out of the data
+path. Hopsworks shipped that combination for a feature store and reported up to 45x throughput
+over their REST API, and independent benchmarks put Flight up to 30x over ODBC. Feast's
+community requested the switch and it was not made
 ([#2013](https://github.com/feast-dev/feast/issues/2013), 29 comments).
 
-The research also found that `arrow-flight` tracks the workspace's Arrow major and brings
-`tonic` and `prost` with it, and that this crate ships no auth handler. A serving surface would
-add an auth handler rather than inherit one, and none of the three is a dependency here today.
-
-Such a surface wraps the in-process read rather than reimplementing it. It also needs a resolved
-field set per request, which is where the `FeatureService` name stops being decorative and starts
-being an interface. Tracked as [issue #5](https://github.com/chandlerok/feather/issues/5).
+`arrow-flight` tracks the workspace's Arrow major and brings `tonic` and `prost` with it, and it
+ships no auth handler. Neither does the serving surface, which is the gap described above.

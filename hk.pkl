@@ -23,7 +23,7 @@ local linters = new Mapping<String, Step> {
 
   // ---- Everything else: JSON, TOML, YAML, Markdown, Dockerfile ----
   // dprint owns every non-Rust, non-Python file type. Its plugin list lives in
-  // dprint.json; this step just hands it the staged files.
+  // dprint.json; this step hands it the staged files.
   ["dprint"] = new Step {
     glob = List(
       "**/*.json",
