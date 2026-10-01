@@ -371,6 +371,49 @@ impl FeatureService {
     }
 }
 
+/// One requested feature, split into the view it comes from and its name there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub view: String,
+    pub feature: String,
+}
+
+/// Split `view:feature` references, rejecting the shapes an engine cannot use.
+///
+/// This is the one spelling of what a request may name, so every binding refuses
+/// the same inputs with the same reasons. An empty list is refused because a read
+/// with nothing to return is a caller's mistake, not an empty result; a repeated
+/// reference is refused because the result's column order would carry it twice and
+/// the two copies could not be told apart.
+pub fn parse_references<S: AsRef<str>>(features: &[S]) -> Result<Vec<Reference>> {
+    if features.is_empty() {
+        return Err(Error::NoFeaturesRequested);
+    }
+    let mut references: Vec<Reference> = Vec::with_capacity(features.len());
+    for reference in features {
+        let reference = reference.as_ref();
+        let (view, feature) = reference
+            .split_once(':')
+            .filter(|(view, feature)| !view.is_empty() && !feature.is_empty())
+            .ok_or_else(|| Error::MalformedFeatureReference {
+                reference: reference.to_owned(),
+            })?;
+        if references
+            .iter()
+            .any(|seen| seen.view == view && seen.feature == feature)
+        {
+            return Err(Error::DuplicateFeatureReference {
+                reference: reference.to_owned(),
+            });
+        }
+        references.push(Reference {
+            view: view.to_owned(),
+            feature: feature.to_owned(),
+        });
+    }
+    Ok(references)
+}
+
 /// Everything the engines need to know about a project's feature definitions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Definitions {
@@ -1004,5 +1047,73 @@ mod tests {
             error.to_string(),
             "malformed definitions: declares view `user_clicks` twice"
         );
+    }
+
+    #[test]
+    fn a_well_formed_reference_splits_into_its_view_and_feature() {
+        let references = parse_references(&["user_clicks:click_count"]).expect("valid");
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].view, "user_clicks");
+        assert_eq!(references[0].feature, "click_count");
+    }
+
+    #[test]
+    fn a_reference_keeps_its_request_order() {
+        let references = parse_references(&["b:two", "a:one", "b:one"]).expect("valid");
+
+        let pairs: Vec<(&str, &str)> = references
+            .iter()
+            .map(|r| (r.view.as_str(), r.feature.as_str()))
+            .collect();
+        assert_eq!(pairs, [("b", "two"), ("a", "one"), ("b", "one")]);
+    }
+
+    #[test]
+    fn an_empty_reference_list_is_refused() {
+        let error = parse_references::<String>(&[]).expect_err("must fail");
+
+        assert_eq!(error.to_string(), "features must name at least one feature");
+    }
+
+    #[test]
+    fn a_reference_without_a_colon_is_refused() {
+        let error = parse_references(&["click_count"]).expect_err("must fail");
+
+        assert!(
+            matches!(error, Error::MalformedFeatureReference { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_reference_with_an_empty_side_is_refused() {
+        // Both halves are refused, because an empty view or feature names nothing.
+        for reference in [":count", "clicks:", ":"] {
+            let error = parse_references(&[reference]).expect_err("must fail");
+            assert!(
+                matches!(error, Error::MalformedFeatureReference { .. }),
+                "{reference} produced {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_reference_is_refused() {
+        let error = parse_references(&["clicks:count", "clicks:count"]).expect_err("must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "the reference `clicks:count` is requested twice"
+        );
+    }
+
+    #[test]
+    fn the_same_feature_under_two_views_is_not_a_duplicate() {
+        // The namespace is what makes the pair unique, so these are two different
+        // columns and both are kept.
+        let references = parse_references(&["a:count", "b:count"]).expect("valid");
+
+        assert_eq!(references.len(), 2);
     }
 }
