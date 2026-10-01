@@ -187,6 +187,44 @@ request has to clear all five checks — `lint`, `rust`, `python 3.11`, `python 
 that skips the hook still cannot land; it just fails after the Rust build instead of in a
 second, which is what the hook is for.
 
+## Releasing
+
+Two artifacts are published from this repository, and only one of them is automated.
+
+### The wheel, on PyPI (automated)
+
+Bump `version` in `pyproject.toml`, land that, then tag `v<that same version>` and push the
+tag. `.github/workflows/publish.yml` builds the four wheels and uploads them. The job checks
+the version in the built wheel rather than in either file, so it holds whichever one is
+behind. PyPI refuses to reuse a version, so a re-tag is not a retry: a failed upload is fixed
+and released as a new version. `workflow_dispatch` builds all four wheels and skips the
+upload, which is how to check the matrix without spending a tag on it.
+
+### `feather-core`, on crates.io (manual)
+
+The binding crates deliver a wheel, not a crate fetch, so only `feather-core` is published and
+`cargo publish` is run by hand. The Cargo version is inherited from `[workspace.package]` in
+the root `Cargo.toml`, and that is the version crates.io receives.
+
+```bash
+# 1. Bump [workspace.package] version in Cargo.toml and land that.
+#    This is not a feather-core-only edit: crates/feather-py also inherits it. It is
+#    harmless for the wheel, because maturin prefers pyproject.toml and pyproject still
+#    wins, so the two can legitimately carry different versions.
+# 2. Dry run first, so a packaging error costs nothing.
+cargo publish -p feather-core --locked --dry-run
+# 3. Publish for real.
+cargo publish -p feather-core --locked
+# 4. Tag the same version, which is what runs the PyPI job above.
+git tag v<version> && git push origin v<version>
+```
+
+Two things about this that are easy to get wrong. crates.io does not let a name be
+re-published at a version already claimed, exactly as PyPI does not, so **the first publish
+claims `feather-core 0.0.1` permanently** and a failed upload cannot be retried at the same
+version either. And a successful publish takes the name `feather-core` permanently, so
+confirm the name is still the one you want immediately before step 3 rather than assuming it.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
