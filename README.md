@@ -150,7 +150,9 @@ from somewhere else pass `-C`: `feather refresh -C my_feature_store user_clicks`
 
 A generated project declares no `[store]`, so its online store is a database at
 `.feather/online` beside the `feather.toml`, which `serve()` opens. A deployment can put a
-different path under `[store]`, and the same command writes there instead.
+different path under `[store]`, and the same command writes there instead. A project
+refreshed under the earlier behaviour has no database on disk yet, so run `feather refresh`
+once after upgrading or `serve()` will open an empty store and answer null for every column.
 
 ## Going to production
 

@@ -333,7 +333,7 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
 fn online_location(settings_path: &str, store: Option<&StoreSettings>) -> (PathBuf, u64, u64) {
     match store {
         Some(store) => (PathBuf::from(&store.path), store.cache(), store.memtable()),
-        // The directory `feather init` writes, beside the `feather.toml` that omits it.
+        // A refresh creates this on its first write, beside the `feather.toml` that omits it.
         None => (
             PathBuf::from(settings_path)
                 .parent()
@@ -607,7 +607,7 @@ impl FeatureStore {
     /// Raises:
     ///     ValueError: If a named view is not declared, or a source cannot be read as its view
     ///         declares it.
-    ///     OSError: If the declared store directory cannot be opened.
+    ///     OSError: If the store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     #[cfg(feature = "offline")]
     #[pyo3(signature = (views = None))]
@@ -682,7 +682,7 @@ impl FeatureStore {
     ///         both the same join key and the same entity name, since the hash key carries the
     ///         name and one request reads one entity type; if the frame has no such column or has
     ///         a null in it; or if a requested feature name collides with a column of the frame.
-    ///     OSError: If the declared store directory cannot be opened.
+    ///     OSError: If the store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     fn get_online_features(
         &self,

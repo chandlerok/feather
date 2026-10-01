@@ -328,11 +328,12 @@ def test_a_missing_join_key_column_is_refused(project: Project) -> None:
 
 
 def test_a_renamed_view_is_retired_and_leaves_the_registry(tmp_path: Path) -> None:
-    """A rename, over a store that outlives one `FeatureStore`, which local mode cannot be.
+    """A rename, over a store that outlives one `FeatureStore`.
 
     The registry is in the embedded store, so a second store over the same project sees what the
-    first one wrote. In local mode the store is per instance, so this is the only place the
-    retire path can be exercised end to end; the Rust suite pins the rule itself.
+    first one wrote. That is the only way the retire path can be exercised end to end, so this
+    asks for `store=True` rather than the project a generated `feather.toml` resolves to; the
+    Rust suite pins the rule itself.
     """
     project = make_project(tmp_path, project=f"feathertest_retire_{uuid.uuid4().hex}", store=True)
     project.store.materialize()

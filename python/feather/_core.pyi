@@ -111,7 +111,7 @@ class FeatureStore:
         Raises:
             ValueError: If a named view is not declared, or a source cannot be read as its view
                 declares it.
-            OSError: If the declared store directory cannot be opened.
+            OSError: If the store directory cannot be opened.
         """
         ...
     def get_online_features(
@@ -139,7 +139,7 @@ class FeatureStore:
                 both the same join key and the same entity name; if ``entity_frame`` lacks the
                 join key column or holds a null in it; or if a requested feature name collides
                 with a column of the frame.
-            OSError: If the declared store directory cannot be opened.
+            OSError: If the store directory cannot be opened.
         """
         ...
     def get_historical_features(
