@@ -36,13 +36,16 @@
 #
 # ## Releasing
 #
-# Bump `version` in `pyproject.toml`, land that, then tag `v<that same version>`
-# and push the tag. maturin merges its metadata from Cargo.toml and pyproject.toml
-# and pyproject wins, so the Cargo version is the crates.io version, which
-# nothing reads now that `publish = false`; the job checks the version in the
-# built wheel rather than in either file, so it holds either way. PyPI refuses to
-# reuse a version, so a re-tag is not a retry: a failed upload is fixed and
-# released as a new version.
+# This job is the PyPI half of the release procedure. The crates.io half is
+# manual and lives in the README's `## Releasing` section, which is the whole
+# procedure for both artifacts.
+#
+# maturin merges its metadata from Cargo.toml and pyproject.toml and pyproject
+# wins, so `pyproject.toml`'s version is the wheel's version whichever one the
+# Cargo manifests carry; the job checks the version in the built wheel rather
+# than in either file, so it holds either way. PyPI refuses to reuse a version,
+# so a re-tag is not a retry: a failed upload is fixed and released as a new
+# version.
 #
 # `workflow_dispatch` builds all four wheels and skips the upload, which is how
 # to check the matrix without spending a tag on it.
