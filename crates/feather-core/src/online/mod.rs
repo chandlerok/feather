@@ -12,14 +12,19 @@ pub mod memory;
 pub mod fjall;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::ArrayRef;
+use arrow::array::new_null_array;
+use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::compute::{concat, take};
+use arrow::datatypes::{Field as ArrowField, Schema};
+use arrow::record_batch::RecordBatch;
 
-use crate::definitions::FeatureView;
+use crate::definitions::{FeatureView, Reference};
 use crate::error::{Error, Result};
 use crate::key::{freshness_field, value_field};
-use crate::value::{SchemaTag, decode_batch};
+use crate::value::{SchemaTag, arrow_type, decode_batch};
 
 /// One field of a write: its value, and when it stops being readable.
 ///
@@ -353,6 +358,110 @@ pub async fn read_entities<S: OnlineStore>(
     Ok(out)
 }
 
+/// Assemble the online read's result table.
+///
+/// The entity frame's own columns come back untouched, one per input row, followed
+/// by one column per requested feature in request order. A value that is missing,
+/// expired, or stored under a schema the definition no longer matches reaches the
+/// caller as a null, and the three are not distinguished here, which is the
+/// documented online contract.
+///
+/// This lives in the core so the reshaping is one implementation rather than one
+/// per binding: the index-into-present-or-null step and the column naming are the
+/// parts a second binding would otherwise write twice and let drift.
+///
+/// Args:
+///     entity: The entity frame, already read out of whatever the caller passed.
+///     references: The parsed request, in the order the columns should come back.
+///     views: The views the references resolved to, keyed by view name. Each is
+///         looked up for the declared dtype, which is what a null column is typed by.
+///     slots: One `(view, feature)` index pair per reference, into `values`,
+///         which is the position `read_entities` wrote it to. A length that
+///         does not match `references` is an error, not a shorter table.
+///     values: What `read_entities` produced, one inner vector per entity, each
+///         holding one [`ViewValues`] per distinct view in first-appearance order.
+///
+/// Returns:
+///     The entity frame's columns followed by one column per requested feature.
+pub fn assemble_online_result(
+    entity: &RecordBatch,
+    references: &[Reference],
+    views: &BTreeMap<String, FeatureView>,
+    slots: &[(usize, usize)],
+    values: &[Vec<ViewValues>],
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(entity.num_columns() + references.len());
+    let mut fields: Vec<ArrowField> = Vec::with_capacity(entity.num_columns() + references.len());
+    for (index, field) in entity.schema().fields().iter().enumerate() {
+        columns.push(entity.column(index).clone());
+        fields.push(field.as_ref().clone());
+    }
+
+    // `zip` stops at the shorter of the two lists, so a caller that supplied one
+    // slot per view rather than per reference would get a table missing its
+    // trailing columns, with nothing to report. The position that has no
+    // counterpart is named, in whichever list ran out.
+    if references.len() != slots.len() {
+        return Err(Error::RowOutOfRange {
+            row: references.len().max(slots.len()),
+            len: references.len().min(slots.len()),
+        });
+    }
+
+    for (reference, (view_slot, feature_slot)) in references.iter().zip(slots) {
+        let declared = views
+            .get(&reference.view)
+            .ok_or_else(|| Error::UnknownView(reference.view.clone()))?
+            .field(&reference.feature)
+            .ok_or_else(|| Error::UnknownFeature {
+                view: reference.view.clone(),
+                name: reference.feature.clone(),
+            })?;
+        let dtype = arrow_type(declared.dtype);
+
+        // One element per entity, in entity order, pointing at that entity's value
+        // among the ones that have one or at a null for one that does not. `take`
+        // turns a null index into a null of the right type, which is how an absent
+        // value reaches the caller.
+        let mut present: Vec<ArrayRef> = Vec::new();
+        let mut indices: Vec<Option<u32>> = Vec::with_capacity(values.len());
+        for per_view in values {
+            let value = per_view.get(*view_slot).ok_or(Error::RowOutOfRange {
+                row: *view_slot,
+                len: per_view.len(),
+            })?;
+            match value {
+                ViewValues::Present {
+                    columns: decoded, ..
+                } => {
+                    let column = decoded.get(*feature_slot).ok_or(Error::RowOutOfRange {
+                        row: *feature_slot,
+                        len: decoded.len(),
+                    })?;
+                    indices.push(Some(present.len() as u32));
+                    present.push(column.clone());
+                }
+                ViewValues::Missing(_) => indices.push(None),
+            }
+        }
+
+        let column = if present.is_empty() {
+            new_null_array(&dtype, values.len())
+        } else {
+            let borrowed: Vec<&dyn Array> = present.iter().map(|array| array.as_ref()).collect();
+            let decoded = concat(&borrowed)?;
+            take(&decoded, &UInt32Array::from(indices), None)?
+        };
+        columns.push(column);
+        fields.push(ArrowField::new(&reference.feature, dtype, true));
+    }
+
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
 /// v1 supports exactly one entity per view, and a single request must resolve to a
 /// single entity name because that name is part of the hash key.
 fn shared_entity_name<'a>(
@@ -402,7 +511,7 @@ pub fn ttl_duration(ttl_days: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::definitions::{DType, Entity, Field, Source};
+    use crate::definitions::{DType, Entity, Field, Source, parse_references};
     use crate::online::memory::MemoryStore;
     use crate::value::encode_batch;
     use arrow::array::{ArrayRef, Int64Array};
@@ -718,5 +827,146 @@ mod tests {
                 .unwrap()
                 .contains_key(&value_field("clicks"))
         );
+    }
+
+    /// One entity frame row, so a fixture can vary which entity is present.
+    fn entity_frame(keys: &[i64]) -> RecordBatch {
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(keys.to_vec()))];
+        let schema = Arc::new(Schema::new(vec![ArrowField::new(
+            "user_id",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        RecordBatch::try_new(schema, columns).expect("entity frame")
+    }
+
+    /// A present value of one Int64 column, which is what the assembly reads out of.
+    fn present(value: i64) -> ViewValues {
+        ViewValues::Present {
+            columns: vec![Arc::new(Int64Array::from(vec![value]))],
+            freshness_micros: NOW,
+        }
+    }
+
+    #[test]
+    fn a_present_value_reaches_its_column() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        // One view slot, one feature slot, and a value present for both entities.
+        let slots = vec![(0, 0)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        let out = assemble_online_result(&entity, &references, &views, &slots, &values)
+            .expect("assembled");
+
+        assert_eq!(out.num_rows(), 2);
+        let count = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(count.values(), &[10, 20]);
+        assert_eq!(out.schema().field(1).name(), "count");
+    }
+
+    #[test]
+    fn a_missing_value_becomes_a_null_of_the_declared_type() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        let slots = vec![(0, 0)];
+        // The second entity never wrote the view, so its value is absent.
+        let values = vec![
+            vec![present(10)],
+            vec![ViewValues::Missing(Missing::NeverWritten)],
+        ];
+
+        let out = assemble_online_result(&entity, &references, &views, &slots, &values)
+            .expect("assembled");
+
+        let count = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        // The first entity's value is untouched; the second is a null rather than
+        // a zero, so a caller can tell an absent value from a real one.
+        assert!(!count.is_null(0));
+        assert_eq!(count.value(0), 10);
+        assert!(count.is_null(1));
+    }
+
+    #[test]
+    fn an_all_missing_view_produces_an_all_null_column() {
+        let entity = entity_frame(&[1, 2, 3]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        let slots = vec![(0, 0)];
+        let values = vec![
+            vec![ViewValues::Missing(Missing::NeverWritten)],
+            vec![ViewValues::Missing(Missing::Expired)],
+            vec![ViewValues::Missing(Missing::SchemaMismatch)],
+        ];
+
+        let out = assemble_online_result(&entity, &references, &views, &slots, &values)
+            .expect("assembled");
+
+        let count = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(count.null_count(), 3);
+    }
+
+    #[test]
+    fn the_entity_columns_come_back_first_and_untouched() {
+        let entity = entity_frame(&[7, 8]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        let slots = vec![(0, 0)];
+        let values = vec![vec![present(1)], vec![present(2)]];
+
+        let out = assemble_online_result(&entity, &references, &views, &slots, &values)
+            .expect("assembled");
+
+        assert_eq!(out.schema().field(0).name(), "user_id");
+        let key = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(key.values(), &[7, 8]);
+    }
+
+    #[test]
+    fn a_slot_per_view_rather_than_per_reference_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None), ("buys", None)]);
+        let references = parse_references(&["clicks:count", "buys:count"]).expect("valid");
+        // One slot where the request asked for two columns. `zip` would have
+        // stopped there and returned a table with the second column missing.
+        let slots = vec![(0, 0)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 2, len: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_view_slot_outside_the_read_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        // The right number of slots, pointing at a view this read never made.
+        let slots = vec![(1, 0)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 1, len: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_feature_slot_outside_the_columns_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        // `clicks` declares one feature, so the second column is not there.
+        let slots = vec![(0, 1)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 1, len: 1 })
+        ));
     }
 }

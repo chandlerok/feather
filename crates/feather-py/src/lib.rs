@@ -9,10 +9,12 @@
 //! by the core, so a binding that skips its own checks cannot hand over something
 //! the engines cannot represent.
 //!
-//! [`FeatureStore`] is the one place the binding does real work: it resolves
-//! `view:feature` references into one join per view, intersects the rows the views
-//! agree on, and reattaches the entity frame's own columns by row index. Every
-//! decision it makes is re-checked by the core.
+//! The online read is a case in point: the reference splitting, the
+//! present-or-null reshaping, and the result table all live in the core, so this
+//! module only opens the store, runs the read, and hands the table to the
+//! capsule. The historical join is the one path that still does real work here,
+//! resolving references into one join per view and reattaching the entity frame's
+//! own columns by row index. Every decision it makes is re-checked by the core.
 
 use feather_core::Error as CoreError;
 use pyo3::exceptions::{PyFileNotFoundError, PyOSError, PyValueError};
@@ -20,40 +22,42 @@ use pyo3::prelude::*;
 
 mod demo;
 
+use std::collections::BTreeMap;
 #[cfg(feature = "offline")]
-use std::collections::{BTreeMap, HashMap};
-#[cfg(feature = "offline")]
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[cfg(feature = "offline")]
-use arrow::array::new_null_array;
-#[cfg(feature = "offline")]
 use arrow::array::{Array, ArrayRef, Int64Array, UInt32Array};
+use arrow::compute::concat_batches;
 #[cfg(feature = "offline")]
-use arrow::compute::{concat, concat_batches, take};
+use arrow::compute::take;
 #[cfg(feature = "offline")]
 use arrow::datatypes::{Field as ArrowField, Schema};
 #[cfg(feature = "offline")]
 use arrow::record_batch::RecordBatch;
-#[cfg(feature = "offline")]
 use pyo3_arrow::PyTable;
 
 #[cfg(feature = "offline")]
 use feather_core::offline::ROW_COLUMN;
-#[cfg(all(feature = "offline", feature = "fjall"))]
+// The online read path is not behind `offline`: reading online features never runs the
+// point-in-time join, so a build that only reads online carries no DuckDB. `FjallStore`
+// still needs `fjall`, because that feature is what provides it.
+#[cfg(feature = "fjall")]
 use feather_core::online::fjall::FjallStore;
-#[cfg(feature = "offline")]
 use feather_core::online::memory::MemoryStore;
-#[cfg(feature = "offline")]
 use feather_core::online::{
-    EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, ViewValues, WriteBatch,
+    EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, WriteBatch,
 };
-#[cfg(all(feature = "offline", feature = "fjall"))]
+#[cfg(feature = "fjall")]
 use feather_core::settings::Store as StoreSettings;
+use feather_core::{
+    Definitions, FeatureView, assemble_online_result, entity_key_component, parse_references,
+    read_entities,
+};
 #[cfg(feature = "offline")]
 use feather_core::{
-    Definitions, FeatureView, JoinOptions, Limits, OfflineEngine, OnMissing, entity_key_component,
-    materialize as materialize_project, read_entities, value,
+    JoinOptions, Limits, OfflineEngine, OnMissing, materialize as materialize_project,
 };
 
 /// Read and validate a `feather.toml`, returned as JSON.
@@ -119,8 +123,8 @@ fn intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
 /// served from.
 ///
 /// Constructed from a `feather.toml` path and the compiled definitions, both of which the core
-/// validates. The engine is opened once and reused, because opening it creates a private spill
-/// directory and may load a filesystem extension.
+/// validates. In a build that carries DuckDB, the engine is opened once and reused, because
+/// opening it creates a private spill directory and may load a filesystem extension.
 ///
 /// The state sits behind a `Mutex` so the class is `Send + Sync`, which a PyO3 class has to be
 /// without `unsendable`. A DuckDB connection is `Send` but not `Sync`, and the mutex is what
@@ -133,14 +137,12 @@ fn intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
 ///
 /// The lock is taken *inside* the GIL-released region, in [`FeatureStore::with_inner`], and that
 /// ordering is the point rather than a detail. See the note there for what goes wrong otherwise.
-#[cfg(feature = "offline")]
 #[pyclass]
 struct FeatureStore {
     inner: Mutex<Inner>,
 }
 
 /// Everything a store owns, behind its mutex.
-#[cfg(feature = "offline")]
 struct Inner {
     /// The runtime the online store's I/O runs on.
     ///
@@ -149,6 +151,13 @@ struct Inner {
     /// with `block_on` is sound here: that thread is not one of its workers, so there is no
     /// runtime to nest inside.
     runtime: tokio::runtime::Runtime,
+    /// The offline engine, present only in a build that carries DuckDB.
+    ///
+    /// The online read path does not touch it, so a build without the `offline`
+    /// feature has no field here and still serves: the historical join and the
+    /// refresh are the two operations that need it, and a build that has neither
+    /// does not pay for DuckDB.
+    #[cfg(feature = "offline")]
     engine: OfflineEngine,
     definitions: Definitions,
     /// The project name, which namespaces every online key.
@@ -166,7 +175,6 @@ struct Inner {
 }
 
 /// The online store a project serves from, which one it is decided by the settings.
-#[cfg(feature = "offline")]
 enum Online {
     /// Local mode: the settings declare no `[store]`, so the values live in this process and
     /// die with it.
@@ -177,7 +185,6 @@ enum Online {
     Fjall(Box<FjallStore>),
 }
 
-#[cfg(feature = "offline")]
 impl OnlineStore for Online {
     async fn write(&mut self, batches: &[WriteBatch]) -> feather_core::Result<()> {
         match self {
@@ -210,7 +217,6 @@ impl OnlineStore for Online {
     }
 }
 
-#[cfg(feature = "offline")]
 impl ProjectScan for Online {
     async fn hash_fields(&self, key: &[u8]) -> feather_core::Result<Vec<(String, Vec<u8>)>> {
         match self {
@@ -258,7 +264,6 @@ impl ProjectScan for Online {
 /// Raises:
 ///     OSError: If another thread panicked while holding the lock, so the state cannot be
 ///         trusted.
-#[cfg(feature = "offline")]
 impl FeatureStore {
     fn with_inner<T, F>(&self, py: Python<'_>, f: F) -> PyResult<T>
     where
@@ -272,12 +277,11 @@ impl FeatureStore {
     }
 }
 
-/// A panic while another thread held the lock is what poisons it, which means the engine's
-/// state is unknown; saying so beats unwrapping into a second panic.
-#[cfg(feature = "offline")]
+/// A panic while another thread held the lock is what poisons it, which means the state inside it
+/// is unknown; saying so beats unwrapping into a second panic.
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
     PyOSError::new_err(
-        "another thread panicked while using this FeatureStore, so its engine cannot be trusted",
+        "another thread panicked while using this FeatureStore, so its state cannot be trusted",
     )
 }
 
@@ -295,7 +299,6 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
 ///
 /// Raises:
 ///     OSError: If the declared store directory cannot be opened.
-#[cfg(feature = "offline")]
 fn open_online(inner: &mut Inner) -> PyResult<()> {
     if inner.online.is_some() {
         return Ok(());
@@ -330,7 +333,6 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
 ///
 /// Raises:
 ///     OSError: If the declared store directory cannot be opened, naming the path.
-#[cfg(feature = "offline")]
 fn connect_online(#[cfg(feature = "fjall")] store: Option<&StoreSettings>) -> PyResult<Online> {
     #[cfg(feature = "fjall")]
     if let Some(store) = store {
@@ -338,11 +340,9 @@ fn connect_online(#[cfg(feature = "fjall")] store: Option<&StoreSettings>) -> Py
             FjallStore::open(&store.path, store.cache(), store.memtable()).map_err(core_error)?,
         )));
     }
-    let _ = &store;
     Ok(Online::Memory(MemoryStore::new()))
 }
 
-#[cfg(feature = "offline")]
 #[pymethods]
 impl FeatureStore {
     /// Open a store over a project.
@@ -376,11 +376,13 @@ impl FeatureStore {
         definitions
             .validate_sources(&settings.connections)
             .map_err(core_error)?;
+        #[cfg(feature = "offline")]
         let engine =
             OfflineEngine::open(&Limits::default(), &settings.connections).map_err(core_error)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 runtime,
+                #[cfg(feature = "offline")]
                 engine,
                 project: definitions.project.clone(),
                 definitions,
@@ -414,6 +416,7 @@ impl FeatureStore {
     ///         feature, or repeats one; if `on_missing` is neither `null` nor
     ///         `drop`; if a requested feature name collides with a column of the
     ///         entity frame; or if a join fails.
+    #[cfg(feature = "offline")]
     #[pyo3(signature = (
         entity_frame,
         features,
@@ -440,7 +443,7 @@ impl FeatureStore {
             }
         };
 
-        let references = parse_references(&features)?;
+        let references = parse_references(&features).map_err(core_error)?;
 
         // Read out of the capsule before the lock is taken: it is pure Arrow work with no Python
         // in it, and the frame's own columns are needed again after the joins.
@@ -583,6 +586,7 @@ impl FeatureStore {
     ///         declares it.
     ///     OSError: If the declared store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
+    #[cfg(feature = "offline")]
     #[pyo3(signature = (views = None))]
     fn materialize(
         &self,
@@ -663,7 +667,7 @@ impl FeatureStore {
         entity_frame: PyTable,
         features: Vec<String>,
     ) -> PyResult<PyTable> {
-        let references = parse_references(&features)?;
+        let references = parse_references(&features).map_err(core_error)?;
         let (batches, entity_schema) = entity_frame.into_inner();
         let entity = concat_batches(&entity_schema, &batches).map_err(arrow_error)?;
 
@@ -772,54 +776,11 @@ impl FeatureStore {
             Ok((values, views, slots))
         })?;
 
-        // The frame's own columns come back untouched: only the value writes are reordered, so
-        // reattaching by position is exact rather than a join.
-        let mut columns: Vec<ArrayRef> =
-            Vec::with_capacity(entity.num_columns() + references.len());
-        let mut fields: Vec<ArrowField> =
-            Vec::with_capacity(entity.num_columns() + references.len());
-        for (index, field) in entity_schema.fields().iter().enumerate() {
-            columns.push(entity.column(index).clone());
-            fields.push(field.as_ref().clone());
-        }
-
-        for (reference, (view_slot, feature_slot)) in references.iter().zip(&slots) {
-            let declared = views[&reference.view]
-                .field(&reference.feature)
-                .expect("checked against the definitions above");
-            let dtype = value::arrow_type(declared.dtype);
-
-            // One element per entity that has a value, in entity order, and an index into it or
-            // a null for each entity that does not. `take` turns a null index into a null of the
-            // right type, which is how an absent value reaches the caller.
-            let mut present: Vec<ArrayRef> = Vec::new();
-            let mut indices: Vec<Option<u32>> = Vec::with_capacity(values.len());
-            for per_view in &values {
-                match &per_view[*view_slot] {
-                    ViewValues::Present {
-                        columns: decoded, ..
-                    } => {
-                        indices.push(Some(present.len() as u32));
-                        present.push(decoded[*feature_slot].clone());
-                    }
-                    ViewValues::Missing(_) => indices.push(None),
-                }
-            }
-
-            let column = if present.is_empty() {
-                new_null_array(&dtype, values.len())
-            } else {
-                let borrowed: Vec<&dyn Array> =
-                    present.iter().map(|array| array.as_ref()).collect();
-                let decoded = concat(&borrowed).map_err(arrow_error)?;
-                take(&decoded, &UInt32Array::from(indices), None).map_err(arrow_error)?
-            };
-            columns.push(column);
-            fields.push(ArrowField::new(&reference.feature, dtype, true));
-        }
-
-        let schema = std::sync::Arc::new(Schema::new(fields));
-        let output = RecordBatch::try_new(schema.clone(), columns).map_err(arrow_error)?;
+        // The reshaping is the core's, so a second binding produces the same
+        // table for the same read rather than a near-copy of this loop.
+        let output = assemble_online_result(&entity, &references, &views, &slots, &values)
+            .map_err(core_error)?;
+        let schema = output.schema();
         PyTable::try_new(vec![output], schema)
     }
 }
@@ -867,58 +828,11 @@ struct MaterializeReport {
 ///
 /// Read here and passed into the read path rather than read inside a query, so the TTL rule
 /// stays testable without waiting for a clock.
-#[cfg(feature = "offline")]
 fn now_micros() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_micros() as i64)
         .unwrap_or(0)
-}
-
-/// One requested feature, split into the view it comes from and its name there.
-#[cfg(feature = "offline")]
-struct Reference {
-    view: String,
-    feature: String,
-}
-
-/// Split `view:feature` references, rejecting the shapes the engine cannot use.
-///
-/// The Python layer builds these, so this is a check of what the core accepts
-/// rather than of what a user typed.
-#[cfg(feature = "offline")]
-fn parse_references(features: &[String]) -> PyResult<Vec<Reference>> {
-    if features.is_empty() {
-        return Err(PyValueError::new_err(
-            "features must name at least one feature",
-        ));
-    }
-    let mut references: Vec<Reference> = Vec::with_capacity(features.len());
-    for reference in features {
-        let (view, feature) = reference.split_once(':').ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "malformed reference `{reference}`; expected `view:feature`"
-            ))
-        })?;
-        if view.is_empty() || feature.is_empty() {
-            return Err(PyValueError::new_err(format!(
-                "malformed reference `{reference}`; expected `view:feature`"
-            )));
-        }
-        if references
-            .iter()
-            .any(|seen| seen.view == view && seen.feature == feature)
-        {
-            return Err(PyValueError::new_err(format!(
-                "the reference `{reference}` is requested twice"
-            )));
-        }
-        references.push(Reference {
-            view: view.to_owned(),
-            feature: feature.to_owned(),
-        });
-    }
-    Ok(references)
 }
 
 /// Index a view's result by the entity frame row it belongs to.
@@ -970,7 +884,6 @@ fn gather_indices(rows: &[i64], position: impl Fn(i64) -> Option<u32>) -> PyResu
 }
 
 /// Wrap an Arrow failure as the exception a Python caller expects.
-#[cfg(feature = "offline")]
 fn arrow_error(error: arrow::error::ArrowError) -> PyErr {
     PyValueError::new_err(format!("arrow: {error}"))
 }
@@ -1122,11 +1035,11 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(load_settings, m)?)?;
     m.add_function(wrap_pyfunction!(demo::write_demo_data, m)?)?;
+    m.add_class::<FeatureStore>()?;
     #[cfg(feature = "serve")]
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     #[cfg(feature = "offline")]
     {
-        m.add_class::<FeatureStore>()?;
         m.add_class::<MaterializeReport>()?;
         m.add_class::<ViewRefresh>()?;
     }
