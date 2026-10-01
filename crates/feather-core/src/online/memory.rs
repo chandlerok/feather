@@ -1,4 +1,4 @@
-//! In-process [`OnlineStore`], and the store a project serves from until it needs a shared one.
+//! In-process [`OnlineStore`], and what a build with no embedded store serves from.
 //!
 //! A build without the `fjall` feature has no embedded store to open, so a project serves from
 //! this one and its values live in the process until it exits. A build with `fjall` always has a

@@ -333,7 +333,8 @@ fn open_online(inner: &mut Inner) -> PyResult<()> {
 fn online_location(settings_path: &str, store: Option<&StoreSettings>) -> (PathBuf, u64, u64) {
     match store {
         Some(store) => (PathBuf::from(&store.path), store.cache(), store.memtable()),
-        // A refresh creates this on its first write, beside the `feather.toml` that omits it.
+        // The first call that opens the store creates this, beside the `feather.toml` that
+        // omits it.
         None => (
             PathBuf::from(settings_path)
                 .parent()

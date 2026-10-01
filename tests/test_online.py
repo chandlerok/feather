@@ -168,7 +168,7 @@ def make_project(
 
 @pytest.fixture
 def project(tmp_path: Path) -> Project:
-    """A local-mode project, which reads and writes in this process.
+    """A project with no `[store]`, so its store is a database under `tmp_path`.
 
     Args:
         tmp_path: The pytest temp directory.
@@ -331,8 +331,7 @@ def test_a_renamed_view_is_retired_and_leaves_the_registry(tmp_path: Path) -> No
     """A rename, over a store that outlives one `FeatureStore`.
 
     The registry is in the embedded store, so a second store over the same project sees what the
-    first one wrote. That is the only way the retire path can be exercised end to end, so this
-    asks for `store=True` rather than the project a generated `feather.toml` resolves to; the
+    first one wrote. That is the only way the retire path can be exercised end to end; the
     Rust suite pins the rule itself.
     """
     project = make_project(tmp_path, project=f"feathertest_retire_{uuid.uuid4().hex}", store=True)
