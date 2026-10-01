@@ -304,8 +304,8 @@ impl Store {
 /// A validated `feather.toml`.
 ///
 /// Unknown keys are rejected, so a typo is a load error rather than a silently
-/// ignored setting. An absent `store` is local mode: an in-process DuckDB over local
-/// files, served from an in-process online store.
+/// ignored setting. An absent `store` resolves to `.feather/online` beside this
+/// file, which is where a materialization writes and where `serve()` reads.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -317,8 +317,9 @@ pub struct Settings {
     /// module.
     #[serde(default)]
     pub connections: BTreeMap<String, Connection>,
-    /// The embedded online store. Absent means the in-process map, which is the right default
-    /// for a project that is read from the same process that materializes it.
+    /// The embedded online store. Absent means `.feather/online` beside the settings file, which
+    /// is the right default because both the write path and the serving path resolve it the
+    /// same way and neither can end up reading a database the other never wrote.
     #[serde(default)]
     pub store: Option<Store>,
 }

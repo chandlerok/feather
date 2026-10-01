@@ -136,11 +136,9 @@ def demo(directory: Path, *, force: bool = False) -> None:
 def refresh(directory: Path, views: Sequence[str]) -> None:
     """Refresh the project's views into the online store.
 
-    A project with no ``[store]`` in its settings is local mode, and its online store
-    is in-process and belongs to the store object that opened it. So the values
-    written here are served to this process and to nothing after it; a
-    deployment that serves from more than one process configures a store, and
-    the same call writes to that.
+    A generated project declares no ``[store]``, so its online store is a database at
+    ``.feather/online`` beside the ``feather.toml``, which ``serve()`` opens. A deployment can
+    put a different path under ``[store]``, and the same call writes there instead.
 
     Args:
         directory: The project directory, holding ``feather.toml``.
@@ -151,7 +149,7 @@ def refresh(directory: Path, views: Sequence[str]) -> None:
         FileNotFoundError: If there is no ``feather.toml`` in ``directory``.
         ValueError: If a named view is not declared, or a source cannot be read as
             its view declares it.
-        OSError: If the declared store directory cannot be opened.
+        OSError: If the store directory cannot be opened.
     """
     from feather import FeatureStore
 

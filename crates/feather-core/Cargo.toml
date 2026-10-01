@@ -1,9 +1,15 @@
 [package]
 name = "feather-core"
 version.workspace = true
+categories = ["data-science"]
 edition.workspace = true
+keywords = ["arrow", "feature-store", "parquet"]
 license.workspace = true
-publish.workspace = true
+# Overrides the workspace's `publish = false`, which the other members keep. A Rust
+# consumer takes this crate directly; the binding crates deliver a wheel and an npm
+# tarball, not a crate fetch, so they stay unpublished. The name is free on crates.io
+# (`feather` is taken), and the first publish is the one that claims it.
+publish = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Encoding, offline joins, and online storage for Feather"

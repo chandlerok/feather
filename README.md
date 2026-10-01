@@ -148,10 +148,11 @@ removes its fields from every entity that still carries them. Name views to refr
 subset: `feather refresh user_clicks`. That refreshes the project you are standing in, so
 from somewhere else pass `-C`: `feather refresh -C my_feature_store user_clicks`.
 
-A generated project declares no `[store]`, so its online store is an in-process map that
-belongs to the `FeatureStore` that opened it: the values are there for the process that
-refreshed them and for nothing after it. A deployment puts a path in `feather.toml` under
-`[store]`, and the same command writes a database instead, which `serve()` then opens.
+A generated project declares no `[store]`, so its online store is a database at
+`.feather/online` beside the `feather.toml`, which `serve()` opens. A deployment can put a
+different path under `[store]`, and the same command writes there instead. A project
+refreshed under the earlier behaviour has no database on disk yet, so run `feather refresh`
+once after upgrading or `serve()` will open an empty store and answer null for every column.
 
 ## Going to production
 

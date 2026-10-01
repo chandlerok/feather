@@ -1,7 +1,8 @@
-//! In-process [`OnlineStore`], and the store a project serves from until it needs a shared one.
+//! In-process [`OnlineStore`], and what a build with no embedded store serves from.
 //!
-//! Local mode runs on this: `feather.toml` with no `[store]` table. It is the default rather
-//! than a fallback, so it is written to be served from rather than merely to be correct.
+//! A build without the `fjall` feature has no embedded store to open, so a project serves from
+//! this one and its values live in the process until it exits. A build with `fjall` always has a
+//! directory to open, and never reaches this.
 //!
 //! Shape: one allocation for the entity's field index, its entries in name order; each field's
 //! name and value are still separate allocations, as they were. A request asks for one or two

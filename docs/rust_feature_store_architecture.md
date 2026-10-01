@@ -494,9 +494,12 @@ written down.
 
 #### Where the store lives
 
-The store is embedded and in-process. `feather.toml` with no `[store]` table serves from an
-in-process map that dies with the process; a `[store]` table names a directory, and both a
-materialization and `FeatureStore.serve()` open it. It is a database that one process opens at a
+The store is embedded and in-process. `feather.toml` with no `[store]` table resolves to
+`.feather/online` beside that `feather.toml`, and a `[store]` table names a directory instead;
+either way a materialization and `FeatureStore.serve()` open the same one, from one resolver.
+They did not always: the serving path fell back to that directory while materialization fell
+back to an in-process map, so a project with no `[store]` was served out of a database nothing
+had written and answered null for every column. It is a database that one process opens at a
 time, so the server is the only thing that opens it, and that is what replaces a shared tier: a
 reader in any language goes to the server, not to the store. A point read costs single-digit
 microseconds warm, where a networked KV store pays a round trip per entity.
