@@ -25,6 +25,7 @@ mod demo;
 use std::collections::BTreeMap;
 #[cfg(feature = "offline")]
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 #[cfg(feature = "offline")]
@@ -45,11 +46,11 @@ use feather_core::offline::ROW_COLUMN;
 // still needs `fjall`, because that feature is what provides it.
 #[cfg(feature = "fjall")]
 use feather_core::online::fjall::FjallStore;
+#[cfg(not(feature = "fjall"))]
 use feather_core::online::memory::MemoryStore;
 use feather_core::online::{
     EntityRequest, OnlineStore, ProjectScan, ReadRequest, ViewRequest, WriteBatch,
 };
-#[cfg(feature = "fjall")]
 use feather_core::settings::Store as StoreSettings;
 use feather_core::{
     Definitions, FeatureView, assemble_online_result, entity_key_component, parse_references,
@@ -162,10 +163,9 @@ struct Inner {
     definitions: Definitions,
     /// The project name, which namespaces every online key.
     project: String,
-    /// The embedded store the settings declare, if any. Read here so the write path and
-    /// `serve()` open the same database, rather than each picking its own.
-    #[cfg(feature = "fjall")]
-    store: Option<StoreSettings>,
+    /// Where the online store lives, resolved from the settings once so that the write path and
+    /// `serve()` cannot each pick their own default and end up disagreeing.
+    location: (PathBuf, u64, u64),
     /// The store features are served from, opened on the first online call.
     ///
     /// `None` until then, so that constructing a store over a project whose store directory is
@@ -176,11 +176,13 @@ struct Inner {
 
 /// The online store a project serves from, which one it is decided by the settings.
 enum Online {
-    /// Local mode: the settings declare no `[store]`, so the values live in this process and
-    /// die with it.
+    /// Local mode: a build with no embedded store, so the values live in this process and die
+    /// with it. Only reachable without `fjall`, because a build with it always opens the
+    /// directory `serve()` opens.
+    #[cfg(not(feature = "fjall"))]
     Memory(MemoryStore),
-    /// The settings declare an embedded store, so a refresh writes a database that outlives
-    /// the process and that `serve()` can then open.
+    /// The embedded store, at the directory the settings resolve to, so that a refresh writes
+    /// the database `serve()` reads even when the settings declare no `[store]`.
     #[cfg(feature = "fjall")]
     Fjall(Box<FjallStore>),
 }
@@ -188,6 +190,7 @@ enum Online {
 impl OnlineStore for Online {
     async fn write(&mut self, batches: &[WriteBatch]) -> feather_core::Result<()> {
         match self {
+            #[cfg(not(feature = "fjall"))]
             Online::Memory(store) => store.write(batches).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.write(batches).await,
@@ -199,6 +202,7 @@ impl OnlineStore for Online {
         requests: &[ReadRequest],
     ) -> feather_core::Result<Vec<Vec<Option<Vec<u8>>>>> {
         match self {
+            #[cfg(not(feature = "fjall"))]
             Online::Memory(store) => store.read(requests).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.read(requests).await,
@@ -210,6 +214,7 @@ impl OnlineStore for Online {
         keys_and_fields: &[(Vec<u8>, Vec<String>)],
     ) -> feather_core::Result<()> {
         match self {
+            #[cfg(not(feature = "fjall"))]
             Online::Memory(store) => store.delete_fields(keys_and_fields).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.delete_fields(keys_and_fields).await,
@@ -220,6 +225,7 @@ impl OnlineStore for Online {
 impl ProjectScan for Online {
     async fn hash_fields(&self, key: &[u8]) -> feather_core::Result<Vec<(String, Vec<u8>)>> {
         match self {
+            #[cfg(not(feature = "fjall"))]
             Online::Memory(store) => store.hash_fields(key).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.hash_fields(key).await,
@@ -232,6 +238,7 @@ impl ProjectScan for Online {
         exclude: &[u8],
     ) -> feather_core::Result<Vec<Vec<u8>>> {
         match self {
+            #[cfg(not(feature = "fjall"))]
             Online::Memory(store) => store.scan_entity_keys(project, exclude).await,
             #[cfg(feature = "fjall")]
             Online::Fjall(store) => store.scan_entity_keys(project, exclude).await,
@@ -298,49 +305,67 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
 ///     `Ok(())` once `inner.online` holds a store.
 ///
 /// Raises:
-///     OSError: If the declared store directory cannot be opened.
+///     OSError: If the store directory cannot be opened.
 fn open_online(inner: &mut Inner) -> PyResult<()> {
     if inner.online.is_some() {
         return Ok(());
     }
-    let opened = {
-        #[cfg_attr(not(feature = "fjall"), allow(unused_mut))]
-        let Inner {
-            runtime,
-            #[cfg(feature = "fjall")]
-            store,
-            ..
-        } = &*inner;
-        let _ = runtime;
-        #[cfg(feature = "fjall")]
-        let opened = connect_online(store.as_ref())?;
-        #[cfg(not(feature = "fjall"))]
-        let opened = connect_online()?;
-        opened
-    };
-    inner.online = Some(opened);
+    inner.online = Some(connect_online(inner.location.clone())?);
     Ok(())
 }
 
-/// Build the store the settings name.
+/// Where the online store lives, and how large its cache and memtable are.
+///
+/// One resolver for both online paths, because they used to disagree. `serve()` fell back to
+/// `.feather/online` when `feather.toml` declared no `[store]`, while materialization fell back
+/// to an in-process map. A project with no `[store]` was therefore served out of a directory
+/// nothing had ever written: the server started, resolved its service, answered every request,
+/// and returned null for every column, with no error and no log line to say so. Resolving it in
+/// one place is what makes that state unreachable rather than merely unlikely.
 ///
 /// Args:
-///     store: The settings' `[store]` table, or `None` for local mode.
+///     settings_path: The `feather.toml` the project was opened from. Only its parent directory
+///         is read, and only when the settings declare no store of their own.
+///     store: The settings' `[store]` table, or `None` for a project that declares none.
 ///
 /// Returns:
-///     The embedded store when the settings declare one, and the in-process map
-///     otherwise, which is the document's local mode.
+///     The directory to open, with the cache and memtable sizes to open it at.
+fn online_location(settings_path: &str, store: Option<&StoreSettings>) -> (PathBuf, u64, u64) {
+    match store {
+        Some(store) => (PathBuf::from(&store.path), store.cache(), store.memtable()),
+        // The first call that opens the store creates this, beside the `feather.toml` that
+        // omits it.
+        None => (
+            PathBuf::from(settings_path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".feather/online"),
+            feather_core::settings::Store::DEFAULT_CACHE_BYTES,
+            feather_core::settings::Store::DEFAULT_MEMTABLE_BYTES,
+        ),
+    }
+}
+
+/// Build the store at the location the settings resolve to.
+///
+/// Args:
+///     location: The directory and sizes `online_location` resolved.
+///
+/// Returns:
+///     The embedded store, in a build that has one. Without `fjall` there is nothing to embed,
+///     and the values live in this process until it exits.
 ///
 /// Raises:
-///     OSError: If the declared store directory cannot be opened, naming the path.
-fn connect_online(#[cfg(feature = "fjall")] store: Option<&StoreSettings>) -> PyResult<Online> {
+///     OSError: If the store directory cannot be opened, naming the path.
+fn connect_online(location: (PathBuf, u64, u64)) -> PyResult<Online> {
     #[cfg(feature = "fjall")]
-    if let Some(store) = store {
-        return Ok(Online::Fjall(Box::new(
-            FjallStore::open(&store.path, store.cache(), store.memtable()).map_err(core_error)?,
-        )));
-    }
-    Ok(Online::Memory(MemoryStore::new()))
+    return Ok(Online::Fjall(Box::new(
+        FjallStore::open(&location.0, location.1, location.2).map_err(core_error)?,
+    )));
+    #[cfg(not(feature = "fjall"))]
+    let _ = location;
+    #[cfg(not(feature = "fjall"))]
+    return Ok(Online::Memory(MemoryStore::new()));
 }
 
 #[pymethods]
@@ -386,8 +411,7 @@ impl FeatureStore {
                 engine,
                 project: definitions.project.clone(),
                 definitions,
-                #[cfg(feature = "fjall")]
-                store: settings.store,
+                location: online_location(settings_path, settings.store.as_ref()),
                 online: None,
             }),
         })
@@ -584,7 +608,7 @@ impl FeatureStore {
     /// Raises:
     ///     ValueError: If a named view is not declared, or a source cannot be read as its view
     ///         declares it.
-    ///     OSError: If the declared store directory cannot be opened.
+    ///     OSError: If the store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     #[cfg(feature = "offline")]
     #[pyo3(signature = (views = None))]
@@ -659,7 +683,7 @@ impl FeatureStore {
     ///         both the same join key and the same entity name, since the hash key carries the
     ///         name and one request reads one entity type; if the frame has no such column or has
     ///         a null in it; or if a requested feature name collides with a column of the frame.
-    ///     OSError: If the declared store directory cannot be opened.
+    ///     OSError: If the store directory cannot be opened.
     ///     OSError: If another thread panicked while holding this store.
     fn get_online_features(
         &self,
@@ -922,7 +946,6 @@ fn serve(
     workers: usize,
 ) -> PyResult<()> {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     let settings = feather_core::load_settings(settings_path).map_err(core_error)?;
@@ -987,19 +1010,7 @@ fn serve(
     )
     .map_err(PyValueError::new_err)?;
 
-    let directory = settings.store.as_ref().map_or_else(
-        || {
-            PathBuf::from(settings_path)
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(".feather/online")
-        },
-        |store| PathBuf::from(&store.path),
-    );
-    let (cache, memtable) = settings
-        .store
-        .as_ref()
-        .map_or((64 << 20, 64 << 20), |s| (s.cache(), s.memtable()));
+    let (directory, cache, memtable) = online_location(settings_path, settings.store.as_ref());
 
     let socket: std::net::SocketAddr = addr
         .parse()

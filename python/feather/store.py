@@ -210,7 +210,7 @@ class FeatureStore:
         Raises:
             ValueError: If a named view is not declared, or a source cannot be read as its view
                 declares it.
-            OSError: If the declared store directory cannot be opened.
+            OSError: If the store directory cannot be opened.
         """
         return self._store.materialize(None if views is None else list(views))
 
@@ -250,7 +250,7 @@ class FeatureStore:
                 both the same join key and the same entity name, since one call reads one entity
                 type; if ``entity_df`` lacks the join key column or holds a null in it; or if the
                 read fails.
-            OSError: If the declared store directory cannot be opened.
+            OSError: If the store directory cannot be opened.
         """
         if not hasattr(entity_df, "__arrow_c_stream__"):
             raise TypeError(_why_not_arrow(entity_df))

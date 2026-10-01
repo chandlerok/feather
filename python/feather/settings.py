@@ -121,8 +121,8 @@ class Store(pydantic.BaseModel):
 class FeatherSettings(pydantic.BaseModel):
     """A validated ``feather.toml``.
 
-    An absent ``store`` is local mode: an in-process DuckDB over local files, served from
-    an in-process online store.
+    An absent ``store`` is local mode: an in-process DuckDB over local files, with its online
+    store resolved to ``.feather/online`` beside this file.
     """
 
     model_config = pydantic.ConfigDict(frozen=True, extra="forbid")

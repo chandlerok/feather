@@ -448,10 +448,14 @@ def test_refresh_with_no_view_named_refreshes_every_view(
 def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> None:
     """One store, not two.
 
-    A project with no `[store]` in `feather.toml` is local mode, and the in-process
-    store belongs to the `FeatureStore` that opened it. So the values a refresh
-    writes are there for the object that wrote them, which is why this holds the
-    store rather than opening a second one.
+    The embedded store is single-owner and takes an exclusive lock, so a second
+    `FeatureStore` over the same directory cannot be opened until the first is
+    released. `test_a_renamed_view_is_retired_and_leaves_the_registry` says the
+    same at `tests/test_online.py:346`, and
+    `a_second_open_over_the_same_directory_is_refused_until_the_first_is_closed`
+    pins it in Rust at `crates/feather-core/src/online/fjall.rs:541`. This test
+    wants a read against the store that just wrote, so it holds that one store
+    rather than opening a second.
     """
     view = generated_view(project)
     entities = pl.DataFrame({"user_id": [1, 2, 3]})
@@ -471,6 +475,44 @@ def test_the_refreshed_values_are_served_from_the_same_store(project: Path) -> N
     features = source_rows(project)
     newest = max(timestamp for _, timestamp in features)
     assert after["click_count"].to_list() == [features[(user, newest)][0] for user in (1, 2, 3)]
+
+
+def test_a_refreshed_project_leaves_a_database_the_next_process_reads(project: Path) -> None:
+    """A refresh writes a database on disk, so what it wrote outlives the process.
+
+    The generated project declares no `[store]`, so an absent one resolves to
+    `.feather/online` beside the `feather.toml`, and both the write path and
+    `serve()` open that same directory.
+
+    This is the test that fails if that resolution is reverted. Before it, the
+    write path used an in-process map: `.feather/online` was never created, so the
+    first assertion below fails, and the store opened afterwards is a fresh
+    in-memory one that knows nothing the first wrote, so every column reads null
+    and the second assertion fails. `serve()` would have answered null for every
+    column with no error and no log line.
+
+    The first store is released before the second is opened because the embedded
+    store is single-owner and takes an exclusive lock over the directory, so a
+    second `FeatureStore` cannot be opened until the first is gone.
+    """
+    view = generated_view(project)
+    entities = pl.DataFrame({"user_id": [1, 2, 3]})
+
+    def materialize() -> None:
+        with inside(project):
+            FeatureStore(SETTINGS_NAME).materialize(None)
+
+    # The store this creates is dropped as the call returns, which is what releases
+    # the lock the second `FeatureStore` below needs.
+    materialize()
+
+    assert (project / ".feather" / "online").is_dir(), "a refresh writes a database on disk"
+
+    with inside(project):
+        reopened = FeatureStore(SETTINGS_NAME)
+        values = pl.DataFrame(reopened.get_online_features(entities, [view.click_count]))
+
+    assert values["click_count"].null_count() == 0, "a second store reads what the first wrote"
 
 
 def test_refresh_of_an_unknown_view_is_a_message_not_a_traceback(
