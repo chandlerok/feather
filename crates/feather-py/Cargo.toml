@@ -37,12 +37,11 @@ pyo3-arrow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The online store's I/O is asynchronous, so the binding owns a runtime and blocks on it from
-# the Python thread. Optional because every use sits behind `fjall`, `offline`, or `serve`:
-# without one of those there is no online read, no join, and no server for a runtime to serve,
-# so an unconditional dependency would make a build carry one it cannot use. `rt-multi-thread`
-# because the serving transport runs one request per worker thread; `net` and `time` because
-# that runtime needs them.
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "net", "time"] }
+# the Python thread. Unconditional because the online read path runs on this runtime, and that
+# path is not behind `offline`: a build with `--no-default-features` drops DuckDB but keeps tokio
+# and the online store. `rt-multi-thread` because the serving transport runs one request per worker
+# thread; `net` and `time` because that runtime needs them.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
 
 [features]
 # `serve` and `fjall` are default because both are load-bearing for a project that
@@ -56,10 +55,10 @@ default = ["offline", "fjall", "serve"]
 # tests the engines, and so a build can drop DuckDB with --no-default-features. It gates only
 # the historical join and the refresh: the online read path compiles without it, so a build
 # without this feature carries no DuckDB and still reads and serves.
-offline = ["feather-core/offline", "dep:tokio"]
+offline = ["feather-core/offline"]
 # The embedded store, which the online read path needs, so a build that only reads online
-# features carries no DuckDB. It brings the runtime with it, because the read path runs on it.
-fjall = ["feather-core/fjall", "dep:tokio"]
+# features carries no DuckDB.
+fjall = ["feather-core/fjall"]
 # Serving over Arrow Flight. Does not imply `offline`: a project that only reads
 # online features never runs a point-in-time join, so it should not pay for the engine.
-serve = ["dep:feather-serve", "dep:tokio"]
+serve = ["dep:feather-serve"]

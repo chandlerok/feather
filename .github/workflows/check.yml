@@ -116,8 +116,20 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --all-features \
             -- -D warnings
-      # The suite includes the RustFS and Postgres integration tests,
-      # which connect eagerly and have no skip guard: with nothing
+      # Nothing else in this workflow compiles the build with no engine in it:
+      # clippy above and the test suite below both pass `--all-features`, where
+      # every `#[cfg(feature = "offline")]` is true, so the ungated path never
+      # reaches a compiler. `feather-core`'s `default = []` makes
+      # `--no-default-features` the build a Rust consumer of the crate gets, and
+      # it is the one `feather-py` gets once `offline` is dropped: no DuckDB, and
+      # the online read path still there. Neither links DuckDB, which is why
+      # these are `check` and not `test`.
+      - name: check the ungated build
+        run: |
+          cargo check -p feather-core --no-default-features
+          cargo check -p feather-py --no-default-features
+      # The suite includes the RustFS and Postgres integration
+      # tests, which connect eagerly and have no skip guard: with nothing
       # listening they fail rather than skip. docker-compose.yml is reused
       # rather than bare containers so the tests meet the same
       # constraints they are written against. RustFS comes up through the same

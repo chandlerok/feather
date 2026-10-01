@@ -375,8 +375,9 @@ pub async fn read_entities<S: OnlineStore>(
 ///     references: The parsed request, in the order the columns should come back.
 ///     views: The views the references resolved to, keyed by view name. Each is
 ///         looked up for the declared dtype, which is what a null column is typed by.
-///     slots: For each reference, the `(view, feature)` index pair into `values`,
-///         which is the position `read_entities` wrote it to.
+///     slots: One `(view, feature)` index pair per reference, into `values`,
+///         which is the position `read_entities` wrote it to. A length that
+///         does not match `references` is an error, not a shorter table.
 ///     values: What `read_entities` produced, one inner vector per entity, each
 ///         holding one [`ViewValues`] per distinct view in first-appearance order.
 ///
@@ -394,6 +395,17 @@ pub fn assemble_online_result(
     for (index, field) in entity.schema().fields().iter().enumerate() {
         columns.push(entity.column(index).clone());
         fields.push(field.as_ref().clone());
+    }
+
+    // `zip` stops at the shorter of the two lists, so a caller that supplied one
+    // slot per view rather than per reference would get a table missing its
+    // trailing columns, with nothing to report. The position that has no
+    // counterpart is named, in whichever list ran out.
+    if references.len() != slots.len() {
+        return Err(Error::RowOutOfRange {
+            row: references.len().max(slots.len()),
+            len: references.len().min(slots.len()),
+        });
     }
 
     for (reference, (view_slot, feature_slot)) in references.iter().zip(slots) {
@@ -414,12 +426,20 @@ pub fn assemble_online_result(
         let mut present: Vec<ArrayRef> = Vec::new();
         let mut indices: Vec<Option<u32>> = Vec::with_capacity(values.len());
         for per_view in values {
-            match &per_view[*view_slot] {
+            let value = per_view.get(*view_slot).ok_or(Error::RowOutOfRange {
+                row: *view_slot,
+                len: per_view.len(),
+            })?;
+            match value {
                 ViewValues::Present {
                     columns: decoded, ..
                 } => {
+                    let column = decoded.get(*feature_slot).ok_or(Error::RowOutOfRange {
+                        row: *feature_slot,
+                        len: decoded.len(),
+                    })?;
                     indices.push(Some(present.len() as u32));
-                    present.push(decoded[*feature_slot].clone());
+                    present.push(column.clone());
                 }
                 ViewValues::Missing(_) => indices.push(None),
             }
@@ -902,5 +922,51 @@ mod tests {
         assert_eq!(out.schema().field(0).name(), "user_id");
         let key = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(key.values(), &[7, 8]);
+    }
+
+    #[test]
+    fn a_slot_per_view_rather_than_per_reference_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None), ("buys", None)]);
+        let references = parse_references(&["clicks:count", "buys:count"]).expect("valid");
+        // One slot where the request asked for two columns. `zip` would have
+        // stopped there and returned a table with the second column missing.
+        let slots = vec![(0, 0)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 2, len: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_view_slot_outside_the_read_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        // The right number of slots, pointing at a view this read never made.
+        let slots = vec![(1, 0)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 1, len: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_feature_slot_outside_the_columns_is_refused() {
+        let entity = entity_frame(&[1, 2]);
+        let views = views(&[("clicks", None)]);
+        let references = parse_references(&["clicks:count"]).expect("valid");
+        // `clicks` declares one feature, so the second column is not there.
+        let slots = vec![(0, 1)];
+        let values = vec![vec![present(10)], vec![present(20)]];
+
+        assert!(matches!(
+            assemble_online_result(&entity, &references, &views, &slots, &values),
+            Err(Error::RowOutOfRange { row: 1, len: 1 })
+        ));
     }
 }

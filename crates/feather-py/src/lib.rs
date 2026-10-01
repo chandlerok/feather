@@ -123,8 +123,8 @@ fn intersect(a: &[i64], b: &[i64]) -> Vec<i64> {
 /// served from.
 ///
 /// Constructed from a `feather.toml` path and the compiled definitions, both of which the core
-/// validates. The engine is opened once and reused, because opening it creates a private spill
-/// directory and may load a filesystem extension.
+/// validates. In a build that carries DuckDB, the engine is opened once and reused, because
+/// opening it creates a private spill directory and may load a filesystem extension.
 ///
 /// The state sits behind a `Mutex` so the class is `Send + Sync`, which a PyO3 class has to be
 /// without `unsendable`. A DuckDB connection is `Send` but not `Sync`, and the mutex is what
@@ -277,11 +277,11 @@ impl FeatureStore {
     }
 }
 
-/// A panic while another thread held the lock is what poisons it, which means the engine's
-/// state is unknown; saying so beats unwrapping into a second panic.
+/// A panic while another thread held the lock is what poisons it, which means the state inside it
+/// is unknown; saying so beats unwrapping into a second panic.
 fn poisoned<T>(_: std::sync::PoisonError<T>) -> PyErr {
     PyOSError::new_err(
-        "another thread panicked while using this FeatureStore, so its engine cannot be trusted",
+        "another thread panicked while using this FeatureStore, so its state cannot be trusted",
     )
 }
 
@@ -340,7 +340,6 @@ fn connect_online(#[cfg(feature = "fjall")] store: Option<&StoreSettings>) -> Py
             FjallStore::open(&store.path, store.cache(), store.memtable()).map_err(core_error)?,
         )));
     }
-    let _ = &store;
     Ok(Online::Memory(MemoryStore::new()))
 }
 
@@ -1036,7 +1035,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(load_settings, m)?)?;
     m.add_function(wrap_pyfunction!(demo::write_demo_data, m)?)?;
-m.add_class::<FeatureStore>()?;
+    m.add_class::<FeatureStore>()?;
     #[cfg(feature = "serve")]
     m.add_function(wrap_pyfunction!(serve, m)?)?;
     #[cfg(feature = "offline")]
